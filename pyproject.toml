@@ -1,0 +1,164 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "master-generators-ode"
+version = "1.0.0"
+description = "Master Generators for ODEs using ML/DL - Novel ODE Construction Method"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Master Generators Team", email = "contact@master-generators.com"}
+]
+maintainers = [
+    {name = "Master Generators Team", email = "contact@master-generators.com"}
+]
+keywords = [
+    "ODE", "differential equations", "machine learning", "deep learning",
+    "mathematics", "scientific computing", "neural networks", "generators",
+    "special functions", "numerical analysis"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Education",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [
+    "streamlit>=1.28.0",
+    "numpy>=1.24.0",
+    "sympy>=1.12",
+    "torch>=2.0.0",
+    "matplotlib>=3.7.0",
+    "scipy>=1.11.0",
+    "pandas>=2.0.0",
+    "transformers>=4.35.0",
+    "tensorflow>=2.14.0",
+    "scikit-learn>=1.3.0",
+    "plotly>=5.18.0",
+    "fastapi>=0.104.0",
+    "uvicorn>=0.24.0",
+    "pydantic>=2.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+    "mypy>=1.5.0",
+    "sphinx>=7.0.0",
+    "sphinx-rtd-theme>=1.3.0",
+    "jupyter>=1.0.0",
+    "ipykernel>=6.25.0",
+    "pre-commit>=3.5.0",
+    "twine>=4.0.2",
+]
+
+visualization = [
+    "seaborn>=0.12.0",
+    "bokeh>=3.3.0",
+    "altair>=5.1.0",
+]
+
+optimization = [
+    "optuna>=3.4.0",
+    "ray[tune]>=2.8.0",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/yourusername/master-generators"
+"Bug Tracker" = "https://github.com/yourusername/master-generators/issues"
+"Documentation" = "https://master-generators.readthedocs.io"
+"Source Code" = "https://github.com/yourusername/master-generators"
+
+[project.scripts]
+master-generators = "src.cli:main"
+mg-api = "api_server:main"
+mg-ui = "master_generators_app:main"
+
+[tool.setuptools]
+packages = ["src", "src.generators", "src.ml", "src.dl", "src.functions", "src.utils", "api", "ui"]
+
+[tool.setuptools.package-data]
+"*" = ["*.json", "*.yaml", "*.yml", "*.csv", "*.pth", "*.h5", "*.pkl"]
+
+[tool.black]
+line-length = 120
+target-version = ['py38', 'py39', 'py310', 'py311']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+    \.git
+  | \.mypy_cache
+  | \.pytest_cache
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 120
+multi_line_output = 3
+include_trailing_comma = true
+force_grid_wrap = 0
+use_parentheses = true
+ensure_newline_before_comments = true
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+disallow_any_unimported = false
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+check_untyped_defs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q --strict-markers"
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "unit: marks tests as unit tests",
+]
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["*/tests/*", "*/test_*.py", "*/__init__.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
+
+[tool.flake8]
+max-line-length = 120
+extend-ignore = ["E203", "W503"]
+exclude = [".git", "__pycache__", "build", "dist", "*.egg-info", ".venv"]
+max-complexity = 10
