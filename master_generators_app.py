@@ -33,7 +33,7 @@ import plotly.graph_objects as go
 # -----------------------------------------------------------------------------
 # App metadata / logging
 # -----------------------------------------------------------------------------
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("master_generators_app")
 
@@ -255,6 +255,18 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
+
+# -----------------------------------------------------------------------------
+# Small helper for robust rerun across Streamlit versions
+# -----------------------------------------------------------------------------
+def _rerun():
+    try:
+        st.rerun()
+    except Exception:
+        try:
+            st.experimental_rerun()
+        except Exception:
+            pass
 
 # -----------------------------------------------------------------------------
 # Safer LaTeX exporter
@@ -638,10 +650,13 @@ def get_function_expr(func_lib_obj: Any, func_name: str) -> sp.Expr:
     # Could be a callable, SymPy Expr, or SymPy Function
     if callable(f_z):
         try:
-            return sp.sympify(str(f_z(z)))
+            # Prefer symbolic call
+            return sp.sympify(f_z(z))
         except Exception:
-            # last resort: try numeric structure
-            return sp.sympify(func_name)
+            try:
+                return sp.sympify(str(f_z(z)))
+            except Exception:
+                return sp.sympify(func_name)
     if isinstance(f_z, sp.Expr):
         return f_z
     if isinstance(f_z, sp.FunctionClass) or isinstance(f_z, sp.Function) or hasattr(f_z, "__call__"):
@@ -682,7 +697,6 @@ def create_solution_plot(ode: Dict, x_range: Tuple[float, float], num_points: in
             ys = f_num(xs)
             ys = np.real(ys) if np.iscomplexobj(ys) else ys
         else:
-            # not a sympy expression
             raise ValueError("Non-symbolic solution")
         fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name="Solution"))
         fig.update_layout(title="ODE Solution", xaxis_title="x", yaxis_title="y(x)")
@@ -936,11 +950,11 @@ def dashboard_page():
         if st.button("🔧 Create New Generator", use_container_width=True):
             st.session_state.generator_terms = []
             st.session_state.active_page = "🔧 Generator Constructor"
-            st.experimental_rerun()
+            _rerun()
     with q2:
         if st.button("📊 Generate Batch ODEs", use_container_width=True):
             st.session_state.active_page = "📊 Batch Generation"
-            st.experimental_rerun()
+            _rerun()
     with q3:
         export_all_results()
 
@@ -1014,7 +1028,7 @@ def generator_constructor_page():
             except Exception as e:
                 logger.warning(f"Could not add term to constructor: {e}")
             st.success(f"Added: {term.get_description()}")
-            st.experimental_rerun()
+            _rerun()
 
     # ----- Display current terms -----
     if st.session_state.generator_terms:
@@ -1038,7 +1052,7 @@ def generator_constructor_page():
                     for t in st.session_state.generator_terms:
                         new_constructor.add_term(t)
                     st.session_state.generator_constructor = new_constructor
-                    st.experimental_rerun()
+                    _rerun()
 
         if st.button("🔨 Build Generator Specification", type="primary", use_container_width=True):
             gen_spec = GeneratorSpecification(
@@ -1089,7 +1103,7 @@ def generator_constructor_page():
             if st.button("🚀 Generate ODE", type="primary", use_container_width=True):
                 with st.spinner("Applying Master Theorem 4.1 and constructing RHS..."):
                     try:
-                        # Resolve g(z) as a SymPy expression
+                        # Resolve f(z) as a SymPy expression
                         f_expr = get_function_expr(source_lib, func_name)
                         x = sp.Symbol("x", real=True)
 
@@ -1104,12 +1118,11 @@ def generator_constructor_page():
                                 generator_lhs = gen_spec.lhs
                             except Exception as e:
                                 logger.warning(f"Failed to apply generator to solution: {e}")
-                                # fallback: simple master RHS form (constant)
                                 rhs = sp.simplify(sp.pi * (f_expr.subs(sp.Symbol("z"), alpha + beta) + M))
-                                generator_lhs = sp.Symbol("L")[0]  # placeholder
+                                generator_lhs = sp.Symbol("LHS")
                         else:
                             rhs = sp.simplify(sp.pi * (f_expr.subs(sp.Symbol("z"), alpha + beta) + M))
-                            generator_lhs = sp.Symbol("L")[0]  # placeholder
+                            generator_lhs = sp.Symbol("LHS")
 
                         # Classification (simple, based on spec)
                         classification = {}
@@ -1131,7 +1144,7 @@ def generator_constructor_page():
                             "type": classification.get("type", "Unknown"),
                             "order": classification.get("order", 0),
                             "classification": classification,
-                            "initial_conditions": {},  # can be added if desired
+                            "initial_conditions": {},
                             "timestamp": datetime.now().isoformat(),
                             "generator_number": len(st.session_state.generated_odes) + 1,
                         }
@@ -1193,7 +1206,7 @@ def generator_constructor_page():
             st.session_state.generator_constructor = GeneratorConstructor()
             if "current_generator" in st.session_state:
                 st.session_state.pop("current_generator")
-            st.experimental_rerun()
+            _rerun()
     else:
         st.info("No terms yet. Use the builder above to add your first term.")
 
@@ -1770,6 +1783,7 @@ def physical_applications_page():
                     for ode in similar[:3]:
                         st.write(f"• Generator {ode.get('generator_number', 'N/A')}")
 
+    st.subfooter = st.subheader  # compatibility alias if Streamlit changes
     st.subheader("🔗 Match Your ODEs to Applications")
     if st.session_state.generated_odes and HAVE_SRC and st.session_state.ode_classifier is not None:
         selected_ode = st.selectbox(
@@ -1986,7 +2000,7 @@ def examples_library_page():
             },
             {
                 "name": "Exponential Nonlinearity",
-                "generator": "exp(y'') + exp(y') = RHS",
+                "generator": "exp(y'") + exp(y') = RHS",
                 "parameters": {"alpha": 0, "beta": 1, "n": 1, "M": 0},
                 "function": "log(z+1)",
                 "description": "Exponential transformation of derivatives",
