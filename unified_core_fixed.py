@@ -555,6 +555,8 @@ class NonlinearGeneratorFactory(StandardGenerator):
 # UNIFIED MASTER GENERATOR SYSTEM
 # ============================================================================
 
+# unified_core_fixed.py - Updated UnifiedMasterGenerator class
+
 class UnifiedMasterGenerator:
     """
     Unified system combining template-based and standard generators
@@ -645,7 +647,204 @@ class UnifiedMasterGenerator:
             'description': f"Template: {template}"
         }
     
-    # ... (rest remains the same)
+    def generate_standard(
+        self,
+        gen_type: str,
+        gen_num: int,
+        f_z: sp.Expr,
+        **extra_params
+    ) -> Dict[str, Any]:
+        """
+        Generate ODE using standard generators
+        
+        Args:
+            gen_type: 'linear' or 'nonlinear'
+            gen_num: Generator number (1-8 for linear, 1-10 for nonlinear)
+            f_z: Function f(z)
+            **extra_params: Additional parameters (q, v, a)
+            
+        Returns:
+            Dictionary with ODE details
+        """
+        if gen_type == 'linear':
+            return self.linear_factory.create(gen_num, f_z, **extra_params)
+        elif gen_type == 'nonlinear':
+            return self.nonlinear_factory.create(gen_num, f_z, **extra_params)
+        else:
+            raise ValueError(f"Unknown generator type: {gen_type}")
+    
+    def generate_batch(
+        self,
+        count: int,
+        mode: str = 'mixed',
+        functions: Optional[List[sp.Expr]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Generate multiple ODEs
+        
+        Args:
+            count: Number of ODEs to generate
+            mode: 'template', 'standard', or 'mixed'
+            functions: List of f(z) functions to use
+            
+        Returns:
+            List of ODE dictionaries
+        """
+        results = []
+        
+        # Default functions if not provided
+        if functions is None:
+            z = sp.Symbol('z')
+            functions = [
+                z, z**2, sp.exp(z), sp.sin(z), sp.cos(z),
+                sp.sinh(z), sp.cosh(z), sp.log(z + 1)
+            ]
+        
+        # Templates for template mode
+        templates = [
+            "y + Dy2",
+            "y + Dy1",
+            "Dy2 + Dy1",
+            "y + sin(Dy1)",
+            "exp(Dy2) + y",
+            "Dy3 + y",
+            "y + Dy1 + Dy2",
+            "sinh(Dy1) + y"
+        ]
+        
+        for i in range(count):
+            # Random selection
+            f_z = np.random.choice(functions)
+            
+            if mode == 'template' or (mode == 'mixed' and np.random.random() < 0.5):
+                # Template-based generation
+                template = np.random.choice(templates)
+                result = self.generate_from_template(template, f_z)
+            else:
+                # Standard generation
+                gen_type = np.random.choice(['linear', 'nonlinear'])
+                
+                if gen_type == 'linear':
+                    gen_num = np.random.randint(1, 9)
+                    result = self.generate_standard(gen_type, gen_num, f_z)
+                else:
+                    gen_num = np.random.randint(1, 11)
+                    extra = {}
+                    
+                    # Add random parameters for specific generators
+                    if gen_num in [1, 2, 4]:
+                        extra['q'] = np.random.randint(2, 5)
+                    if gen_num in [2, 3, 5]:
+                        extra['v'] = np.random.randint(2, 5)
+                    if gen_num in [4, 5, 9, 10]:
+                        extra['a'] = np.random.uniform(1.5, 3.0)
+                    
+                    result = self.generate_standard(gen_type, gen_num, f_z, **extra)
+            
+            results.append(result)
+        
+        return results
+    
+    def export_to_json(self, result: Dict[str, Any]) -> str:
+        """
+        Export ODE result to JSON format
+        
+        Args:
+            result: Dictionary containing ODE generation results
+            
+        Returns:
+            JSON string representation
+        """
+        # Prepare export data with string conversions for SymPy objects
+        export_data = {
+            'ode': str(result.get('ode', '')),
+            'lhs': str(result.get('lhs', '')),
+            'rhs': str(result.get('rhs', '')),
+            'solution': str(result.get('solution', '')),
+            'latex_ode': sp.latex(result.get('ode', '')) if result.get('ode') else '',
+            'latex_solution': sp.latex(result.get('solution', '')) if result.get('solution') else '',
+            'type': result.get('type', ''),
+            'order': result.get('order', 0),
+            'description': result.get('description', ''),
+            'initial_conditions': {},
+            'parameters': {
+                'alpha': float(self.params.get('alpha', 0)),
+                'beta': float(self.params.get('beta', 1)),
+                'n': int(self.params.get('n', 1)),
+                'M': float(self.params.get('M', 0))
+            }
+        }
+        
+        # Convert initial conditions
+        if 'initial_conditions' in result:
+            for key, value in result['initial_conditions'].items():
+                try:
+                    # Try to convert to string
+                    export_data['initial_conditions'][key] = str(value)
+                except:
+                    export_data['initial_conditions'][key] = 'undefined'
+        
+        # Add optional fields if present
+        optional_fields = [
+            'generator_number', 'template', 'powers', 
+            'scaling_parameter', 'subtype'
+        ]
+        
+        for field in optional_fields:
+            if field in result:
+                export_data[field] = result[field]
+        
+        # Add metadata
+        export_data['metadata'] = {
+            'generated_at': str(dt.datetime.now().isoformat()),
+            'version': '2.0.0'
+        }
+        
+        # Convert to JSON with proper formatting
+        # Use default=str to handle any remaining SymPy objects
+        return json.dumps(export_data, indent=2, default=str)
+    
+    def to_latex(self, result: Dict[str, Any]) -> Dict[str, str]:
+        """
+        Convert all SymPy expressions in result to LaTeX
+        
+        Args:
+            result: ODE generation result dictionary
+            
+        Returns:
+            Dictionary with LaTeX representations
+        """
+        latex_result = {}
+        
+        for key in ['ode', 'lhs', 'rhs', 'solution']:
+            if key in result and result[key] is not None:
+                try:
+                    latex_result[key] = sp.latex(result[key])
+                except:
+                    latex_result[key] = str(result[key])
+        
+        return latex_result
+    
+    def validate_parameters(self) -> bool:
+        """
+        Validate current parameters
+        
+        Returns:
+            True if parameters are valid
+        """
+        if self.params['beta'] <= 0:
+            raise ValueError("Beta must be positive")
+        
+        if self.params['n'] < 1:
+            raise ValueError("n must be at least 1")
+        
+        if abs(self.params['alpha']) > 100:
+            logger.warning("Alpha is very large, results may be unstable")
+        
+        if abs(self.params['M']) > 100:
+            logger.warning("M is very large, results may be unstable")
+        
+        return True
 
 
 # ============================================================================
