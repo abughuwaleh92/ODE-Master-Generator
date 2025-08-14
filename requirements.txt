@@ -64,3 +64,15 @@ mypy==1.7.1
 isort==5.12.0
 pre-commit==3.5.0
 PyJWT>=2.8.0
+streamlit>=1.33
+sympy>=1.12
+numpy>=1.23
+fastapi>=0.110
+uvicorn>=0.29
+sqlalchemy>=2.0
+pydantic>=2.5
+requests>=2.31
+scikit-learn>=1.2
+torch>=2.2
+
+
