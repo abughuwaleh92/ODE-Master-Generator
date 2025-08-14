@@ -52,20 +52,18 @@ except Exception:
 
 HAVE_SRC = True
 try:
-    # Core generators, constructors, theorems, classifiers
+    # Generators & factories
     from src.generators.master_generator import (
         MasterGenerator,
         EnhancedMasterGenerator,
         CompleteMasterGenerator,
+        CompleteLinearGeneratorFactory,      # <- lives here
+        CompleteNonlinearGeneratorFactory,   # <- lives here
     )
-    from src.generators.linear_generators import (
-        LinearGeneratorFactory,
-        CompleteLinearGeneratorFactory,
-    )
-    from src.generators.nonlinear_generators import (
-        NonlinearGeneratorFactory,
-        CompleteNonlinearGeneratorFactory,
-    )
+    from src.generators.linear_generators import LinearGeneratorFactory
+    from src.generators.nonlinear_generators import NonlinearGeneratorFactory
+
+    # Constructor & DSL
     from src.generators.generator_constructor import (
         GeneratorConstructor,
         GeneratorSpecification,
@@ -73,21 +71,27 @@ try:
         DerivativeType,
         OperatorType,
     )
+
+    # Master theorems
     from src.generators.master_theorem import (
         MasterTheoremSolver,
         MasterTheoremParameters,
         ExtendedMasterTheorem,
     )
+
+    # Classifier
     from src.generators.ode_classifier import ODEClassifier, PhysicalApplication
+
     # Functions
     from src.functions.basic_functions import BasicFunctions
     from src.functions.special_functions import SpecialFunctions
+
     # ML / DL
     from src.ml.pattern_learner import (
         GeneratorPatternLearner,
         GeneratorVAE,
         GeneratorTransformer,
-        create_model,
+        create_model,  # defined in pattern_learner and re-exported in src/ml/__init__.py
     )
     from src.ml.trainer import MLTrainer, ODEDataset, ODEDataGenerator
     from src.ml.generator_learner import (
@@ -101,15 +105,89 @@ try:
         ODETokenizer,
         ODETransformer,
     )
+
     # Utils
     from src.utils.config import Settings, AppConfig
     from src.utils.cache import CacheManager, cached
     from src.utils.validators import ParameterValidator
-    from src.ui.components import UIComponents
+
+    # UI (note the capital U/I in the repo)
+    from src.UI.components import UIComponents
 
 except Exception as e:
-    logger.warning(f"Some imports from src/ failed or are missing: {e}")
+    # Optional fallback for environments where 'src.' prefix isn't used
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.warning(
+        "Some imports from src/ failed (%s). "
+        "Attempting fallback imports without the 'src.' prefix.", e
+    )
     HAVE_SRC = False
+    # Fall back to flat package layout if someone installed your src as a package
+    try:
+        from generators.master_generator import (
+            MasterGenerator,
+            EnhancedMasterGenerator,
+            CompleteMasterGenerator,
+            CompleteLinearGeneratorFactory,
+            CompleteNonlinearGeneratorFactory,
+        )
+        from generators.linear_generators import LinearGeneratorFactory
+        from generators.nonlinear_generators import NonlinearGeneratorFactory
+
+        from generators.generator_constructor import (
+            GeneratorConstructor,
+            GeneratorSpecification,
+            DerivativeTerm,
+            DerivativeType,
+            OperatorType,
+        )
+        from generators.master_theorem import (
+            MasterTheoremSolver,
+            MasterTheoremParameters,
+            ExtendedMasterTheorem,
+        )
+        from generators.ode_classifier import ODEClassifier, PhysicalApplication
+
+        from functions.basic_functions import BasicFunctions
+        from functions.special_functions import SpecialFunctions
+
+        from ml.pattern_learner import (
+            GeneratorPatternLearner,
+            GeneratorVAE,
+            GeneratorTransformer,
+            create_model,
+        )
+        from ml.trainer import MLTrainer, ODEDataset, ODEDataGenerator
+        from ml.generator_learner import (
+            GeneratorPattern,
+            GeneratorPatternNetwork,
+            GeneratorLearningSystem,
+        )
+        from dl.novelty_detector import (
+            ODENoveltyDetector,
+            NoveltyAnalysis,
+            ODETokenizer,
+            ODETransformer,
+        )
+
+        from utils.config import Settings, AppConfig
+        from utils.cache import CacheManager, cached
+        from utils.validators import ParameterValidator
+
+        # UI fallback (try both cases to be safe)
+        try:
+            from UI.components import UIComponents
+        except Exception:
+            from ui.components import UIComponents
+
+        HAVE_SRC = True
+    except Exception as e2:
+        logger.error(
+            "Fallback imports also failed: %s. "
+            "Ensure the project ZIP is extracted with the 'src/' folder and run from repo root.",
+            e2
+        )
 
 # -----------------------------------------------------------------------------
 # Streamlit page config & CSS
