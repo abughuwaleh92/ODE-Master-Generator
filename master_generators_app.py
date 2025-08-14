@@ -1,472 +1,1229 @@
-# master_generators_app.py
-# Streamlit UI for Master Generators (Theorem 4.2) with robust core-call compatibility
+# unified_core.py
+"""
+Unified Master Generators Core Module
+Combines Theorem 4.2 template-based approach with complete standard generators
+"""
+
 from __future__ import annotations
 
-import os
-import json
-import traceback
-from typing import Any, Dict, Optional, Tuple
-
 import sympy as sp
-from sympy import Eq
+import numpy as np
+from typing import Dict, Any, List, Optional, Tuple, Callable, Union
+from dataclasses import dataclass
+from enum import Enum
+import json
+import logging
 
-import streamlit as st
+logger = logging.getLogger(__name__)
 
-# Optional HTTP for API probe
-try:
-    import requests  # type: ignore
-except Exception:
-    requests = None
+# ============================================================================
+# CORE THEOREM 4.2 IMPLEMENTATION
+# ============================================================================
 
-# ---- Import shim for the core ----
-# We support both a flat file and a packaged core (mg_core.core_master_generators)
-CORE_IMPORT_OK = False
-core_err = None
-try:
-    from core_master_generators import (
-        Theorem42, GeneratorBuilder, TemplateConfig,
-        safe_eval_f_of_z, ode_to_json, expr_from_srepr,
-        GeneratorLibrary, GeneratorPatternLearner, NoveltyDetector
-    )
-    CORE_IMPORT_OK = True
-except Exception as e1:
-    try:
-        from mg_core.core_master_generators import (
-            Theorem42, GeneratorBuilder, TemplateConfig,
-            safe_eval_f_of_z, ode_to_json, expr_from_srepr,
-            GeneratorLibrary, GeneratorPatternLearner, NoveltyDetector
+class Theorem42:
+    """
+    Implements the generalized (compact) form of Theorem 4.2
+    Supports both symbolic and numeric n and m parameters
+    """
+    
+    def __init__(
+        self,
+        x: Optional[sp.Symbol] = None,
+        alpha: Optional[sp.Symbol] = None,
+        beta: Optional[sp.Symbol] = None,
+        n: Union[int, str, sp.Symbol] = "n",
+        m_sym: Optional[sp.Symbol] = None
+    ):
+        self.x = x or sp.symbols("x", real=True)
+        self.alpha = alpha if alpha is not None else sp.symbols("alpha", real=True)
+        self.beta = beta if beta is not None else sp.symbols("beta", real=True)
+        
+        # Handle n as symbolic or numeric
+        if isinstance(n, (int, sp.Integer)):
+            self.n = int(n)
+        elif isinstance(n, str):
+            self.n = sp.symbols(n, integer=True, positive=True)
+        else:
+            self.n = n
+        
+        # Canonical integer symbols for summation
+        self.s = sp.symbols("s", integer=True, positive=True)
+        self.j = sp.symbols("j", integer=True, positive=True)
+        
+        # Symbolic m
+        self.m_sym = m_sym if isinstance(m_sym, sp.Symbol) else sp.symbols("m", integer=True, positive=True)
+        
+        # Function symbol
+        self.yfun = sp.Function("y")(self.x)
+    
+    def _omega(self, s: Optional[int] = None) -> sp.Expr:
+        """Compute ω(s) = (2s-1)π/(2n)"""
+        s_val = self.s if s is None else s
+        return sp.pi * (2*s_val - 1) / (2*self.n)
+    
+    def _lambda(self, s: Optional[int] = None) -> sp.Expr:
+        """λ_s = exp(i x cos ω_s − x sin ω_s)"""
+        w = self._omega(s)
+        return sp.exp(sp.I*self.x*sp.cos(w) - self.x*sp.sin(w))
+    
+    def _lambda_bar(self, s: Optional[int] = None) -> sp.Expr:
+        """λ̄_s = exp(−i x cos ω_s − x sin ω_s)"""
+        w = self._omega(s)
+        return sp.exp(-sp.I*self.x*sp.cos(w) - self.x*sp.sin(w))
+    
+    def _zeta(self, s: Optional[int] = None) -> sp.Expr:
+        """ζ_s = exp(−x sin ω_s)"""
+        w = self._omega(s)
+        return sp.exp(-self.x*sp.sin(w))
+    
+    def _psi(self, f: Callable[[sp.Expr], sp.Expr], s: Optional[int] = None) -> sp.Expr:
+        """ψ = f(α + β λ_s)"""
+        lam = self._lambda(s)
+        return f(self.alpha + self.beta*lam)
+    
+    def _phi(self, f: Callable[[sp.Expr], sp.Expr], s: Optional[int] = None) -> sp.Expr:
+        """φ = f(α + β λ̄_s)"""
+        lam_bar = self._lambda_bar(s)
+        return f(self.alpha + self.beta*lam_bar)
+    
+    def y_base(self, f: Callable[[sp.Expr], sp.Expr], n_override: Optional[Any] = None) -> sp.Expr:
+        """Generate y(x) solution using Theorem 4.1"""
+        nval = self.n if n_override is None else n_override
+        s = self.s
+        
+        # Build the sum
+        f_alpha_beta = f(self.alpha + self.beta)
+        expr = sp.summation(
+            2*f_alpha_beta - self._psi(f, s) - self._phi(f, s),
+            (s, 1, nval)
         )
-        CORE_IMPORT_OK = True
-    except Exception as e2:
-        core_err = (e1, e2)
-        CORE_IMPORT_OK = False
+        
+        return sp.pi/(2*nval) * expr
+    
+    def y_derivative(
+        self,
+        f: Callable[[sp.Expr], sp.Expr],
+        m: Optional[Union[int, sp.Symbol]] = None,
+        n_override: Optional[Any] = None,
+        complex_form: bool = True
+    ) -> sp.Expr:
+        """
+        General m-th derivative of y(x)
+        Handles both numeric and symbolic m
+        """
+        nval = self.n if n_override is None else n_override
+        s, j = self.s, self.j
+        
+        lam = self._lambda(s)
+        lamp = self._lambda_bar(s)
+        zeta = self._zeta(s)
+        
+        # Numeric m - explicit expansion
+        if isinstance(m, (int, sp.Integer)):
+            m = int(m)
+            if m <= 0:
+                return sp.S.Zero
+            
+            inner = sp.S.Zero
+            for jj in range(1, m+1):
+                # Stirling number of second kind
+                from sympy.functions.combinatorial.numbers import stirling
+                S = stirling(m, jj, kind=2)
+                
+                # Derivatives of psi and phi w.r.t. alpha
+                dpsi = sp.Derivative(self._psi(f, s), (self.alpha, jj))
+                dphi = sp.Derivative(self._phi(f, s), (self.alpha, jj))
+                
+                # Build term
+                term = S * (self.beta**jj) * (zeta**jj) * (
+                    lam**m * dpsi + lamp**m * dphi
+                )
+                inner += term
+            
+            result = -sp.pi/(2*nval) * sp.summation(inner, (s, 1, nval))
+            
+        else:
+            # Symbolic m - use symbolic sums
+            m_sym = self.m_sym if m is None else m
+            from sympy.functions.combinatorial.numbers import stirling
+            S2 = stirling(m_sym, j, kind=2)
+            
+            dpsi = sp.Derivative(self._psi(f, s), (self.alpha, j))
+            dphi = sp.Derivative(self._phi(f, s), (self.alpha, j))
+            
+            summand = S2 * (self.beta**j) * (zeta**j) * (
+                lam**m_sym * dpsi + lamp**m_sym * dphi
+            )
+            
+            result = -sp.pi/(2*nval) * sp.summation(
+                sp.summation(summand, (j, 1, m_sym)), 
+                (s, 1, nval)
+            )
+        
+        return result if complex_form else sp.re(result)
 
-if not CORE_IMPORT_OK:
-    st.error(
-        "Cannot import `core_master_generators`. "
-        "Place `core_master_generators.py` next to this file or install the `mg_core` package."
-    )
-    if core_err:
-        st.code("\n".join([repr(core_err[0]), repr(core_err[1])]))
-    st.stop()
 
-# ---- Page config ----
-st.set_page_config(page_title="Master Generators (Theorem 4.2)", layout="wide")
+# ============================================================================
+# TEMPLATE-BASED GENERATOR BUILDER
+# ============================================================================
 
-# ---- Session init ----
-if "learner" not in st.session_state:
-    st.session_state.learner = GeneratorPatternLearner()
-if "novelty" not in st.session_state:
-    st.session_state.novelty = NoveltyDetector()
-if "trainset" not in st.session_state:
-    st.session_state.trainset = []  # list of (lhs_expr, rhs_expr, meta)
-if "current_ode" not in st.session_state:
-    st.session_state.current_ode = None
+@dataclass
+class TemplateConfig:
+    """Configuration for template-based generators"""
+    alpha: Any = sp.symbols("alpha", real=True)
+    beta: Any = sp.symbols("beta", real=True)
+    n: Any = sp.symbols("n", integer=True, positive=True)
+    m_sym: Any = sp.symbols("m", integer=True, positive=True)
 
-# ---- Helpers ----
 
-def hr():
-    st.markdown("---")
-
-def to_latex(lhs: sp.Expr, rhs: sp.Expr) -> str:
-    return sp.latex(Eq(lhs, rhs))
-
-def build_theorem(n_mode: str, n_value: Optional[int]) -> Theorem42:
+class GeneratorBuilder:
     """
-    Build Theorem42 with symbolic or numeric n.
-    Some cores accept str('n'); others require a SymPy Symbol. We try both.
+    Builds ODEs from free-form templates using Theorem 4.2
     """
-    if n_mode == "Symbolic (n)":
-        # Try SymPy symbol first
+    
+    def __init__(self, theorem: Theorem42, config: Optional[TemplateConfig] = None):
+        self.T = theorem
+        self.cfg = config or TemplateConfig()
+        self.x = self.T.x
+        self.yfun = self.T.yfun
+        self.m_val: Optional[Any] = None
+    
+    @staticmethod
+    def _parse_template(template: str) -> str:
+        """Parse template aliases"""
+        import re
+        # Map y^(m) → Dym, y^(k) → Dyk
+        s = re.sub(r"y\^\(\s*m\s*\)", "Dym", template)
+        s = re.sub(r"y\^\(\s*(\d+)\s*\)", lambda m: f"Dy{m.group(1)}", s)
+        return s
+    
+    @staticmethod
+    def _extract_orders(template: str) -> List[int]:
+        """Extract derivative orders from template"""
+        import re
+        return sorted({int(m) for m in re.findall(r"\bDy(\d+)\b", template)})
+    
+    def build(
+        self,
+        template: str,
+        f: Callable[[sp.Expr], sp.Expr],
+        m: Optional[Union[int, sp.Symbol]] = None,
+        n_override: Optional[Any] = None,
+        complex_form: bool = True
+    ) -> Tuple[sp.Expr, sp.Expr]:
+        """
+        Build LHS and RHS from template
+        
+        Args:
+            template: Template string like "y + sin(Dy1) + exp(Dy2)"
+            f: Function f(z)
+            m: Value for symbolic m
+            n_override: Override for n
+            complex_form: Keep complex form or take real part
+            
+        Returns:
+            (LHS expression, RHS expression)
+        """
+        self.m_val = m
+        template = self._parse_template(template)
+        orders = self._extract_orders(template)
+        uses_dym = "Dym" in template
+        
+        # Build namespace for LHS
+        ns_lhs = _sympy_ns()
+        ns_lhs.update({
+            "x": self.x,
+            "y": self.yfun,
+            "alpha": self.T.alpha,
+            "beta": self.T.beta,
+            "m": m if m is not None else self.T.m_sym
+        })
+        
+        # Add derivative symbols
+        for k in orders:
+            ns_lhs[f"Dy{k}"] = sp.Derivative(self.yfun, (self.x, k))
+        
+        if uses_dym:
+            if isinstance(m, (int, sp.Integer)):
+                ns_lhs["Dym"] = sp.Derivative(self.yfun, (self.x, int(m)))
+            else:
+                ns_lhs["Dym"] = sp.Symbol("Dym")  # Placeholder for symbolic m
+        
+        # Parse LHS
         try:
-            return Theorem42(n=sp.Symbol("n"))
-        except TypeError:
-            return Theorem42(n="n")
-        except Exception:
-            return Theorem42()  # as last resort
-    else:
-        if n_value is None or int(n_value) <= 0:
-            raise ValueError("Numeric n must be a positive integer.")
-        return Theorem42(n=int(n_value))
-
-def make_builder(T: Theorem42) -> GeneratorBuilder:
-    """
-    Compatibility wrapper around GeneratorBuilder construction.
-    Supports:
-      - GeneratorBuilder(T, TemplateConfig(...))
-      - GeneratorBuilder(T)
-      - legacy: (GeneratorBuilder().init(T)) or init(T, TemplateConfig(...))
-    """
-    cfg = TemplateConfig(
-        alpha=getattr(T, "alpha", sp.Symbol("alpha")),
-        beta=getattr(T, "beta", sp.Symbol("beta")),
-        n=getattr(T, "n", sp.Symbol("n")),
-        m_sym=getattr(T, "m_sym", sp.Symbol("m")),
-    )
-    # Try preferred signature: (theorem, config)
-    try:
-        return GeneratorBuilder(T, cfg)  # type: ignore[arg-type]
-    except TypeError:
-        pass
-    except Exception:
-        pass
-    # Try minimal: (theorem)
-    try:
-        return GeneratorBuilder(T)  # type: ignore[arg-type]
-    except TypeError:
-        pass
-    except Exception:
-        pass
-    # Legacy: instance + .init(...)
-    gb = GeneratorBuilder  # class
-    try:
-        inst = gb()  # type: ignore[call-arg]
-        if hasattr(inst, "init"):
-            try:
-                return inst.init(T, cfg)  # type: ignore[attr-defined]
-            except TypeError:
-                return inst.init(T)  # type: ignore[attr-defined]
-        # If no .init, but constructor requires no args:
-        return inst  # type: ignore[return-value]
-    except Exception as e:
-        raise TypeError(
-            f"Cannot create GeneratorBuilder with any supported signature: {e}"
-        )
-
-def call_build(G: Any, *, template: str, f: Any, m: Any, complex_form: bool) -> Tuple[sp.Expr, sp.Expr]:
-    """
-    Robust call into GeneratorBuilder.build(), trying common signatures.
-    Prioritized signature:
-        build(template=..., f=..., m=..., n_override=None, complex_form=True)
-    Fallbacks try removing unknown keywords / renaming flags.
-    """
-    # 1) Preferred keyworded signature
-    try:
-        return G.build(template=template, f=f, m=m, n_override=None, complex_form=complex_form)
-    except TypeError:
-        pass
-    # 2) Without n_override
-    try:
-        return G.build(template=template, f=f, m=m, complex_form=complex_form)
-    except TypeError:
-        pass
-    # 3) Positional with complex_form
-    try:
-        return G.build(template, f, m, complex_form)
-    except TypeError:
-        pass
-    # 4) Positional without complex_form
-    try:
-        return G.build(template, f, m)
-    except TypeError as e:
-        raise TypeError(f"GeneratorBuilder.build() signature mismatch: {e}")
-
-def ui_presets() -> Tuple[str, str]:
-    """
-    Provide preset (template, f_str) without instantiating GeneratorLibrary.
-    """
-    # Return values from static/class helpers when available, else built-ins
-    try:
-        return GeneratorLibrary.preset_pantograph_linear()  # type: ignore[attr-defined]
-    except Exception:
-        return ("y + Dy2", "z")
-
-def ui_presets_nonlinear() -> Tuple[str, str]:
-    try:
-        return GeneratorLibrary.preset_nonlinear_wrap()  # type: ignore[attr-defined]
-    except Exception:
-        return ("exp(Dy2) + y", "sin(z)")
-
-def ui_presets_multi() -> Tuple[str, str]:
-    try:
-        return GeneratorLibrary.preset_multiorder_mix()  # type: ignore[attr-defined]
-    except Exception:
-        return ("y + Dy1 + Dy3 + sinh(Dym)", "exp(z)")
-
-# ---- Pages ----
-
-def page_generators():
-    st.title("Master Generators — Compose & Generate (Theorem 4.2)")
-
-    colL, colR = st.columns([7, 5])
-
-    with colL:
-        st.subheader("1) Compose LHS freely")
-        st.markdown(
-            """
-            **Atoms**:  
-            - `y` → \( y(x) \)  
-            - `DyK` → \( y^{(K)}(x) \), e.g. `Dy1`, `Dy2`, `Dy3`  
-            - `Dym` → \( y^{(m)}(x) \) when \(m\) is symbolic  
-            - `y^(m)` is accepted as an alias for `Dym`  
-            - Wraps: `exp(Dy2)`, `sinh(Dym)`, `cos(y)`, `log(1+y)`, etc.
-            """
-        )
-
-        preset = st.selectbox(
-            "Presets (optional)",
-            options=[
-                "— choose —",
-                "Pantograph (linear): y + Dy2 with f(z)=z",
-                "Nonlinear wrap: exp(Dy2) + y with f(z)=sin(z)",
-                "Multi-order mix: y + Dy1 + Dy3 + sinh(Dym) with f(z)=exp(z)",
-            ],
-            index=0,
-        )
-
-        default_template, default_f = ("y + Dy2", "z")
-        if preset == "Pantograph (linear): y + Dy2 with f(z)=z":
-            default_template, default_f = ui_presets()
-        elif preset == "Nonlinear wrap: exp(Dy2) + y with f(z)=sin(z)":
-            default_template, default_f = ui_presets_nonlinear()
-        elif preset == "Multi-order mix: y + Dy1 + Dy3 + sinh(Dym) with f(z)=exp(z)":
-            default_template, default_f = ui_presets_multi()
-
-        template = st.text_input("LHS template", value=default_template)
-        f_str = st.text_input("Analytic f(z)", value=default_f)
-
-        hr()
-        st.subheader("2) Symbolic parameters")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            n_mode = st.radio("n is", ["Symbolic (n)", "Numeric"], horizontal=True)
-        with c2:
-            n_value = None
-            if n_mode == "Numeric":
-                n_value = st.number_input("n (integer ≥ 1)", min_value=1, max_value=999, value=2, step=1)
-        with c3:
-            m_mode = st.radio("m is", ["Symbolic (m)", "Numeric"], horizontal=True)
-            m_value = None
-            if m_mode == "Numeric":
-                m_value = st.number_input("m (integer ≥ 1)", min_value=1, max_value=999, value=3, step=1)
-
-        complex_form = st.checkbox("Keep complex form (uncheck to take Re)", value=True)
-
-        hr()
-        st.subheader("3) Build ODE (RHS via Theorem 4.2)")
-        build_btn = st.button("Build ODE")
-
-    with colR:
-        st.subheader("Numeric preview (optional)")
-        alpha_val = st.text_input("alpha", "1")
-        beta_val = st.text_input("beta", "0.5")
-        x_val = st.text_input("x", "0.7")
-        eval_btn = st.button("Evaluate Sample")
-
-    if build_btn:
-        try:
-            f = safe_eval_f_of_z(f_str)
+            lhs = sp.sympify(template, locals=ns_lhs)
         except Exception as e:
-            st.error(f"Invalid f(z): {e}")
-            return
-
+            raise ValueError(f"Cannot parse LHS template: {e}\nTemplate: {template}")
+        
+        # Build RHS by substituting actual expressions
+        rhs_map = {}
+        rhs_map["y"] = self.T.y_base(f, n_override=n_override)
+        
+        for k in orders:
+            rhs_map[f"Dy{k}"] = self.T.y_derivative(f, m=k, n_override=n_override, complex_form=complex_form)
+        
+        if uses_dym:
+            rhs_map["Dym"] = self.T.y_derivative(
+                f,
+                m=(m if m is not None else self.T.m_sym),
+                n_override=n_override,
+                complex_form=complex_form
+            )
+        
+        # Build RHS namespace
+        ns_rhs = ns_lhs.copy()
+        ns_rhs.update(rhs_map)
+        
+        # Parse RHS
         try:
-            T = build_theorem(n_mode, n_value)
-            G = make_builder(T)
+            rhs = sp.sympify(template, locals=ns_rhs)
         except Exception as e:
-            st.error(f"Failed to initialize builder: {e}")
-            st.code(traceback.format_exc())
-            return
+            raise ValueError(f"Cannot build RHS: {e}\nTemplate: {template}")
+        
+        return sp.simplify(lhs), sp.simplify(rhs)
 
-        try:
-            m_arg = getattr(T, "m_sym", sp.Symbol("m")) if m_mode == "Symbolic (m)" else int(m_value)  # type: ignore[arg-type]
-            lhs, rhs = call_build(G, template=template, f=f, m=m_arg, complex_form=complex_form)
-        except Exception as e:
-            st.error(f"Failed to build ODE: {e}")
-            st.code(traceback.format_exc())
-            return
 
-        st.success("ODE constructed.")
-        st.latex(to_latex(lhs, rhs))
+# ============================================================================
+# COMPLETE STANDARD GENERATORS
+# ============================================================================
 
-        # JSON
-        meta = {
-            "template": template,
-            "f_str": f_str,
-            "n_mode": n_mode,
-            "n_value": (int(n_value) if n_mode == "Numeric" else "n"),
-            "m_mode": m_mode,
-            "m_value": (int(m_value) if m_mode == "Numeric" else "m"),
-            "complex_form": complex_form,
+class StandardGenerator:
+    """Base class for standard generators"""
+    
+    def __init__(self, alpha: float = 1.0, beta: float = 1.0, n: int = 1, M: float = 0.0):
+        if beta <= 0:
+            raise ValueError("Beta must be positive")
+        if n < 1:
+            raise ValueError("n must be at least 1")
+        
+        self.alpha = alpha
+        self.beta = beta
+        self.n = n
+        self.M = M
+        
+        self.x = sp.Symbol('x', real=True)
+        self.z = sp.Symbol('z')
+        self.y = sp.Function('y')
+    
+    def compute_derivatives_at_exp(self, f_z: sp.Expr, max_order: int = 3) -> Dict[int, sp.Expr]:
+        """Compute derivatives of f at α + βe^(-x)"""
+        exp_arg = self.alpha + self.beta * sp.exp(-self.x)
+        derivatives = {}
+        
+        derivatives[0] = f_z.subs(self.z, exp_arg)
+        
+        current_deriv = f_z
+        for order in range(1, max_order + 1):
+            current_deriv = sp.diff(current_deriv, self.z)
+            derivatives[order] = current_deriv.subs(self.z, exp_arg)
+        
+        return derivatives
+    
+    def compute_derivatives_at_scaled(self, f_z: sp.Expr, a: float, max_order: int = 3) -> Dict[int, sp.Expr]:
+        """Compute derivatives of f at α + βe^(-x/a)"""
+        exp_arg_scaled = self.alpha + self.beta * sp.exp(-self.x/a)
+        derivatives = {}
+        
+        derivatives[0] = f_z.subs(self.z, exp_arg_scaled)
+        
+        current_deriv = f_z
+        for order in range(1, max_order + 1):
+            current_deriv = sp.diff(current_deriv, self.z)
+            derivatives[order] = current_deriv.subs(self.z, exp_arg_scaled)
+        
+        return derivatives
+
+
+class LinearGeneratorFactory(StandardGenerator):
+    """Factory for all 8 linear generators with explicit RHS"""
+    
+    def create(self, generator_number: int, f_z: sp.Expr, **params) -> Dict[str, Any]:
+        """Create linear generator by number (1-8)"""
+        
+        # Initialize with parameters
+        self.__init__(**params)
+        
+        generators = {
+            1: self._generator_1,
+            2: self._generator_2,
+            3: self._generator_3,
+            4: self._generator_4,
+            5: self._generator_5,
+            6: self._generator_6,
+            7: self._generator_7,
+            8: self._generator_8,
         }
-        ser = ode_to_json(lhs, rhs, meta=meta)
-        st.subheader("Serialized ODE (JSON)")
-        st.json(json.loads(ser))
-        st.download_button("⬇️ Download ODE JSON", data=ser.encode("utf-8"), file_name="ode.json", mime="application/json")
+        
+        if generator_number not in generators:
+            raise ValueError(f"Linear generator number must be 1-8, got {generator_number}")
+        
+        return generators[generator_number](f_z, **params)
+    
+    def _generator_1(self, f_z: sp.Expr, **kwargs) -> Dict[str, Any]:
+        """Generator 1: y''(x) + y(x) = RHS"""
+        f_alpha_beta = f_z.subs(self.z, self.alpha + self.beta)
+        derivs = self.compute_derivatives_at_exp(f_z, 2)
+        
+        rhs = sp.pi * (f_alpha_beta - derivs[0] + self.M 
+                      - self.beta * sp.exp(-self.x) * derivs[1]
+                      - self.beta**2 * sp.exp(-2*self.x) * derivs[2])
+        
+        lhs = self.y(self.x).diff(self.x, 2) + self.y(self.x)
+        ode = sp.Eq(lhs, rhs)
+        
+        # Generate solution using Theorem 4.2
+        theorem = Theorem42(alpha=self.alpha, beta=self.beta, n=self.n, m_sym=sp.Symbol('m'))
+        solution = theorem.y_base(lambda z: f_z.subs(self.z, z))
+        
+        return {
+            'ode': ode,
+            'lhs': lhs,
+            'rhs': rhs,
+            'solution': solution,
+            'type': 'linear',
+            'order': 2,
+            'generator_number': 1,
+            'description': "y''(x) + y(x) = RHS",
+            'initial_conditions': {'y(0)': sp.pi * self.M}
+        }
+    
+    def _generator_2(self, f_z: sp.Expr, **kwargs) -> Dict[str, Any]:
+        """Generator 2: y''(x) + y'(x) = RHS"""
+        f_alpha_beta = f_z.subs(self.z, self.alpha + self.beta)
+        derivs = self.compute_derivatives_at_exp(f_z, 2)
+        
+        rhs = sp.pi * (f_alpha_beta - derivs[0] + self.M
+                      - self.beta**2 * sp.exp(-2*self.x) * derivs[2])
+        
+        lhs = self.y(self.x).diff(self.x, 2) + self.y(self.x).diff(self.x)
+        ode = sp.Eq(lhs, rhs)
+        
+        theorem = Theorem42(alpha=self.alpha, beta=self.beta, n=self.n)
+        solution = theorem.y_base(lambda z: f_z.subs(self.z, z))
+        
+        return {
+            'ode': ode,
+            'lhs': lhs,
+            'rhs': rhs,
+            'solution': solution,
+            'type': 'linear',
+            'order': 2,
+            'generator_number': 2,
+            'description': "y''(x) + y'(x) = RHS",
+            'initial_conditions': {'y(0)': sp.pi * self.M}
+        }
+    
+    def _generator_3(self, f_z: sp.Expr, **kwargs) -> Dict[str, Any]:
+        """Generator 3: y(x) + y'(x) = RHS"""
+        f_alpha_beta = f_z.subs(self.z, self.alpha + self.beta)
+        
+        rhs = sp.pi * (f_alpha_beta + self.M)
+        
+        lhs = self.y(self.x) + self.y(self.x).diff(self.x)
+        ode = sp.Eq(lhs, rhs)
+        
+        theorem = Theorem42(alpha=self.alpha, beta=self.beta, n=self.n)
+        solution = theorem.y_base(lambda z: f_z.subs(self.z, z))
+        
+        return {
+            'ode': ode,
+            'lhs': lhs,
+            'rhs': rhs,
+            'solution': solution,
+            'type': 'linear',
+            'order': 1,
+            'generator_number': 3,
+            'description': "y(x) + y'(x) = RHS",
+            'initial_conditions': {'y(0)': sp.pi * self.M}
+        }
+    
+    def _generator_4(self, f_z: sp.Expr, a: float = 2, **kwargs) -> Dict[str, Any]:
+        """Generator 4: y''(x) + y(x/a) - y(x) = RHS (Pantograph)"""
+        f_alpha_beta = f_z.subs(self.z, self.alpha + self.beta)
+        derivs_exp = self.compute_derivatives_at_exp(f_z, 2)
+        derivs_scaled = self.compute_derivatives_at_scaled(f_z, a, 2)
+        
+        rhs = sp.pi * (f_alpha_beta - derivs_exp[0] + derivs_scaled[0] - derivs_exp[0] + self.M
+                      - self.beta * sp.exp(-self.x) * derivs_exp[1]
+                      - self.beta**2 * sp.exp(-2*self.x) * derivs_exp[2])
+        
+        lhs = self.y(self.x).diff(self.x, 2) + self.y(self.x/a) - self.y(self.x)
+        ode = sp.Eq(lhs, rhs)
+        
+        theorem = Theorem42(alpha=self.alpha, beta=self.beta, n=self.n)
+        solution = theorem.y_base(lambda z: f_z.subs(self.z, z))
+        
+        return {
+            'ode': ode,
+            'lhs': lhs,
+            'rhs': rhs,
+            'solution': solution,
+            'type': 'linear',
+            'subtype': 'pantograph',
+            'order': 2,
+            'generator_number': 4,
+            'scaling_parameter': a,
+            'description': f"y''(x) + y(x/{a}) - y(x) = RHS",
+            'initial_conditions': {'y(0)': sp.pi * self.M}
+        }
+    
+    def _generator_5(self, f_z: sp.Expr, a: float = 2, **kwargs) -> Dict[str, Any]:
+        """Generator 5: y(x/a) + y'(x) = RHS"""
+        f_alpha_beta = f_z.subs(self.z, self.alpha + self.beta)
+        derivs_scaled = self.compute_derivatives_at_scaled(f_z, a, 1)
+        
+        rhs = sp.pi * (f_alpha_beta + derivs_scaled[0] - f_alpha_beta + self.M)
+        
+        lhs = self.y(self.x/a) + self.y(self.x).diff(self.x)
+        ode = sp.Eq(lhs, rhs)
+        
+        theorem = Theorem42(alpha=self.alpha, beta=self.beta, n=self.n)
+        solution = theorem.y_base(lambda z: f_z.subs(self.z, z))
+        
+        return {
+            'ode': ode,
+            'lhs': lhs,
+            'rhs': rhs,
+            'solution': solution,
+            'type': 'linear',
+            'subtype': 'delay',
+            'order': 1,
+            'generator_number': 5,
+            'scaling_parameter': a,
+            'description': f"y(x/{a}) + y'(x) = RHS",
+            'initial_conditions': {'y(0)': sp.pi * self.M}
+        }
+    
+    def _generator_6(self, f_z: sp.Expr, **kwargs) -> Dict[str, Any]:
+        """Generator 6: y'''(x) + y(x) = RHS"""
+        f_alpha_beta = f_z.subs(self.z, self.alpha + self.beta)
+        derivs = self.compute_derivatives_at_exp(f_z, 3)
+        
+        rhs = sp.pi * (f_alpha_beta - derivs[0] + self.M
+                      - self.beta * sp.exp(-self.x) * derivs[1]
+                      - self.beta**2 * sp.exp(-2*self.x) * derivs[2]
+                      - self.beta**3 * sp.exp(-3*self.x) * derivs[3])
+        
+        lhs = self.y(self.x).diff(self.x, 3) + self.y(self.x)
+        ode = sp.Eq(lhs, rhs)
+        
+        theorem = Theorem42(alpha=self.alpha, beta=self.beta, n=self.n)
+        solution = theorem.y_base(lambda z: f_z.subs(self.z, z))
+        
+        return {
+            'ode': ode,
+            'lhs': lhs,
+            'rhs': rhs,
+            'solution': solution,
+            'type': 'linear',
+            'order': 3,
+            'generator_number': 6,
+            'description': "y'''(x) + y(x) = RHS",
+            'initial_conditions': {'y(0)': sp.pi * self.M}
+        }
+    
+    def _generator_7(self, f_z: sp.Expr, **kwargs) -> Dict[str, Any]:
+        """Generator 7: y'''(x) + y'(x) = RHS"""
+        f_alpha_beta = f_z.subs(self.z, self.alpha + self.beta)
+        derivs = self.compute_derivatives_at_exp(f_z, 3)
+        
+        rhs = sp.pi * (f_alpha_beta - derivs[0] + self.M
+                      - self.beta**3 * sp.exp(-3*self.x) * derivs[3])
+        
+        lhs = self.y(self.x).diff(self.x, 3) + self.y(self.x).diff(self.x)
+        ode = sp.Eq(lhs, rhs)
+        
+        theorem = Theorem42(alpha=self.alpha, beta=self.beta, n=self.n)
+        solution = theorem.y_base(lambda z: f_z.subs(self.z, z))
+        
+        return {
+            'ode': ode,
+            'lhs': lhs,
+            'rhs': rhs,
+            'solution': solution,
+            'type': 'linear',
+            'order': 3,
+            'generator_number': 7,
+            'description': "y'''(x) + y'(x) = RHS",
+            'initial_conditions': {'y(0)': sp.pi * self.M}
+        }
+    
+    def _generator_8(self, f_z: sp.Expr, **kwargs) -> Dict[str, Any]:
+        """Generator 8: y'''(x) + y''(x) = RHS"""
+        f_alpha_beta = f_z.subs(self.z, self.alpha + self.beta)
+        derivs = self.compute_derivatives_at_exp(f_z, 3)
+        
+        rhs = sp.pi * (f_alpha_beta - derivs[0] + self.M
+                      - self.beta * sp.exp(-self.x) * derivs[1]
+                      - self.beta**3 * sp.exp(-3*self.x) * derivs[3])
+        
+        lhs = self.y(self.x).diff(self.x, 3) + self.y(self.x).diff(self.x, 2)
+        ode = sp.Eq(lhs, rhs)
+        
+        theorem = Theorem42(alpha=self.alpha, beta=self.beta, n=self.n)
+        solution = theorem.y_base(lambda z: f_z.subs(self.z, z))
+        
+        return {
+            'ode': ode,
+            'lhs': lhs,
+            'rhs': rhs,
+            'solution': solution,
+            'type': 'linear',
+            'order': 3,
+            'generator_number': 8,
+            'description': "y'''(x) + y''(x) = RHS",
+            'initial_conditions': {'y(0)': sp.pi * self.M}
+        }
 
-        st.session_state.current_ode = (lhs, rhs, meta)
 
-    if eval_btn:
-        if not st.session_state.current_ode:
-            st.warning("Build an ODE first.")
-        else:
-            lhs, rhs, _ = st.session_state.current_ode
-            try:
-                subs = {
-                    sp.Symbol("alpha"): sp.sympify(alpha_val),
-                    sp.Symbol("beta"): sp.sympify(beta_val),
-                    sp.Symbol("x"): sp.sympify(x_val),
-                }
-                st.write("**Numeric preview**")
-                st.write(f"LHS = {sp.N(lhs.subs(subs))}")
-                st.write(f"RHS = {sp.N(rhs.subs(subs))}")
-            except Exception as e:
-                st.error(f"Evaluation failed: {e}")
-                st.code(traceback.format_exc())
+class NonlinearGeneratorFactory(StandardGenerator):
+    """Factory for all 10 nonlinear generators with explicit RHS"""
+    
+    def create(self, generator_number: int, f_z: sp.Expr, **params) -> Dict[str, Any]:
+        """Create nonlinear generator by number (1-10)"""
+        
+        # Initialize with parameters
+        self.__init__(
+            alpha=params.get('alpha', 1.0),
+            beta=params.get('beta', 1.0),
+            n=params.get('n', 1),
+            M=params.get('M', 0.0)
+        )
+        
+        generators = {
+            1: self._generator_1,
+            2: self._generator_2,
+            3: self._generator_3,
+            4: self._generator_4,
+            5: self._generator_5,
+            6: self._generator_6,
+            7: self._generator_7,
+            8: self._generator_8,
+            9: self._generator_9,
+            10: self._generator_10,
+        }
+        
+        if generator_number not in generators:
+            raise ValueError(f"Nonlinear generator number must be 1-10, got {generator_number}")
+        
+        return generators[generator_number](f_z, **params)
+    
+    def _generator_1(self, f_z: sp.Expr, q: int = 2, **kwargs) -> Dict[str, Any]:
+        """Generator 1: (y''(x))^q + y(x) = RHS"""
+        f_alpha_beta = f_z.subs(self.z, self.alpha + self.beta)
+        derivs = self.compute_derivatives_at_exp(f_z, 2)
+        
+        y_double_prime_expr = -self.beta * sp.exp(-self.x) * derivs[1] - self.beta**2 * sp.exp(-2*self.x) * derivs[2]
+        y_expr = f_alpha_beta - derivs[0] + self.M
+        
+        rhs = sp.pi**q * y_double_prime_expr**q + sp.pi * y_expr
+        
+        lhs = self.y(self.x).diff(self.x, 2)**q + self.y(self.x)
+        ode = sp.Eq(lhs, rhs)
+        
+        theorem = Theorem42(alpha=self.alpha, beta=self.beta, n=self.n)
+        solution = theorem.y_base(lambda z: f_z.subs(self.z, z))
+        
+        return {
+            'ode': ode,
+            'lhs': lhs,
+            'rhs': rhs,
+            'solution': solution,
+            'type': 'nonlinear',
+            'order': 2,
+            'generator_number': 1,
+            'powers': {'q': q},
+            'description': f"(y''(x))^{q} + y(x) = RHS",
+            'initial_conditions': {'y(0)': sp.pi * self.M}
+        }
+    
+    def _generator_2(self, f_z: sp.Expr, q: int = 2, v: int = 3, **kwargs) -> Dict[str, Any]:
+        """Generator 2: (y''(x))^q + (y'(x))^v = RHS"""
+        derivs = self.compute_derivatives_at_exp(f_z, 2)
+        
+        y_double_prime_expr = -self.beta * sp.exp(-self.x) * derivs[1] - self.beta**2 * sp.exp(-2*self.x) * derivs[2]
+        y_prime_expr = self.beta * sp.exp(-self.x) * derivs[1]
+        
+        rhs = sp.pi**q * y_double_prime_expr**q + sp.pi**v * y_prime_expr**v
+        
+        lhs = self.y(self.x).diff(self.x, 2)**q + self.y(self.x).diff(self.x)**v
+        ode = sp.Eq(lhs, rhs)
+        
+        theorem = Theorem42(alpha=self.alpha, beta=self.beta, n=self.n)
+        solution = theorem.y_base(lambda z: f_z.subs(self.z, z))
+        
+        return {
+            'ode': ode,
+            'lhs': lhs,
+            'rhs': rhs,
+            'solution': solution,
+            'type': 'nonlinear',
+            'order': 2,
+            'generator_number': 2,
+            'powers': {'q': q, 'v': v},
+            'description': f"(y''(x))^{q} + (y'(x))^{v} = RHS",
+            'initial_conditions': {'y(0)': sp.pi * self.M}
+        }
+    
+    def _generator_3(self, f_z: sp.Expr, v: int = 3, **kwargs) -> Dict[str, Any]:
+        """Generator 3: y(x) + (y'(x))^v = RHS"""
+        f_alpha_beta = f_z.subs(self.z, self.alpha + self.beta)
+        derivs = self.compute_derivatives_at_exp(f_z, 1)
+        
+        y_prime_expr = self.beta * sp.exp(-self.x) * derivs[1]
+        
+        rhs = sp.pi * (f_alpha_beta - derivs[0] + self.M) + sp.pi**v * y_prime_expr**v
+        
+        lhs = self.y(self.x) + self.y(self.x).diff(self.x)**v
+        ode = sp.Eq(lhs, rhs)
+        
+        theorem = Theorem42(alpha=self.alpha, beta=self.beta, n=self.n)
+        solution = theorem.y_base(lambda z: f_z.subs(self.z, z))
+        
+        return {
+            'ode': ode,
+            'lhs': lhs,
+            'rhs': rhs,
+            'solution': solution,
+            'type': 'nonlinear',
+            'order': 1,
+            'generator_number': 3,
+            'powers': {'v': v},
+            'description': f"y(x) + (y'(x))^{v} = RHS",
+            'initial_conditions': {'y(0)': sp.pi * self.M}
+        }
+    
+    def _generator_4(self, f_z: sp.Expr, q: int = 2, a: float = 2, **kwargs) -> Dict[str, Any]:
+        """Generator 4: (y''(x))^q + y(x/a) - y(x) = RHS"""
+        f_alpha_beta = f_z.subs(self.z, self.alpha + self.beta)
+        derivs_exp = self.compute_derivatives_at_exp(f_z, 2)
+        derivs_scaled = self.compute_derivatives_at_scaled(f_z, a, 2)
+        
+        y_double_prime_expr = -self.beta * sp.exp(-self.x) * derivs_exp[1] - self.beta**2 * sp.exp(-2*self.x) * derivs_exp[2]
+        
+        rhs = sp.pi**q * y_double_prime_expr**q + sp.pi * (derivs_scaled[0] - derivs_exp[0] + self.M)
+        
+        lhs = self.y(self.x).diff(self.x, 2)**q + self.y(self.x/a) - self.y(self.x)
+        ode = sp.Eq(lhs, rhs)
+        
+        theorem = Theorem42(alpha=self.alpha, beta=self.beta, n=self.n)
+        solution = theorem.y_base(lambda z: f_z.subs(self.z, z))
+        
+        return {
+            'ode': ode,
+            'lhs': lhs,
+            'rhs': rhs,
+            'solution': solution,
+            'type': 'nonlinear',
+            'subtype': 'pantograph',
+            'order': 2,
+            'generator_number': 4,
+            'powers': {'q': q},
+            'scaling_parameter': a,
+            'description': f"(y''(x))^{q} + y(x/{a}) - y(x) = RHS",
+            'initial_conditions': {'y(0)': sp.pi * self.M}
+        }
+    
+    def _generator_5(self, f_z: sp.Expr, v: int = 3, a: float = 2, **kwargs) -> Dict[str, Any]:
+        """Generator 5: y(x/a) + (y'(x))^v = RHS"""
+        derivs_exp = self.compute_derivatives_at_exp(f_z, 1)
+        derivs_scaled = self.compute_derivatives_at_scaled(f_z, a, 1)
+        
+        y_prime_expr = self.beta * sp.exp(-self.x) * derivs_exp[1]
+        
+        rhs = sp.pi * (derivs_scaled[0] + self.M) + sp.pi**v * y_prime_expr**v
+        
+        lhs = self.y(self.x/a) + self.y(self.x).diff(self.x)**v
+        ode = sp.Eq(lhs, rhs)
+        
+        theorem = Theorem42(alpha=self.alpha, beta=self.beta, n=self.n)
+        solution = theorem.y_base(lambda z: f_z.subs(self.z, z))
+        
+        return {
+            'ode': ode,
+            'lhs': lhs,
+            'rhs': rhs,
+            'solution': solution,
+            'type': 'nonlinear',
+            'subtype': 'delay',
+            'order': 1,
+            'generator_number': 5,
+            'powers': {'v': v},
+            'scaling_parameter': a,
+            'description': f"y(x/{a}) + (y'(x))^{v} = RHS",
+            'initial_conditions': {'y(0)': sp.pi * self.M}
+        }
+    
+    def _generator_6(self, f_z: sp.Expr, **kwargs) -> Dict[str, Any]:
+        """Generator 6: sin(y''(x)) + y(x) = RHS"""
+        f_alpha_beta = f_z.subs(self.z, self.alpha + self.beta)
+        derivs = self.compute_derivatives_at_exp(f_z, 2)
+        
+        y_double_prime_term = sp.pi * (-self.beta * sp.exp(-self.x) * derivs[1] 
+                                      - self.beta**2 * sp.exp(-2*self.x) * derivs[2])
+        y_term = sp.pi * (f_alpha_beta - derivs[0] + self.M)
+        
+        rhs = sp.sin(y_double_prime_term) + y_term
+        
+        lhs = sp.sin(self.y(self.x).diff(self.x, 2)) + self.y(self.x)
+        ode = sp.Eq(lhs, rhs)
+        
+        theorem = Theorem42(alpha=self.alpha, beta=self.beta, n=self.n)
+        solution = theorem.y_base(lambda z: f_z.subs(self.z, z))
+        
+        return {
+            'ode': ode,
+            'lhs': lhs,
+            'rhs': rhs,
+            'solution': solution,
+            'type': 'nonlinear',
+            'subtype': 'trigonometric',
+            'order': 2,
+            'generator_number': 6,
+            'description': "sin(y''(x)) + y(x) = RHS",
+            'initial_conditions': {'y(0)': sp.pi * self.M}
+        }
+    
+    def _generator_7(self, f_z: sp.Expr, **kwargs) -> Dict[str, Any]:
+        """Generator 7: e^(y''(x)) + e^(y'(x)) = RHS"""
+        derivs = self.compute_derivatives_at_exp(f_z, 2)
+        
+        y_double_prime_term = sp.pi * (-self.beta * sp.exp(-self.x) * derivs[1] 
+                                      - self.beta**2 * sp.exp(-2*self.x) * derivs[2])
+        y_prime_term = sp.pi * self.beta * sp.exp(-self.x) * derivs[1]
+        
+        rhs = sp.exp(y_double_prime_term) + sp.exp(y_prime_term)
+        
+        lhs = sp.exp(self.y(self.x).diff(self.x, 2)) + sp.exp(self.y(self.x).diff(self.x))
+        ode = sp.Eq(lhs, rhs)
+        
+        theorem = Theorem42(alpha=self.alpha, beta=self.beta, n=self.n)
+        solution = theorem.y_base(lambda z: f_z.subs(self.z, z))
+        
+        return {
+            'ode': ode,
+            'lhs': lhs,
+            'rhs': rhs,
+            'solution': solution,
+            'type': 'nonlinear',
+            'subtype': 'exponential',
+            'order': 2,
+            'generator_number': 7,
+            'description': "e^(y''(x)) + e^(y'(x)) = RHS",
+            'initial_conditions': {'y(0)': sp.pi * self.M}
+        }
+    
+    def _generator_8(self, f_z: sp.Expr, **kwargs) -> Dict[str, Any]:
+        """Generator 8: y(x) + e^(y'(x)) = RHS"""
+        f_alpha_beta = f_z.subs(self.z, self.alpha + self.beta)
+        derivs = self.compute_derivatives_at_exp(f_z, 1)
+        
+        y_prime_term = sp.pi * self.beta * sp.exp(-self.x) * derivs[1]
+        
+        rhs = sp.pi * (f_alpha_beta - derivs[0] + self.M) + sp.exp(y_prime_term)
+        
+        lhs = self.y(self.x) + sp.exp(self.y(self.x).diff(self.x))
+        ode = sp.Eq(lhs, rhs)
+        
+        theorem = Theorem42(alpha=self.alpha, beta=self.beta, n=self.n)
+        solution = theorem.y_base(lambda z: f_z.subs(self.z, z))
+        
+        return {
+            'ode': ode,
+            'lhs': lhs,
+            'rhs': rhs,
+            'solution': solution,
+            'type': 'nonlinear',
+            'subtype': 'exponential',
+            'order': 1,
+            'generator_number': 8,
+            'description': "y(x) + e^(y'(x)) = RHS",
+            'initial_conditions': {'y(0)': sp.pi * self.M}
+        }
+    
+    def _generator_9(self, f_z: sp.Expr, a: float = 2, **kwargs) -> Dict[str, Any]:
+        """Generator 9: e^(y''(x)) + y(x/a) - y(x) = RHS"""
+        derivs_exp = self.compute_derivatives_at_exp(f_z, 2)
+        derivs_scaled = self.compute_derivatives_at_scaled(f_z, a, 0)
+        
+        y_double_prime_term = sp.pi * (-self.beta * sp.exp(-self.x) * derivs_exp[1] 
+                                      - self.beta**2 * sp.exp(-2*self.x) * derivs_exp[2])
+        
+        rhs = sp.exp(y_double_prime_term) + sp.pi * (derivs_scaled[0] - derivs_exp[0] + self.M)
+        
+        lhs = sp.exp(self.y(self.x).diff(self.x, 2)) + self.y(self.x/a) - self.y(self.x)
+        ode = sp.Eq(lhs, rhs)
+        
+        theorem = Theorem42(alpha=self.alpha, beta=self.beta, n=self.n)
+        solution = theorem.y_base(lambda z: f_z.subs(self.z, z))
+        
+        return {
+            'ode': ode,
+            'lhs': lhs,
+            'rhs': rhs,
+            'solution': solution,
+            'type': 'nonlinear',
+            'subtype': 'exponential-pantograph',
+            'order': 2,
+            'generator_number': 9,
+            'scaling_parameter': a,
+            'description': f"e^(y''(x)) + y(x/{a}) - y(x) = RHS",
+            'initial_conditions': {'y(0)': sp.pi * self.M}
+        }
+    
+    def _generator_10(self, f_z: sp.Expr, a: float = 2, **kwargs) -> Dict[str, Any]:
+        """Generator 10: y(x/a) + ln(y'(x)) = RHS"""
+        derivs_exp = self.compute_derivatives_at_exp(f_z, 1)
+        derivs_scaled = self.compute_derivatives_at_scaled(f_z, a, 0)
+        
+        y_prime_term = sp.pi * self.beta * sp.exp(-self.x) * derivs_exp[1]
+        
+        # Handle log carefully to avoid negative arguments
+        rhs = sp.pi * (derivs_scaled[0] + self.M) + sp.log(sp.Abs(y_prime_term))
+        
+        lhs = self.y(self.x/a) + sp.log(sp.Abs(self.y(self.x).diff(self.x)))
+        ode = sp.Eq(lhs, rhs)
+        
+        theorem = Theorem42(alpha=self.alpha, beta=self.beta, n=self.n)
+        solution = theorem.y_base(lambda z: f_z.subs(self.z, z))
+        
+        return {
+            'ode': ode,
+            'lhs': lhs,
+            'rhs': rhs,
+            'solution': solution,
+            'type': 'nonlinear',
+            'subtype': 'logarithmic',
+            'order': 1,
+            'generator_number': 10,
+            'scaling_parameter': a,
+            'description': f"y(x/{a}) + ln(|y'(x)|) = RHS",
+            'initial_conditions': {'y(0)': sp.pi * self.M}
+        }
 
-    hr()
-    st.subheader("Where to hook in more")
-    st.markdown(
+
+# ============================================================================
+# UNIFIED MASTER GENERATOR SYSTEM
+# ============================================================================
+
+class UnifiedMasterGenerator:
+    """
+    Unified system combining template-based and standard generators
+    """
+    
+    def __init__(self, **params):
         """
-        - Add more **preset recipes** (pantograph families, multi-order mixes, nonlinear wraps).
-        - Extend template DSL, e.g., named blocks and reuse.
-        - Use **API Probe** page to persist ODEs/models to FastAPI.
-        - Enrich labels (stiffness, linearity degree, solvability) and triage by novelty score.
+        Initialize unified generator
+        
+        Args:
+            alpha: Parameter alpha
+            beta: Parameter beta (must be positive)
+            n: Order parameter (int or symbolic)
+            M: Constant term
         """
-    )
-
-def page_ml():
-    st.title("ML & DL — Classify, Rank, Train")
-
-    if not st.session_state.current_ode:
-        st.info("Build an ODE on the Generators page first.")
-        return
-
-    lhs, rhs, meta = st.session_state.current_ode
-    st.subheader("Selected ODE")
-    st.latex(sp.latex(Eq(lhs, rhs)))
-
-    novelty = st.session_state.novelty
-    score = novelty.score(lhs, rhs)
-    st.metric("Novelty/Complexity Score", f"{score:.4f}")
-
-    hr()
-    st.subheader("Classification (linearity, stiffness, solvability)")
-    learner = st.session_state.learner
-    preds = learner.predict([(lhs, rhs)])
-    st.json(preds[0])
-
-    hr()
-    st.subheader("Training data")
-    with st.expander("Append current ODE to training set"):
-        col1, col2, col3 = st.columns(3)
-        linear = col1.selectbox("linear", options=[0, 1], index=0)
-        stiff  = col2.selectbox("stiffness", options=[0, 1, 2], index=0)
-        solv   = col3.selectbox("solvability", options=[0, 1, 2], index=0)
-        if st.button("➕ Add"):
-            st.session_state.trainset.append((lhs, rhs, {"linear": linear, "stiffness": stiff, "solvability": solv}))
-            st.success(f"Added. Size: {len(st.session_state.trainset)}")
-
-    with st.expander("Bulk load training set (JSONL: lhs_srepr, rhs_srepr, meta)"):
-        up = st.file_uploader("Upload JSONL", type=["jsonl", "txt"])
-        if up is not None:
-            lines = up.read().decode("utf-8").splitlines()
-            added = 0
-            for line in lines:
-                try:
-                    obj = json.loads(line)
-                    l = expr_from_srepr(obj["lhs_srepr"])
-                    r = expr_from_srepr(obj["rhs_srepr"])
-                    m = obj.get("meta", {})
-                    st.session_state.trainset.append((l, r, m))
-                    added += 1
-                except Exception as e:
-                    st.warning(f"Skipped: {e}")
-            st.success(f"Loaded {added} samples.")
-
-    if st.button("🧠 Train classifier (sklearn if present; else heuristics)"):
-        try:
-            st.session_state.learner.train(st.session_state.trainset)
-            st.success("Training complete.")
-        except Exception as e:
-            st.error(f"Training failed: {e}")
-
-    preds2 = learner.predict([(lhs, rhs)])
-    st.subheader("Prediction (post-train)")
-    st.json(preds2[0])
-
-def page_api_probe():
-    st.title("API Probe — FastAPI backend")
-
-    if requests is None:
-        st.warning("The `requests` package is not installed. API probe disabled.")
-        return
-
-    base = st.text_input("Base URL", value=os.getenv("MG_API_BASE", "http://localhost:8000"))
-
-    hr()
-    st.subheader("Health")
-    if st.button("GET /health"):
-        try:
-            r = requests.get(f"{base}/health", timeout=5)
-            st.code(f"HTTP {r.status_code}\n{r.text}")
-        except Exception as e:
-            st.error(e)
-
-    hr()
-    st.subheader("Generate (POST /generate)")
-    c1, c2 = st.columns(2)
-    with c1:
-        template = st.text_input("template", value="y + Dy2", key="api_template")
-        f_str    = st.text_input("f_str", value="z", key="api_fstr")
-        n_mode   = st.selectbox("n_mode", options=["symbolic", "numeric"], index=0, key="api_nmode")
-        n_value  = st.number_input("n_value", min_value=1, max_value=999, value=2, step=1, key="api_nvalue")
-        m_mode   = st.selectbox("m_mode", options=["symbolic", "numeric"], index=1, key="api_mmode")
-        m_value  = st.number_input("m_value", min_value=1, max_value=999, value=3, step=1, key="api_mvalue")
-        complex_form = st.checkbox("complex_form", value=True, key="api_cplx")
-    with c2:
-        if st.button("POST /generate"):
-            payload = {
-                "template": template,
-                "f_str": f_str,
-                "n_mode": n_mode,
-                "n_value": int(n_value),
-                "m_mode": m_mode,
-                "m_value": int(m_value),
-                "complex_form": complex_form,
-                "persist": True,
-            }
-            try:
-                r = requests.post(f"{base}/generate", json=payload, timeout=30)
-                st.code(f"HTTP {r.status_code}")
-                st.json(r.json())
-            except Exception as e:
-                st.error(e)
-
-    hr()
-    st.subheader("Train (POST /train)")
-    if st.button("POST /train (from in-app memory)"):
-        if not st.session_state.trainset:
-            st.warning("Training set is empty.")
+        # Store parameters
+        self.params = {
+            'alpha': params.get('alpha', 1.0),
+            'beta': params.get('beta', 1.0),
+            'n': params.get('n', 1),
+            'M': params.get('M', 0.0)
+        }
+        
+        # Initialize both systems
+        self.theorem42 = Theorem42(
+            alpha=self.params['alpha'],
+            beta=self.params['beta'],
+            n=self.params['n']
+        )
+        
+        self.generator_builder = GeneratorBuilder(self.theorem42)
+        self.linear_factory = LinearGeneratorFactory(**self.params)
+        self.nonlinear_factory = NonlinearGeneratorFactory(**self.params)
+        
+        logger.info("Unified Master Generator initialized")
+    
+    def generate_from_template(
+        self,
+        template: str,
+        f_z: Union[sp.Expr, Callable],
+        m: Optional[Union[int, sp.Symbol]] = None,
+        complex_form: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Generate ODE using template-based approach
+        
+        Args:
+            template: Template string (e.g., "y + sin(Dy1) + exp(Dy2)")
+            f_z: Function f(z) as expression or callable
+            m: Value for symbolic m in template
+            complex_form: Keep complex form or take real part
+            
+        Returns:
+            Dictionary with ODE details
+        """
+        # Convert f_z to callable if needed
+        if isinstance(f_z, sp.Expr):
+            z = sp.Symbol('z')
+            f = lambda arg: f_z.subs(z, arg)
         else:
-            def _ser(expr): return sp.srepr(expr)
-            items = [{"lhs_srepr": _ser(l), "rhs_srepr": _ser(r), "meta": m} for (l, r, m) in st.session_state.trainset]
-            try:
-                r = requests.post(f"{base}/train", json={"samples": items}, timeout=60)
-                st.code(f"HTTP {r.status_code}")
-                st.json(r.json())
-            except Exception as e:
-                st.error(e)
+            f = f_z
+        
+        # Build using template
+        lhs, rhs = self.generator_builder.build(
+            template=template,
+            f=f,
+            m=m,
+            complex_form=complex_form
+        )
+        
+        # Create solution
+        solution = self.theorem42.y_base(f)
+        
+        # Extract derivative orders for classification
+        import re
+        orders = sorted({int(m) for m in re.findall(r"\bDy(\d+)\b", template)})
+        max_order = max(orders) if orders else 0
+        
+        return {
+            'ode': sp.Eq(lhs, rhs),
+            'lhs': lhs,
+            'rhs': rhs,
+            'solution': solution,
+            'type': 'template-based',
+            'order': max_order,
+            'template': template,
+            'initial_conditions': {'y(0)': sp.pi * self.params['M']},
+            'description': f"Template: {template}"
+        }
+    
+    def generate_standard(
+        self,
+        gen_type: str,
+        gen_num: int,
+        f_z: sp.Expr,
+        **extra_params
+    ) -> Dict[str, Any]:
+        """
+        Generate ODE using standard generators
+        
+        Args:
+            gen_type: 'linear' or 'nonlinear'
+            gen_num: Generator number (1-8 for linear, 1-10 for nonlinear)
+            f_z: Function f(z)
+            **extra_params: Additional parameters (q, v, a)
+            
+        Returns:
+            Dictionary with ODE details
+        """
+        if gen_type == 'linear':
+            return self.linear_factory.create(gen_num, f_z, **extra_params)
+        elif gen_type == 'nonlinear':
+            return self.nonlinear_factory.create(gen_num, f_z, **extra_params)
+        else:
+            raise ValueError(f"Unknown generator type: {gen_type}")
+    
+    def generate_batch(
+        self,
+        count: int,
+        mode: str = 'mixed',
+        functions: Optional[List[sp.Expr]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Generate multiple ODEs
+        
+        Args:
+            count: Number of ODEs to generate
+            mode: 'template', 'standard', or 'mixed'
+            functions: List of f(z) functions to use
+            
+        Returns:
+            List of ODE dictionaries
+        """
+        results = []
+        
+        # Default functions if not provided
+        if functions is None:
+            z = sp.Symbol('z')
+            functions = [
+                z, z**2, sp.exp(z), sp.sin(z), sp.cos(z),
+                sp.sinh(z), sp.cosh(z), sp.log(z + 1)
+            ]
+        
+        # Templates for template mode
+        templates = [
+            "y + Dy2",
+            "y + Dy1",
+            "Dy2 + Dy1",
+            "y + sin(Dy1)",
+            "exp(Dy2) + y",
+            "Dy3 + y",
+            "y + Dy1 + Dy2",
+            "sinh(Dy1) + y"
+        ]
+        
+        for i in range(count):
+            # Random selection
+            f_z = np.random.choice(functions)
+            
+            if mode == 'template' or (mode == 'mixed' and np.random.random() < 0.5):
+                # Template-based generation
+                template = np.random.choice(templates)
+                result = self.generate_from_template(template, f_z)
+            else:
+                # Standard generation
+                gen_type = np.random.choice(['linear', 'nonlinear'])
+                
+                if gen_type == 'linear':
+                    gen_num = np.random.randint(1, 9)
+                    result = self.generate_standard(gen_type, gen_num, f_z)
+                else:
+                    gen_num = np.random.randint(1, 11)
+                    extra = {}
+                    
+                    # Add random parameters for specific generators
+                    if gen_num in [1, 2, 4]:
+                        extra['q'] = np.random.randint(2, 5)
+                    if gen_num in [2, 3, 5]:
+                        extra['v'] = np.random.randint(2, 5)
+                    if gen_num in [4, 5, 9, 10]:
+                        extra['a'] = np.random.uniform(1.5, 3.0)
+                    
+                    result = self.generate_standard(gen_type, gen_num, f_z, **extra)
+            
+            results.append(result)
+        
+        return results
+    
+    def export_to_json(self, result: Dict[str, Any]) -> str:
+        """Export ODE result to JSON format"""
+        export_data = {
+            'ode': str(result['ode']),
+            'lhs': str(result['lhs']),
+            'rhs': str(result['rhs']),
+            'solution': str(result['solution']),
+            'type': result['type'],
+            'order': result['order'],
+            'description': result.get('description', ''),
+            'initial_conditions': {k: str(v) for k, v in result.get('initial_conditions', {}).items()},
+            'parameters': self.params
+        }
+        
+        # Add extra fields if present
+        for key in ['generator_number', 'template', 'powers', 'scaling_parameter', 'subtype']:
+            if key in result:
+                export_data[key] = result[key]
+        
+        return json.dumps(export_data, indent=2)
 
-    hr()
-    st.subheader("List ODEs (GET /odes)")
-    if st.button("GET /odes?limit=10"):
-        try:
-            r = requests.get(f"{base}/odes?limit=10", timeout=10)
-            st.code(f"HTTP {r.status_code}")
-            st.json(r.json())
-        except Exception as e:
-            st.error(e)
 
-def main():
-    st.sidebar.title("Navigation")
-    page = st.sidebar.radio("Go to", ["Generators", "ML & DL", "API Probe"], index=0)
-    if page == "Generators":
-        page_generators()
-    elif page == "ML & DL":
-        page_ml()
-    else:
-        page_api_probe()
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def _sympy_ns() -> Dict[str, Any]:
+    """Create safe SymPy namespace for sympify"""
+    ns = {name: getattr(sp, name) for name in dir(sp) if not name.startswith("_")}
+    ns.update({
+        "I": sp.I, "pi": sp.pi, "E": sp.E,
+        "sin": sp.sin, "cos": sp.cos, "tan": sp.tan,
+        "sinh": sp.sinh, "cosh": sp.cosh, "tanh": sp.tanh,
+        "exp": sp.exp, "log": sp.log, "sqrt": sp.sqrt,
+        "Abs": sp.Abs, "re": sp.re, "im": sp.im,
+    })
+    return ns
+
+
+def safe_eval_f_of_z(f_str: str) -> Callable[[sp.Expr], sp.Expr]:
+    """
+    Create a function f(z) from string safely
+    
+    Args:
+        f_str: String representation like "sin(z)", "exp(z)", etc.
+        
+    Returns:
+        Callable that takes a SymPy expression and returns f(expression)
+    """
+    z = sp.Symbol('z')
+    try:
+        f_expr = sp.sympify(f_str, locals={**_sympy_ns(), "z": z})
+    except Exception as e:
+        raise ValueError(f"Cannot parse f(z) from string: {f_str!r}. Error: {e}")
+    
+    def f(arg: sp.Expr) -> sp.Expr:
+        return sp.simplify(f_expr.xreplace({z: arg}))
+    
+    return f
+
+
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
 
 if __name__ == "__main__":
-    main()
+    # Test the unified system
+    print("Testing Unified Master Generator System")
+    print("=" * 60)
+    
+    # Initialize unified generator
+    generator = UnifiedMasterGenerator(alpha=1.0, beta=1.0, n=2, M=0.0)
+    
+    # Test 1: Template-based generation
+    print("\n1. Template-based Generation:")
+    print("-" * 40)
+    
+    result1 = generator.generate_from_template(
+        template="y + sin(Dy1) + exp(Dy2)",
+        f_z=safe_eval_f_of_z("exp(z)"),
+        m=2
+    )
+    
+    print(f"Template: y + sin(Dy1) + exp(Dy2)")
+    print(f"ODE: {result1['ode']}")
+    print(f"Order: {result1['order']}")
+    
+    # Test 2: Standard linear generator
+    print("\n2. Standard Linear Generator:")
+    print("-" * 40)
+    
+    z = sp.Symbol('z')
+    result2 = generator.generate_standard(
+        gen_type='linear',
+        gen_num=1,
+        f_z=sp.sin(z)
+    )
+    
+    print(f"Generator: Linear #1")
+    print(f"Description: {result2['description']}")
+    print(f"ODE: {result2['ode']}")
+    
+    # Test 3: Standard nonlinear generator
+    print("\n3. Standard Nonlinear Generator:")
+    print("-" * 40)
+    
+    result3 = generator.generate_standard(
+        gen_type='nonlinear',
+        gen_num=6,
+        f_z=sp.exp(z)
+    )
+    
+    print(f"Generator: Nonlinear #6")
+    print(f"Description: {result3['description']}")
+    print(f"ODE: {result3['ode']}")
+    
+    # Test 4: Batch generation
+    print("\n4. Batch Generation (Mixed Mode):")
+    print("-" * 40)
+    
+    batch = generator.generate_batch(count=5, mode='mixed')
+    
+    for i, ode in enumerate(batch, 1):
+        print(f"  {i}. Type: {ode['type']}, Order: {ode['order']}")
+    
+    # Test 5: JSON export
+    print("\n5. JSON Export:")
+    print("-" * 40)
+    
+    json_data = generator.export_to_json(result1)
+    print(json_data[:200] + "...")
+    
+    print("\n✅ All tests completed successfully!")
