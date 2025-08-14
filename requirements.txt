@@ -15,7 +15,6 @@ tensorflow==2.14.0
 
 # Web Framework
 fastapi==0.104.1
-uvicorn[standard]==0.24.0
 pydantic==2.5.0
 pydantic-settings==2.1.0  # Added this!
 python-multipart==0.0.6
@@ -67,9 +66,8 @@ sympy>=1.12
 numpy>=1.23
 fastapi>=0.110
 uvicorn>=0.29
-sqlalchemy>=2.0
-pydantic>=2.5
 requests>=2.31
+
 
 
 
