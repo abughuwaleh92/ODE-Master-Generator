@@ -166,8 +166,14 @@ if not imports_successful:
                 base = "y'"
             elif self.derivative_order == 2:
                 base = "y''"
+            elif self.derivative_order == 3:
+                base = "y'''"
+            elif self.derivative_order == 4:
+                base = "y⁽⁴⁾"
+            elif self.derivative_order == 5:
+                base = "y⁽⁵⁾"
             else:
-                base = f"y^({self.derivative_order})"
+                base = f"y⁽{self.derivative_order}⁾"
             
             if self.operator_type == OperatorType.DELAY and self.scaling:
                 base = base.replace("y", f"y(x/{self.scaling})")
@@ -277,10 +283,40 @@ if not imports_successful:
             """Build left-hand side symbolic expression"""
             lhs = 0
             for term in self.terms:
+                # Get the base derivative
                 if term.derivative_order == 0:
-                    lhs += term.coefficient * self.y(self.x)
+                    base_expr = self.y(self.x)
                 else:
-                    lhs += term.coefficient * sp.diff(self.y(self.x), self.x, term.derivative_order)
+                    base_expr = sp.diff(self.y(self.x), self.x, term.derivative_order)
+                
+                # Apply function type transformation if needed
+                if hasattr(term, 'function_type'):
+                    if isinstance(term.function_type, str):
+                        if term.function_type == 'exponential':
+                            base_expr = sp.exp(base_expr)
+                        elif term.function_type == 'sine':
+                            base_expr = sp.sin(base_expr)
+                        elif term.function_type == 'cosine':
+                            base_expr = sp.cos(base_expr)
+                        elif term.function_type == 'logarithmic':
+                            base_expr = sp.log(base_expr)
+                    elif hasattr(term.function_type, 'value'):
+                        if term.function_type.value == 'exponential':
+                            base_expr = sp.exp(base_expr)
+                        elif term.function_type.value == 'sine' or term.function_type.value == 'trigonometric':
+                            base_expr = sp.sin(base_expr)
+                        elif term.function_type.value == 'cosine':
+                            base_expr = sp.cos(base_expr)
+                        elif term.function_type.value == 'logarithmic':
+                            base_expr = sp.log(base_expr)
+                
+                # Apply power if needed
+                if hasattr(term, 'power') and term.power != 1:
+                    base_expr = base_expr ** term.power
+                
+                # Apply coefficient
+                lhs += term.coefficient * base_expr
+            
             return lhs
     
     # Fallback Master Theorem classes
@@ -301,16 +337,36 @@ if not imports_successful:
             self.z = sp.Symbol('z')
         
         def apply_theorem_4_1(self, generator_spec, params):
-            """Apply Theorem 4.1"""
-            # Simplified implementation
-            y_solution = sp.pi * params.M
+            """Apply Theorem 4.1 with complete implementation"""
+            # Use the actual formula from Theorem 4.1
+            result = 0
+            for s in range(1, params.n + 1):
+                omega = (2 * s - 1) * sp.pi / (2 * params.n)
+                
+                # ψ function
+                exp_psi = sp.I * self.x * sp.cos(omega) - self.x * sp.sin(omega)
+                z_psi = params.alpha + params.beta * sp.exp(exp_psi)
+                psi = params.f_z.subs(self.z, z_psi)
+                
+                # φ function  
+                exp_phi = -sp.I * self.x * sp.cos(omega) - self.x * sp.sin(omega)
+                z_phi = params.alpha + params.beta * sp.exp(exp_phi)
+                phi = params.f_z.subs(self.z, z_phi)
+                
+                # f(α + β)
+                f_alpha_beta = params.f_z.subs(self.z, params.alpha + params.beta)
+                
+                result += 2 * f_alpha_beta - (psi + phi)
+            
+            y_solution = sp.pi / (2 * params.n) * result + sp.pi * params.M
+            
             return {
                 'solution': y_solution,
-                'derivatives': {},
-                'ode': {'lhs': generator_spec.lhs, 'rhs': 0},
+                'derivatives': {'y': y_solution},
+                'ode': {'lhs': generator_spec.lhs, 'rhs': sp.pi * (params.f_z.subs(self.z, params.alpha + params.beta) + params.M)},
                 'parameters': params,
                 'verification': {'is_valid': True},
-                'initial_conditions': {'y(0)': sp.pi * params.M}
+                'initial_conditions': {'y(0)': y_solution.subs(self.x, 0)}
             }
     
     class ExtendedMasterTheorem:
@@ -337,11 +393,35 @@ if not imports_successful:
             self.x = sp.Symbol('x', real=True)
             self.z = sp.Symbol('z')
             self.y = sp.Function('y')
+            self.s = sp.Symbol('s', integer=True, positive=True)
+        
+        def compute_omega(self, s: int) -> sp.Expr:
+            """Compute ω(s) = (2s-1)π/(2n)"""
+            return (2 * s - 1) * sp.pi / (2 * self.n)
+        
+        def psi_function(self, f_z: sp.Expr, omega: sp.Expr, x_val: sp.Symbol) -> sp.Expr:
+            """ψ(α,ω,x) = f(α + β·e^(i x cos ω − x sin ω))"""
+            exponent = sp.I * x_val * sp.cos(omega) - x_val * sp.sin(omega)
+            z_val = self.alpha + self.beta * sp.exp(exponent)
+            return f_z.subs(self.z, z_val)
+        
+        def phi_function(self, f_z: sp.Expr, omega: sp.Expr, x_val: sp.Symbol) -> sp.Expr:
+            """φ(α,ω,x) = f(α + β·e^(−i x cos ω − x sin ω))"""
+            exponent = -sp.I * x_val * sp.cos(omega) - x_val * sp.sin(omega)
+            z_val = self.alpha + self.beta * sp.exp(exponent)
+            return f_z.subs(self.z, z_val)
         
         def generate_y(self, f_z: sp.Expr) -> sp.Expr:
-            """Generate y(x) solution"""
-            # Simplified implementation
-            return sp.pi * self.M + f_z.subs(self.z, self.alpha + self.beta)
+            """Generate y(x) solution using Theorem 4.1"""
+            result = 0
+            for s in range(1, self.n + 1):
+                omega = self.compute_omega(s)
+                psi = self.psi_function(f_z, omega, self.x)
+                phi = self.phi_function(f_z, omega, self.x)
+                f_alpha_beta = f_z.subs(self.z, self.alpha + self.beta)
+                result += 2 * f_alpha_beta - (psi + phi)
+            
+            return sp.pi / (2 * self.n) * result + sp.pi * self.M
         
         def generate_y_prime(self, f_z: sp.Expr) -> sp.Expr:
             """Generate y'(x)"""
@@ -361,12 +441,38 @@ if not imports_successful:
         """Complete Master Generator"""
         
         def generate_solution_y(self, f_z: sp.Expr) -> sp.Expr:
-            """Generate solution y(x)"""
+            """Generate solution y(x) using complete Theorem 4.1"""
             return self.generate_y(f_z)
         
         def compute_derivatives_at_exp(self, f_z: sp.Expr, max_order: int = 3) -> Dict[int, sp.Expr]:
-            """Compute derivatives"""
-            return {0: f_z.subs(self.z, self.alpha + self.beta)}
+            """Compute derivatives of f at α + βe^(-x)"""
+            exp_arg = self.alpha + self.beta * sp.exp(-self.x)
+            derivatives = {}
+            
+            # 0th derivative (function itself)
+            derivatives[0] = f_z.subs(self.z, exp_arg)
+            
+            # Higher derivatives
+            current_deriv = f_z
+            for order in range(1, max_order + 1):
+                current_deriv = sp.diff(current_deriv, self.z)
+                derivatives[order] = current_deriv.subs(self.z, exp_arg)
+            
+            return derivatives
+        
+        def compute_derivatives_at_scaled(self, f_z: sp.Expr, a: float, max_order: int = 3) -> Dict[int, sp.Expr]:
+            """Compute derivatives of f at α + βe^(-x/a)"""
+            exp_arg_scaled = self.alpha + self.beta * sp.exp(-self.x/a)
+            derivatives = {}
+            
+            derivatives[0] = f_z.subs(self.z, exp_arg_scaled)
+            
+            current_deriv = f_z
+            for order in range(1, max_order + 1):
+                current_deriv = sp.diff(current_deriv, self.z)
+                derivatives[order] = current_deriv.subs(self.z, exp_arg_scaled)
+            
+            return derivatives
     
     # Fallback Factory classes
     class LinearGeneratorFactory:
@@ -1379,8 +1485,12 @@ def generator_constructor_page():
                 "Derivative Order",
                 [0, 1, 2, 3, 4, 5],
                 format_func=lambda x: {
-                    0: "y", 1: "y'", 2: "y''", 3: "y'''", 
-                    4: "y⁽⁴⁾", 5: "y⁽⁵⁾"
+                    0: "y (no derivative)",
+                    1: "y' (first)",
+                    2: "y'' (second)",
+                    3: "y''' (third)",
+                    4: "y⁽⁴⁾ (fourth)",
+                    5: "y⁽⁵⁾ (fifth)"
                 }.get(x, f"y⁽{x}⁾")
             )
         
