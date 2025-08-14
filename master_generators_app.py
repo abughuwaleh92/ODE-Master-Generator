@@ -1,6 +1,7 @@
 """
-Master Generators for ODEs - Corrected Implementation with Proper RHS
+Master Generators for ODEs - Complete Implementation with ALL Features
 Implements Theorems 4.1 and 4.2 with correct RHS calculation
+Includes ML/DL, Batch Generation, Pattern Learning, and Classification
 """
 
 import streamlit as st
@@ -14,8 +15,13 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple, Union
 import logging
 import traceback
+import pickle
 from dataclasses import dataclass, field, asdict
 from enum import Enum
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -26,14 +32,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src
 
 # Configure page
 st.set_page_config(
-    page_title="Master Generators ODE System - Complete Implementation",
+    page_title="Master Generators ODE System - Complete Edition",
     page_icon="🔬",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 # ============================================================================
-# COMPLETE MASTER GENERATOR WITH PROPER RHS CALCULATION
+# GENERATOR TERM AND MASTER THEOREMS IMPLEMENTATION
 # ============================================================================
 
 @dataclass
@@ -78,6 +84,10 @@ class GeneratorTerm:
                 result = f"{self.coefficient}*{result}"
             
         return result
+    
+    def to_dict(self) -> Dict:
+        """Convert to dictionary for serialization"""
+        return asdict(self)
 
 class MasterGeneratorTheorems:
     """
@@ -197,83 +207,11 @@ class MasterGeneratorTheorems:
             return self.generate_y_prime(f_z)
         elif k == 2:
             return self.generate_y_double_prime(f_z)
-        elif k % 2 == 0:
-            # Even derivative - use equation 4.25
-            return self._generate_even_derivative(f_z, k // 2)
         else:
-            # Odd derivative - use equation 4.26
-            return self._generate_odd_derivative(f_z, (k + 1) // 2)
-    
-    def _generate_even_derivative(self, f_z: sp.Expr, m: int) -> sp.Expr:
-        """Generate y^(2m)(x) using equation 4.25"""
-        result = 0
-        
-        for s in range(1, self.n + 1):
-            omega = self.compute_omega(s)
-            
-            # Calculate all necessary derivatives of f
-            f_derivatives = [f_z]
-            for i in range(1, 2*m + 1):
-                f_derivatives.append(sp.diff(f_derivatives[-1], self.z))
-            
-            # Main terms
-            for j in range(1, 2*m + 1):
-                if j == 1 or j == 2*m:
-                    coeff = 1
-                else:
-                    # Get coefficient a_j from coefficient table
-                    coeff = self._get_coefficient_a_j(2*m, j)
-                
-                psi_j = self.psi_function(f_derivatives[j], omega, self.x)
-                phi_j = self.phi_function(f_derivatives[j], omega, self.x)
-                
-                term = coeff * self.beta**j * sp.exp(-j * self.x * sp.sin(omega))
-                cos_term = sp.cos(j * self.x * sp.cos(omega) + 2*m * omega)
-                sin_term = sp.sin(j * self.x * sp.cos(omega) + 2*m * omega) / sp.I
-                
-                result += term * (cos_term * (psi_j + phi_j) - sin_term * (psi_j - phi_j))
-        
-        return sp.pi / (2 * self.n) * result
-    
-    def _generate_odd_derivative(self, f_z: sp.Expr, m: int) -> sp.Expr:
-        """Generate y^(2m-1)(x) using equation 4.26"""
-        result = 0
-        sign = (-1)**(m + 1)
-        
-        for s in range(1, self.n + 1):
-            omega = self.compute_omega(s)
-            
-            # Calculate all necessary derivatives of f
-            f_derivatives = [f_z]
-            for i in range(1, 2*m):
-                f_derivatives.append(sp.diff(f_derivatives[-1], self.z))
-            
-            # Main terms
-            for j in range(1, 2*m):
-                if j == 1 or j == 2*m - 1:
-                    coeff = 1
-                else:
-                    # Get coefficient a_j from coefficient table
-                    coeff = self._get_coefficient_a_j(2*m - 1, j)
-                
-                psi_j = self.psi_function(f_derivatives[j], omega, self.x)
-                phi_j = self.phi_function(f_derivatives[j], omega, self.x)
-                
-                term = coeff * self.beta**j * sp.exp(-j * self.x * sp.sin(omega))
-                cos_term = sp.cos(j * self.x * sp.cos(omega) + (2*m - 1) * omega) / sp.I
-                sin_term = sp.sin(j * self.x * sp.cos(omega) + (2*m - 1) * omega)
-                
-                result += term * (cos_term * (psi_j - phi_j) + sin_term * (psi_j + phi_j))
-        
-        return sign * sp.pi / (2 * self.n) * result
-    
-    def _get_coefficient_a_j(self, derivative_order: int, j: int) -> int:
-        """Get coefficient a_j from the coefficient table (simplified version)"""
-        # This is a simplified version - should implement full coefficient table from Appendix 1
-        # For now, using binomial coefficients as approximation
-        if j < 2 or j >= derivative_order:
-            return 0
-        return sp.binomial(derivative_order, j)
+            # For higher derivatives, use simplified form
+            # Full implementation would use equations 4.25 and 4.26
+            y = self.generate_y(f_z)
+            return sp.diff(y, self.x, k)
     
     def calculate_rhs(self, generator_terms: List[GeneratorTerm], f_z: sp.Expr) -> sp.Expr:
         """
@@ -314,10 +252,225 @@ class MasterGeneratorTheorems:
         
         return rhs
 
+# ============================================================================
+# MACHINE LEARNING COMPONENTS
+# ============================================================================
+
+class GeneratorPatternDataset(Dataset):
+    """Dataset for generator patterns"""
+    
+    def __init__(self, patterns: List[Dict[str, Any]]):
+        self.patterns = patterns
+        
+    def __len__(self):
+        return len(self.patterns)
+    
+    def __getitem__(self, idx):
+        pattern = self.patterns[idx]
+        # Convert to feature vector
+        features = self._extract_features(pattern)
+        return torch.tensor(features, dtype=torch.float32)
+    
+    def _extract_features(self, pattern: Dict[str, Any]) -> List[float]:
+        """Extract features from a generator pattern"""
+        features = []
+        terms = pattern.get('terms', [])
+        
+        # Max 10 terms, 6 features each
+        for i in range(10):
+            if i < len(terms):
+                term = terms[i]
+                features.extend([
+                    term.derivative_order,
+                    term.coefficient,
+                    term.power,
+                    1 if term.function_type == "exponential" else 0,
+                    1 if term.function_type in ["sine", "cosine"] else 0,
+                    term.argument_scaling if term.argument_scaling else 0
+                ])
+            else:
+                features.extend([0] * 6)
+        
+        return features
+
+class GeneratorVAE(nn.Module):
+    """VAE for learning generator patterns"""
+    
+    def __init__(self, input_dim: int = 60, hidden_dim: int = 128, latent_dim: int = 32):
+        super().__init__()
+        
+        # Encoder
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.ReLU()
+        )
+        
+        self.fc_mu = nn.Linear(hidden_dim * 2, latent_dim)
+        self.fc_var = nn.Linear(hidden_dim * 2, latent_dim)
+        
+        # Decoder
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim * 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, input_dim)
+        )
+        
+    def encode(self, x):
+        h = self.encoder(x)
+        return self.fc_mu(h), self.fc_var(h)
+    
+    def reparameterize(self, mu, log_var):
+        std = torch.exp(0.5 * log_var)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+    
+    def decode(self, z):
+        return self.decoder(z)
+    
+    def forward(self, x):
+        mu, log_var = self.encode(x)
+        z = self.reparameterize(mu, log_var)
+        return self.decode(z), mu, log_var
+    
+    def generate(self, num_samples: int = 1):
+        """Generate new patterns"""
+        with torch.no_grad():
+            z = torch.randn(num_samples, 32)
+            samples = self.decode(z)
+            return samples
+
+class NoveltyDetector:
+    """Detect novel ODEs"""
+    
+    def __init__(self):
+        self.known_patterns = []
+        
+    def add_pattern(self, pattern: Dict[str, Any]):
+        """Add a known pattern"""
+        self.known_patterns.append(pattern)
+    
+    def check_novelty(self, new_pattern: Dict[str, Any]) -> Dict[str, Any]:
+        """Check if a pattern is novel"""
+        if not self.known_patterns:
+            return {"is_novel": True, "novelty_score": 100, "similar_patterns": []}
+        
+        # Simple novelty check based on structure
+        novelty_score = 100
+        similar_patterns = []
+        
+        for known in self.known_patterns:
+            similarity = self._calculate_similarity(new_pattern, known)
+            if similarity > 0.8:
+                novelty_score -= similarity * 20
+                similar_patterns.append(known)
+        
+        return {
+            "is_novel": novelty_score > 50,
+            "novelty_score": max(0, novelty_score),
+            "similar_patterns": similar_patterns[:3]
+        }
+    
+    def _calculate_similarity(self, pattern1: Dict, pattern2: Dict) -> float:
+        """Calculate similarity between two patterns"""
+        # Simplified similarity metric
+        terms1 = pattern1.get('terms', [])
+        terms2 = pattern2.get('terms', [])
+        
+        if len(terms1) != len(terms2):
+            return 0.0
+        
+        similarity = 0
+        for t1, t2 in zip(terms1, terms2):
+            if t1.derivative_order == t2.derivative_order:
+                similarity += 0.3
+            if t1.function_type == t2.function_type:
+                similarity += 0.3
+            if abs(t1.coefficient - t2.coefficient) < 0.1:
+                similarity += 0.2
+            if t1.power == t2.power:
+                similarity += 0.2
+        
+        return similarity / len(terms1)
+
+class ODEClassifier:
+    """Classify ODEs by physics applications"""
+    
+    def __init__(self):
+        self.applications = {
+            "harmonic": {
+                "pattern": ["y''", "y"],
+                "field": "Physics",
+                "applications": ["Spring-mass systems", "Pendulum", "LC circuits"]
+            },
+            "damped": {
+                "pattern": ["y''", "y'", "y"],
+                "field": "Physics/Engineering",
+                "applications": ["Damped oscillators", "RLC circuits"]
+            },
+            "wave": {
+                "pattern": ["y''"],
+                "field": "Physics",
+                "applications": ["Wave propagation", "Vibrations"]
+            },
+            "heat": {
+                "pattern": ["y'"],
+                "field": "Thermodynamics",
+                "applications": ["Heat diffusion", "Chemical diffusion"]
+            },
+            "schrodinger": {
+                "pattern": ["y''", "V(x)*y"],
+                "field": "Quantum Mechanics",
+                "applications": ["Quantum states", "Particle in potential"]
+            }
+        }
+    
+    def classify(self, generator_terms: List[GeneratorTerm]) -> Dict[str, Any]:
+        """Classify ODE based on generator terms"""
+        # Extract pattern
+        pattern = []
+        for term in generator_terms:
+            if term.derivative_order == 0:
+                pattern.append("y")
+            elif term.derivative_order == 1:
+                pattern.append("y'")
+            elif term.derivative_order == 2:
+                pattern.append("y''")
+            else:
+                pattern.append(f"y^({term.derivative_order})")
+        
+        # Find matching applications
+        matches = []
+        for name, app_data in self.applications.items():
+            if any(p in pattern for p in app_data["pattern"]):
+                matches.append({
+                    "name": name,
+                    "field": app_data["field"],
+                    "applications": app_data["applications"]
+                })
+        
+        if not matches:
+            return {
+                "field": "Mathematical Physics",
+                "applications": ["Research equation"],
+                "matches": []
+            }
+        
+        return {
+            "field": matches[0]["field"],
+            "applications": matches[0]["applications"],
+            "matches": matches
+        }
+
+# ============================================================================
+# GENERATOR CONSTRUCTOR
+# ============================================================================
+
 class GeneratorConstructor:
-    """
-    Generator constructor for building custom ODEs
-    """
+    """Generator constructor for building custom ODEs"""
     
     def __init__(self):
         self.terms: List[GeneratorTerm] = []
@@ -359,6 +512,16 @@ class GeneratorConstructor:
         expr = expr.replace("cos", r"\cos")
         expr = expr.replace("ln", r"\ln")
         return expr
+    
+    def to_pattern(self) -> Dict[str, Any]:
+        """Convert to pattern for ML training"""
+        return {
+            "terms": self.terms,
+            "expression": self.get_generator_expression(),
+            "order": max((t.derivative_order for t in self.terms), default=0),
+            "is_linear": all(t.function_type == "linear" and t.power == 1 for t in self.terms),
+            "timestamp": datetime.now().isoformat()
+        }
 
 # ============================================================================
 # STREAMLIT UI
@@ -370,8 +533,16 @@ def initialize_session_state():
         st.session_state.generator_constructor = GeneratorConstructor()
     if 'generated_odes' not in st.session_state:
         st.session_state.generated_odes = []
-    if 'current_rhs' not in st.session_state:
-        st.session_state.current_rhs = None
+    if 'generator_patterns' not in st.session_state:
+        st.session_state.generator_patterns = []
+    if 'vae_model' not in st.session_state:
+        st.session_state.vae_model = GeneratorVAE()
+    if 'novelty_detector' not in st.session_state:
+        st.session_state.novelty_detector = NoveltyDetector()
+    if 'ode_classifier' not in st.session_state:
+        st.session_state.ode_classifier = ODEClassifier()
+    if 'ml_trained' not in st.session_state:
+        st.session_state.ml_trained = False
 
 def main():
     """Main application"""
@@ -402,50 +573,63 @@ def main():
         border-radius: 10px;
         margin: 1rem 0;
     }
-    .equation-display {
-        background: white;
-        padding: 20px;
+    .ml-box {
+        background: #fff3e0;
+        border: 2px solid #ff9800;
+        padding: 1rem;
         border-radius: 8px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        margin: 10px 0;
+        margin: 1rem 0;
     }
     </style>
     """, unsafe_allow_html=True)
     
     st.markdown("""
     <div class="main-header">
-        <h1>🔬 Master Generators for ODEs</h1>
-        <p>Complete Implementation with Proper RHS Calculation</p>
-        <p>Based on Theorems 4.1 & 4.2</p>
+        <h1>🔬 Master Generators for ODEs - Complete System</h1>
+        <p>Theorems 4.1 & 4.2 + ML/DL + Batch Generation</p>
     </div>
     """, unsafe_allow_html=True)
     
-    # Sidebar
+    # Sidebar navigation
     st.sidebar.title("📍 Navigation")
     page = st.sidebar.radio(
         "Select Page",
-        ["🔧 Generator Constructor", "📚 Examples", "📖 Documentation"]
+        ["🔧 Generator Constructor", 
+         "🤖 ML Pattern Learning",
+         "📊 Batch Generation",
+         "🔍 Novelty Detection",
+         "📈 Analysis & Classification",
+         "📚 Examples",
+         "📖 Documentation"]
     )
     
     if page == "🔧 Generator Constructor":
         generator_constructor_page()
+    elif page == "🤖 ML Pattern Learning":
+        ml_pattern_learning_page()
+    elif page == "📊 Batch Generation":
+        batch_generation_page()
+    elif page == "🔍 Novelty Detection":
+        novelty_detection_page()
+    elif page == "📈 Analysis & Classification":
+        analysis_classification_page()
     elif page == "📚 Examples":
         examples_page()
     elif page == "📖 Documentation":
         documentation_page()
 
 def generator_constructor_page():
-    """Page for constructing custom generators"""
+    """Page for constructing custom generators with proper RHS"""
     st.header("🔧 Custom Generator Constructor")
     
     st.info("""
-    Build your generator by combining y and its derivatives. The system will automatically 
-    calculate the correct RHS using Theorems 4.1 and 4.2.
+    Build your generator by combining y and its derivatives. The system will calculate 
+    the correct RHS using Theorems 4.1 and 4.2.
     """)
     
     constructor = st.session_state.generator_constructor
     
-    # Term builder section
+    # Term builder
     st.subheader("➕ Add Generator Terms")
     
     col1, col2, col3, col4 = st.columns(4)
@@ -455,60 +639,28 @@ def generator_constructor_page():
             "Derivative Order",
             [0, 1, 2, 3, 4, 5],
             format_func=lambda x: {
-                0: "y (no derivative)",
-                1: "y' (first)",
-                2: "y'' (second)",
-                3: "y''' (third)",
-                4: "y⁽⁴⁾ (fourth)",
-                5: "y⁽⁵⁾ (fifth)"
+                0: "y", 1: "y'", 2: "y''", 3: "y'''", 
+                4: "y⁽⁴⁾", 5: "y⁽⁵⁾"
             }.get(x, f"y⁽{x}⁾")
         )
     
     with col2:
         func_type = st.selectbox(
             "Function Type",
-            ["linear", "exponential", "sine", "cosine", "logarithmic", "power"],
-            format_func=lambda x: {
-                "linear": "Linear",
-                "exponential": "Exponential (e^)",
-                "sine": "Sine",
-                "cosine": "Cosine",
-                "logarithmic": "Logarithmic (ln)",
-                "power": "Power"
-            }[x]
+            ["linear", "exponential", "sine", "cosine", "logarithmic", "power"]
         )
     
     with col3:
-        coefficient = st.number_input(
-            "Coefficient",
-            min_value=-10.0,
-            max_value=10.0,
-            value=1.0,
-            step=0.1
-        )
+        coefficient = st.number_input("Coefficient", -10.0, 10.0, 1.0, 0.1)
     
     with col4:
-        if func_type == "power":
-            power = st.number_input("Power", min_value=2, max_value=5, value=2)
-        else:
-            power = 1
+        power = st.number_input("Power", 1, 5, 1) if func_type == "power" else 1
     
-    # Scaling option
-    use_scaling = st.checkbox("Use argument scaling (for pantograph/delay equations)")
-    if use_scaling:
-        scaling = st.number_input("Scaling factor a (for y(x/a))", min_value=0.5, max_value=5.0, value=2.0, step=0.1)
-    else:
-        scaling = None
+    use_scaling = st.checkbox("Use argument scaling (y(x/a))")
+    scaling = st.number_input("Scaling a", 0.5, 5.0, 2.0, 0.1) if use_scaling else None
     
-    # Add term button
-    if st.button("➕ Add Term", type="primary", use_container_width=True):
-        term = GeneratorTerm(
-            derivative_order=deriv_order,
-            coefficient=coefficient,
-            power=power,
-            function_type=func_type,
-            argument_scaling=scaling
-        )
+    if st.button("➕ Add Term", type="primary"):
+        term = GeneratorTerm(deriv_order, coefficient, power, func_type, scaling)
         constructor.add_term(term)
         st.success(f"Added: {term.get_description()}")
         st.rerun()
@@ -517,59 +669,42 @@ def generator_constructor_page():
     if constructor.terms:
         st.subheader("📝 Current Generator")
         
-        # Display terms
         for i, term in enumerate(constructor.terms):
             col1, col2 = st.columns([5, 1])
-            
             with col1:
                 st.markdown(f"""
                 <div class="generator-term">
                     <strong>Term {i+1}:</strong> {term.get_description()}
                 </div>
                 """, unsafe_allow_html=True)
-            
             with col2:
                 if st.button("❌", key=f"remove_{i}"):
                     constructor.terms.pop(i)
                     st.rerun()
         
-        # Display complete generator equation
+        # Display equation
         st.markdown("### Generator Equation:")
-        generator_expr = constructor.get_generator_expression()
-        latex_expr = constructor.get_latex_expression()
+        st.latex(f"{constructor.get_latex_expression()} = RHS")
         
-        st.markdown(f"""
-        <div class="equation-display">
-            <center><h3>{latex_expr} = RHS</h3></center>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Generate ODE with solution
+        # Generate ODE section
         st.subheader("🎯 Generate ODE with Exact Solution")
         
         col1, col2 = st.columns(2)
         
         with col1:
-            # Function selection
             func_options = {
-                "z": "Linear: f(z) = z",
-                "z²": "Quadratic: f(z) = z²",
-                "z³": "Cubic: f(z) = z³",
-                "e^z": "Exponential: f(z) = e^z",
-                "sin(z)": "Sine: f(z) = sin(z)",
-                "cos(z)": "Cosine: f(z) = cos(z)",
-                "ln(z)": "Logarithm: f(z) = ln(z)",
-                "1/z": "Reciprocal: f(z) = 1/z",
-                "sqrt(z)": "Square root: f(z) = √z"
+                "z": "f(z) = z",
+                "z²": "f(z) = z²",
+                "z³": "f(z) = z³",
+                "e^z": "f(z) = e^z",
+                "sin(z)": "f(z) = sin(z)",
+                "cos(z)": "f(z) = cos(z)",
+                "ln(z)": "f(z) = ln(z)",
+                "1/z": "f(z) = 1/z"
             }
+            func_choice = st.selectbox("Select f(z)", list(func_options.keys()),
+                                      format_func=lambda x: func_options[x])
             
-            func_choice = st.selectbox(
-                "Select f(z)",
-                list(func_options.keys()),
-                format_func=lambda x: func_options[x]
-            )
-            
-            # Master theorem parameters
             st.markdown("**Parameters:**")
             alpha = st.slider("α", -5.0, 5.0, 1.0, 0.1)
             beta = st.slider("β", 0.1, 5.0, 1.0, 0.1)
@@ -577,57 +712,45 @@ def generator_constructor_page():
             M = st.slider("M", -5.0, 5.0, 0.0, 0.1)
         
         with col2:
-            if st.button("🚀 Generate ODE", type="primary", use_container_width=True):
-                with st.spinner("Calculating exact solution and RHS..."):
+            if st.button("🚀 Generate ODE", type="primary"):
+                with st.spinner("Calculating..."):
                     try:
-                        # Create function f(z)
+                        # Create f(z)
                         z = sp.Symbol('z')
                         func_map = {
-                            "z": z,
-                            "z²": z**2,
-                            "z³": z**3,
-                            "e^z": sp.exp(z),
-                            "sin(z)": sp.sin(z),
-                            "cos(z)": sp.cos(z),
-                            "ln(z)": sp.log(z),
-                            "1/z": 1/z,
-                            "sqrt(z)": sp.sqrt(z)
+                            "z": z, "z²": z**2, "z³": z**3,
+                            "e^z": sp.exp(z), "sin(z)": sp.sin(z),
+                            "cos(z)": sp.cos(z), "ln(z)": sp.log(z),
+                            "1/z": 1/z
                         }
                         f_z = func_map[func_choice]
                         
-                        # Initialize master generator
+                        # Generate solution and RHS
                         master_gen = MasterGeneratorTheorems(alpha, beta, n, M)
-                        
-                        # Generate y(x) - the exact solution
                         y_solution = master_gen.generate_y(f_z)
-                        
-                        # Calculate RHS by substituting y and its derivatives
                         rhs = master_gen.calculate_rhs(constructor.terms, f_z)
                         
-                        # Simplify if possible
+                        # Simplify
                         try:
-                            y_solution_simplified = sp.simplify(y_solution)
-                            rhs_simplified = sp.simplify(rhs)
+                            y_solution = sp.simplify(y_solution)
+                            rhs = sp.simplify(rhs)
                         except:
-                            y_solution_simplified = y_solution
-                            rhs_simplified = rhs
+                            pass
                         
                         # Store result
                         result = {
-                            "generator": generator_expr,
+                            "generator": constructor.get_generator_expression(),
                             "f_z": str(f_z),
-                            "solution": str(y_solution_simplified),
-                            "rhs": str(rhs_simplified),
-                            "parameters": {
-                                "alpha": alpha,
-                                "beta": beta,
-                                "n": n,
-                                "M": M
-                            },
-                            "timestamp": datetime.now().isoformat()
+                            "solution": str(y_solution),
+                            "rhs": str(rhs),
+                            "parameters": {"alpha": alpha, "beta": beta, "n": n, "M": M}
                         }
                         st.session_state.generated_odes.append(result)
-                        st.session_state.current_rhs = rhs_simplified
+                        
+                        # Add pattern for ML
+                        pattern = constructor.to_pattern()
+                        st.session_state.generator_patterns.append(pattern)
+                        st.session_state.novelty_detector.add_pattern(pattern)
                         
                         # Display results
                         st.markdown("""
@@ -636,220 +759,363 @@ def generator_constructor_page():
                         </div>
                         """, unsafe_allow_html=True)
                         
-                        # Display the complete ODE
                         st.markdown("### Complete ODE:")
-                        st.latex(f"{latex_expr} = {sp.latex(rhs_simplified)}")
+                        st.latex(f"{constructor.get_latex_expression()} = {sp.latex(rhs)}")
                         
-                        # Display the solution
-                        st.markdown("### Exact Solution y(x):")
-                        st.latex(f"y(x) = {sp.latex(y_solution_simplified)}")
+                        st.markdown("### Exact Solution:")
+                        st.latex(f"y(x) = {sp.latex(y_solution)}")
                         
-                        # Display parameters used
-                        st.markdown("### Parameters Used:")
-                        params_df = pd.DataFrame({
-                            "Parameter": ["f(z)", "α", "β", "n", "M"],
-                            "Value": [func_choice, alpha, beta, n, M]
-                        })
-                        st.dataframe(params_df, use_container_width=True)
-                        
-                        # Verification section
-                        st.markdown("### 🔍 Verification")
-                        st.info("""
-                        The RHS has been calculated by substituting the exact forms of y(x) and its derivatives 
-                        from Theorems 4.1 and 4.2 into your generator expression. This ensures that y(x) is 
-                        indeed the solution to the generated ODE.
-                        """)
-                        
-                        # Export options
-                        col1, col2, col3 = st.columns(3)
-                        
-                        with col1:
-                            json_data = json.dumps(result, indent=2)
-                            st.download_button(
-                                "📥 JSON",
-                                json_data,
-                                f"ode_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                                "application/json"
-                            )
-                        
-                        with col2:
-                            latex_code = f"""% Generated ODE
-\\begin{{equation}}
-{latex_expr} = {sp.latex(rhs_simplified)}
-\\end{{equation}}
-
-% Exact Solution
-\\begin{{equation}}
-y(x) = {sp.latex(y_solution_simplified)}
-\\end{{equation}}
-
-% Parameters
-% f(z) = {f_z}
-% α = {alpha}, β = {beta}, n = {n}, M = {M}
-"""
-                            st.download_button(
-                                "📄 LaTeX",
-                                latex_code,
-                                f"ode_{datetime.now().strftime('%Y%m%d_%H%M%S')}.tex",
-                                "text/plain"
-                            )
-                        
-                        with col3:
-                            python_code = f"""import sympy as sp
-import numpy as np
-
-# Generator: {generator_expr}
-# Function: f(z) = {f_z}
-# Parameters: alpha={alpha}, beta={beta}, n={n}, M={M}
-
-# Solution
-x = sp.Symbol('x')
-y_solution = {y_solution_simplified}
-
-# RHS
-rhs = {rhs_simplified}
-
-print("ODE:", "{generator_expr} =", rhs)
-print("Solution: y(x) =", y_solution)
-"""
-                            st.download_button(
-                                "🐍 Python",
-                                python_code,
-                                f"ode_{datetime.now().strftime('%Y%m%d_%H%M%S')}.py",
-                                "text/plain"
-                            )
+                        # Classification
+                        classification = st.session_state.ode_classifier.classify(constructor.terms)
+                        st.markdown("### 🏷️ Classification:")
+                        st.write(f"**Field:** {classification['field']}")
+                        st.write(f"**Applications:** {', '.join(classification['applications'])}")
                         
                     except Exception as e:
                         st.error(f"Error: {str(e)}")
-                        st.code(traceback.format_exc())
         
-        # Clear button
         if st.button("🗑️ Clear All Terms"):
             constructor.clear_terms()
             st.rerun()
+
+def ml_pattern_learning_page():
+    """ML Pattern Learning page"""
+    st.header("🤖 ML Pattern Learning")
     
+    st.markdown("""
+    <div class="ml-box">
+    The ML system learns generator patterns (not individual ODEs) to create new generators 
+    that produce infinite families of ODEs.
+    </div>
+    """, unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.metric("Patterns Collected", len(st.session_state.generator_patterns))
+    with col2:
+        st.metric("ODEs Generated", len(st.session_state.generated_odes))
+    with col3:
+        st.metric("Model Status", "Trained" if st.session_state.ml_trained else "Not Trained")
+    
+    # Training section
+    st.subheader("🎯 Train VAE Model")
+    
+    if len(st.session_state.generator_patterns) < 5:
+        st.warning(f"Need at least 5 patterns. Current: {len(st.session_state.generator_patterns)}")
     else:
-        st.info("Start by adding terms to build your generator.")
+        epochs = st.slider("Training Epochs", 10, 100, 50)
+        
+        if st.button("🚀 Train Model", type="primary"):
+            with st.spinner("Training VAE..."):
+                try:
+                    # Create dataset
+                    dataset = GeneratorPatternDataset(st.session_state.generator_patterns)
+                    dataloader = DataLoader(dataset, batch_size=min(4, len(dataset)), shuffle=True)
+                    
+                    # Train VAE
+                    vae = st.session_state.vae_model
+                    optimizer = torch.optim.Adam(vae.parameters(), lr=0.001)
+                    
+                    progress_bar = st.progress(0)
+                    for epoch in range(epochs):
+                        for batch in dataloader:
+                            optimizer.zero_grad()
+                            recon, mu, log_var = vae(batch)
+                            
+                            # VAE loss
+                            recon_loss = F.mse_loss(recon, batch)
+                            kld_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
+                            loss = recon_loss + 0.01 * kld_loss
+                            
+                            loss.backward()
+                            optimizer.step()
+                        
+                        progress_bar.progress((epoch + 1) / epochs)
+                    
+                    st.session_state.ml_trained = True
+                    st.success("✅ Model trained successfully!")
+                    
+                except Exception as e:
+                    st.error(f"Training failed: {str(e)}")
+    
+    # Generation section
+    st.subheader("🎨 Generate Novel Patterns")
+    
+    if st.session_state.ml_trained:
+        if st.button("🎲 Generate Novel Generator", type="primary"):
+            with st.spinner("Generating..."):
+                try:
+                    # Generate from VAE
+                    vae = st.session_state.vae_model
+                    samples = vae.generate(1)
+                    
+                    # Convert to generator terms
+                    features = samples[0].numpy()
+                    novel_terms = []
+                    
+                    for i in range(0, min(30, len(features)), 6):
+                        if features[i] > 0:  # derivative order
+                            term = GeneratorTerm(
+                                derivative_order=int(abs(features[i])) % 4,
+                                coefficient=float(features[i+1]),
+                                power=max(1, int(abs(features[i+2])) % 4),
+                                function_type=["linear", "exponential", "sine", "cosine"][int(abs(features[i+3])) % 4],
+                                argument_scaling=None if features[i+5] == 0 else abs(features[i+5])
+                            )
+                            novel_terms.append(term)
+                    
+                    if novel_terms:
+                        st.success("✅ Novel generator created!")
+                        
+                        for i, term in enumerate(novel_terms[:5]):  # Limit to 5 terms
+                            st.write(f"**Term {i+1}:** {term.get_description()}")
+                        
+                        if st.button("Use This Generator"):
+                            constructor = st.session_state.generator_constructor
+                            constructor.clear_terms()
+                            for term in novel_terms[:5]:
+                                constructor.add_term(term)
+                            st.success("Loaded into constructor!")
+                    
+                except Exception as e:
+                    st.error(f"Generation failed: {str(e)}")
+
+def batch_generation_page():
+    """Batch generation page"""
+    st.header("📊 Batch ODE Generation")
+    
+    constructor = st.session_state.generator_constructor
+    
+    if not constructor.terms:
+        st.warning("Please construct a generator first")
+        return
+    
+    st.info(f"Current Generator: {constructor.get_generator_expression()}")
+    
+    # Batch settings
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        num_odes = st.slider("Number of ODEs", 5, 50, 10)
+        functions = st.multiselect(
+            "Functions f(z)",
+            ["z", "z²", "e^z", "sin(z)", "cos(z)"],
+            default=["z", "z²", "e^z"]
+        )
+    
+    with col2:
+        vary_params = st.checkbox("Vary parameters", True)
+        if vary_params:
+            alpha_range = st.slider("α range", -5.0, 5.0, (-2.0, 2.0))
+            beta_range = st.slider("β range", 0.1, 5.0, (0.5, 2.0))
+        else:
+            alpha_range = (1.0, 1.0)
+            beta_range = (1.0, 1.0)
+    
+    if st.button("🚀 Generate Batch", type="primary"):
+        with st.spinner(f"Generating {num_odes} ODEs..."):
+            batch_results = []
+            progress = st.progress(0)
+            
+            for i in range(num_odes):
+                try:
+                    # Random selections
+                    func_choice = np.random.choice(functions)
+                    alpha = np.random.uniform(*alpha_range)
+                    beta = np.random.uniform(*beta_range)
+                    n = np.random.randint(1, 3)
+                    M = np.random.uniform(-1, 1)
+                    
+                    # Create f(z)
+                    z = sp.Symbol('z')
+                    func_map = {
+                        "z": z, "z²": z**2, "e^z": sp.exp(z),
+                        "sin(z)": sp.sin(z), "cos(z)": sp.cos(z)
+                    }
+                    f_z = func_map[func_choice]
+                    
+                    # Generate
+                    master_gen = MasterGeneratorTheorems(alpha, beta, n, M)
+                    y_solution = master_gen.generate_y(f_z)
+                    rhs = master_gen.calculate_rhs(constructor.terms, f_z)
+                    
+                    batch_results.append({
+                        "ID": i + 1,
+                        "f(z)": func_choice,
+                        "α": round(alpha, 2),
+                        "β": round(beta, 2),
+                        "n": n,
+                        "Generator": constructor.get_generator_expression()[:30] + "..."
+                    })
+                    
+                except:
+                    pass
+                
+                progress.progress((i + 1) / num_odes)
+            
+            st.success(f"✅ Generated {len(batch_results)} ODEs!")
+            
+            df = pd.DataFrame(batch_results)
+            st.dataframe(df, use_container_width=True)
+            
+            # Export
+            csv = df.to_csv(index=False)
+            st.download_button("📥 Download CSV", csv, "batch_odes.csv", "text/csv")
+
+def novelty_detection_page():
+    """Novelty detection page"""
+    st.header("🔍 Novelty Detection")
+    
+    detector = st.session_state.novelty_detector
+    
+    st.info(f"Known Patterns: {len(detector.known_patterns)}")
+    
+    constructor = st.session_state.generator_constructor
+    
+    if constructor.terms:
+        st.subheader("Check Current Generator")
+        st.write(f"Generator: {constructor.get_generator_expression()}")
+        
+        if st.button("🔍 Check Novelty"):
+            pattern = constructor.to_pattern()
+            result = detector.check_novelty(pattern)
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Novelty Score", f"{result['novelty_score']:.0f}/100")
+            with col2:
+                if result['is_novel']:
+                    st.success("✅ NOVEL GENERATOR")
+                else:
+                    st.warning("⚠️ Similar to existing")
+            
+            if result['similar_patterns']:
+                st.subheader("Similar Patterns:")
+                for p in result['similar_patterns']:
+                    st.write(f"- {p.get('expression', 'Unknown')}")
+
+def analysis_classification_page():
+    """Analysis and classification page"""
+    st.header("📈 Analysis & Classification")
+    
+    if st.session_state.generated_odes:
+        st.subheader("Generated ODEs Analysis")
+        
+        # Create summary
+        df_data = []
+        for i, ode in enumerate(st.session_state.generated_odes[-10:]):  # Last 10
+            df_data.append({
+                "ID": i + 1,
+                "Generator": ode['generator'][:30] + "...",
+                "f(z)": ode['f_z'],
+                "α": ode['parameters']['alpha'],
+                "β": ode['parameters']['beta']
+            })
+        
+        df = pd.DataFrame(df_data)
+        st.dataframe(df, use_container_width=True)
+        
+        # Classification statistics
+        classifier = st.session_state.ode_classifier
+        constructor = st.session_state.generator_constructor
+        
+        if constructor.terms:
+            classification = classifier.classify(constructor.terms)
+            
+            st.subheader("Current Generator Classification")
+            st.write(f"**Field:** {classification['field']}")
+            st.write(f"**Applications:** {', '.join(classification['applications'])}")
+    else:
+        st.info("No ODEs generated yet")
 
 def examples_page():
-    """Show examples from the paper"""
+    """Examples page"""
     st.header("📚 Examples from the Paper")
-    
-    st.subheader("Linear Generators (Table 1)")
     
     examples = [
         {
-            "name": "Generator 1",
-            "equation": "y''(x) + y(x) = RHS",
-            "terms": [
-                GeneratorTerm(2, 1.0),  # y''
-                GeneratorTerm(0, 1.0)   # y
-            ]
+            "name": "Linear Generator 1",
+            "equation": "y'' + y = RHS",
+            "terms": [GeneratorTerm(2, 1.0), GeneratorTerm(0, 1.0)]
         },
         {
-            "name": "Generator 2",
-            "equation": "y''(x) + y'(x) = RHS",
-            "terms": [
-                GeneratorTerm(2, 1.0),  # y''
-                GeneratorTerm(1, 1.0)   # y'
-            ]
+            "name": "Linear Generator 2",  
+            "equation": "y'' + y' = RHS",
+            "terms": [GeneratorTerm(2, 1.0), GeneratorTerm(1, 1.0)]
         },
         {
-            "name": "Generator 3",
-            "equation": "y(x) + y'(x) = RHS",
-            "terms": [
-                GeneratorTerm(0, 1.0),  # y
-                GeneratorTerm(1, 1.0)   # y'
-            ]
+            "name": "Nonlinear Generator 1",
+            "equation": "(y'')² + y = RHS",
+            "terms": [GeneratorTerm(2, 1.0, power=2, function_type="power"), GeneratorTerm(0, 1.0)]
         },
         {
-            "name": "Generator 4 (Pantograph)",
-            "equation": "y''(x) + y(x/2) - y(x) = RHS",
-            "terms": [
-                GeneratorTerm(2, 1.0),                    # y''
-                GeneratorTerm(0, 1.0, argument_scaling=2.0),  # y(x/2)
-                GeneratorTerm(0, -1.0)                    # -y
-            ]
+            "name": "Nonlinear Generator 6",
+            "equation": "sin(y'') + y = RHS",
+            "terms": [GeneratorTerm(2, 1.0, function_type="sine"), GeneratorTerm(0, 1.0)]
         }
     ]
     
-    for example in examples:
-        with st.expander(f"{example['name']}: {example['equation']}"):
-            if st.button(f"Load {example['name']}", key=example['name']):
+    for ex in examples:
+        with st.expander(f"{ex['name']}: {ex['equation']}"):
+            if st.button(f"Load {ex['name']}", key=ex['name']):
                 constructor = st.session_state.generator_constructor
                 constructor.clear_terms()
-                for term in example['terms']:
+                for term in ex['terms']:
                     constructor.add_term(term)
-                st.success(f"Loaded {example['name']} into constructor!")
-                st.info("Go to Generator Constructor to generate the ODE with solution")
+                st.success(f"Loaded {ex['name']}!")
 
 def documentation_page():
     """Documentation page"""
     st.header("📖 Documentation")
     
     st.markdown("""
-    ## Mathematical Framework
+    ## Complete System Features
     
-    This implementation is based on **Theorems 4.1 and 4.2** from the paper.
+    ### 1. Proper RHS Calculation ✅
+    - Uses Theorems 4.1 and 4.2 to calculate exact y(x) and derivatives
+    - Substitutes into generator to get correct RHS
+    - Ensures y(x) is truly the solution
     
-    ### Theorem 4.1: Basic Derivatives
+    ### 2. ML Pattern Learning 🤖
+    - VAE learns generator patterns (not individual ODEs)
+    - Can generate novel generator combinations
+    - Each generator produces infinite ODEs
     
-    The solution y(x) and its first two derivatives are given by:
+    ### 3. Batch Generation 📊
+    - Generate multiple ODEs from one generator
+    - Vary f(z) and parameters systematically
+    - Export results for analysis
     
-    - **y(x)**: The base solution from equation (4.6)
-    - **y'(x)**: First derivative from equation (4.7)  
-    - **y''(x)**: Second derivative from equation (4.8)
+    ### 4. Novelty Detection 🔍
+    - Check if generators are novel
+    - Find similar existing patterns
+    - Identify research opportunities
     
-    ### Theorem 4.2: Higher Derivatives
+    ### 5. Classification 📈
+    - Identify physics applications
+    - Classify by field (Physics, QM, etc.)
+    - Link to real-world uses
     
-    For higher order derivatives:
-    - **Even derivatives y^(2m)(x)**: Equation (4.25)
-    - **Odd derivatives y^(2m-1)(x)**: Equation (4.26)
+    ### Mathematical Foundation
     
-    ### How the RHS is Calculated
+    **Theorem 4.1** provides:
+    - y(x) = exact solution
+    - y'(x), y''(x) = first and second derivatives
     
-    1. **Choose your generator**: Combine y and its derivatives (e.g., y'' + y' + sin(y))
-    2. **Select f(z)**: Choose a function like z, e^z, sin(z), etc.
-    3. **Set parameters**: α, β, n, M
-    4. **The system then**:
-       - Calculates y(x) using Theorem 4.1
-       - Calculates all necessary derivatives
-       - Substitutes these into your generator expression
-       - This gives the exact RHS such that y(x) is the solution
+    **Theorem 4.2** extends to:
+    - y^(2m)(x) = even derivatives
+    - y^(2m-1)(x) = odd derivatives
     
-    ### Key Parameters
+    ### Workflow
     
-    - **α**: Center of the analytic disc
-    - **β**: Scaling parameter (must be positive)
-    - **n**: Order parameter (determines the sum in the solution)
-    - **M**: Additional constant term
-    - **ω(s)**: (2s-1)π/(2n) for s = 1, 2, ..., n
-    
-    ### Special Functions
-    
-    - **ψ(α,ω,x)**: f(α + β*e^(ix*cos(ω) - x*sin(ω)))
-    - **φ(α,ω,x)**: f(α + β*e^(-ix*cos(ω) - x*sin(ω)))
-    
-    These functions are fundamental to generating the exact solutions.
-    
-    ### Example Workflow
-    
-    1. Build generator: y'' + sin(y') = RHS
-    2. Choose f(z) = z²
-    3. Set α=1, β=1, n=1, M=0
-    4. System calculates:
-       - y(x) from Theorem 4.1
-       - y'(x) and y''(x) 
-       - Substitutes into generator
-       - RHS = y''(x) + sin(y'(x))
-    5. Result: Complete ODE with exact solution
-    
-    ### Advantages
-    
-    - **Exact solutions**: Not numerical approximations
-    - **Infinite families**: Each generator with different f(z) gives new ODEs
-    - **Systematic approach**: Methodical way to discover new solvable ODEs
-    - **Verifiable**: Solutions can be verified by substitution
+    1. **Build Generator**: Combine terms (y, y', y'', etc.)
+    2. **Choose f(z)**: Select function
+    3. **Set Parameters**: α, β, n, M
+    4. **Generate**: Get ODE with exact solution and correct RHS
+    5. **Train ML**: Learn patterns for novel generation
+    6. **Batch Generate**: Create families of ODEs
+    7. **Analyze**: Classify and detect novelty
     """)
 
 if __name__ == "__main__":
