@@ -1,232 +1,239 @@
-# -*- coding: utf-8 -*-
 """
-BasicFunctions
---------------
-A comprehensive, symbolic function catalog in a single variable z for "basic"
-functions used across the Master Generators app.
-
-API (backwards compatible):
-- BasicFunctions().get_function(name: str) -> sympy.Expr   # returns f(z)
-- BasicFunctions().get_function_names() -> List[str]       # sorted function keys
-
-Notes:
-- Case-insensitive; tolerant to spaces, hyphens, and aliases.
-- Returns symbolic expressions of z (SymPy) – no numerics baked in.
+Basic Mathematical Functions for ODE Generators
+Includes elementary functions like sin, cos, exp, log, etc.
 """
 
-from __future__ import annotations
-from typing import Dict, List, Callable, Tuple
 import sympy as sp
-
-
-__all__ = ["BasicFunctions"]
-
-
-def _norm(name: str) -> str:
-    """Normalize keys: lower, strip, replace spaces/hyphens with underscores."""
-    return name.strip().lower().replace(" ", "_").replace("-", "_")
-
+import numpy as np
+from typing import Dict, Any, Callable
 
 class BasicFunctions:
     """
-    Rich symbolic function registry (non-special functions) in variable z.
-
-    Example
-    -------
-    >>> lib = BasicFunctions()
-    >>> f = lib.get_function("exp")      # exp(z)
-    >>> g = lib.get_function("z^3")      # z**3
-    >>> names = lib.get_function_names() # view supported keys
+    Collection of basic mathematical functions for use in generators
     """
-
-    def __init__(self) -> None:
-        # Primary symbol
-        self.z = sp.Symbol("z", real=True)
-
-        # Fixed (non-parameterized) map: key -> expression in z
-        E = self._expr: Dict[str, sp.Expr] = {}
-
-        # Families (parameterized): key_base -> builder(n) -> expr
-        # For "basic" we include power family; specials live in SpecialFunctions.
-        self._families: Dict[str, Callable[[int], sp.Expr]] = {}
-
-        # -------------- Scalars / Identity / Polynomials -----------------
-        E["zero"] = sp.Integer(0)
-        E["one"] = sp.Integer(1)
-        E["constant_0"] = sp.Integer(0)
-        E["constant_1"] = sp.Integer(1)
-
-        # Identity / linear
-        E["z"] = self.z
-        E["identity"] = self.z
-        E["linear"] = self.z
-
-        # Common powers (also exposed as family power(n))
-        E["z^2"] = self.z**2
-        E["z^3"] = self.z**3
-        E["z^4"] = self.z**4
-        E["z^5"] = self.z**5
-        E["z^6"] = self.z**6
-        self._families["power"] = lambda n: self.z**int(n)
-
-        # -------------- Exponential / Logarithms -------------------------
-        E["exp"] = sp.exp(self.z)
-        E["exp_neg"] = sp.exp(-self.z)
-        E["exponential"] = sp.exp(self.z)
-        E["log"] = sp.log(self.z)            # ln(z)
-        E["ln"] = sp.log(self.z)
-        E["log1p"] = sp.log(1 + self.z)      # ln(1+z)
-
-        # -------------- Roots / Abs / Sign / Piecewise -------------------
-        E["sqrt"] = sp.sqrt(self.z)
-        E["abs"] = sp.Abs(self.z)
-        E["sign"] = sp.sign(self.z)
-        # Heaviside default SymPy value at 0 is a symbol; acceptable for symbolic work
-        E["heaviside"] = sp.Heaviside(self.z)
-        E["relu"] = sp.Max(sp.Integer(0), self.z)
-        E["softplus"] = sp.log(1 + sp.exp(self.z))
-
-        # -------------- Trigonometric -----------------------------------
-        E["sin"] = sp.sin(self.z)
-        E["cos"] = sp.cos(self.z)
-        E["tan"] = sp.tan(self.z)
-        E["cot"] = sp.cot(self.z)
-        E["sec"] = sp.sec(self.z)
-        E["csc"] = sp.csc(self.z)
-
-        # Inverse trig
-        E["asin"] = sp.asin(self.z)
-        E["acos"] = sp.acos(self.z)
-        E["atan"] = sp.atan(self.z)
-
-        # -------------- Hyperbolic --------------------------------------
-        E["sinh"] = sp.sinh(self.z)
-        E["cosh"] = sp.cosh(self.z)
-        E["tanh"] = sp.tanh(self.z)
-        E["coth"] = sp.coth(self.z)
-        E["sech"] = sp.sech(self.z)
-        E["csch"] = sp.csch(self.z)
-
-        # -------------- Common analysis functions ------------------------
-        # NOTE: SymPy's sp.sinc(x) = sin(pi*x)/(pi*x). Provide both variants.
-        E["sinc"] = sp.sinc(self.z)                    # normalized sinc
-        E["sinc_unscaled"] = sp.sin(self.z) / self.z   # sin(z)/z
-        E["gaussian"] = sp.exp(-(self.z**2))
-        E["erf"] = sp.erf(self.z)
-        E["erfc"] = sp.erfc(self.z)
-        E["gamma"] = sp.gamma(self.z)
-        E["loggamma"] = sp.loggamma(self.z)
-        E["ei"] = sp.Ei(self.z)   # Exponential integral
-        E["si"] = sp.Si(self.z)   # Sine integral
-        E["ci"] = sp.Ci(self.z)   # Cosine integral
-
-        # Aliases (common names users may try)
-        self._aliases: Dict[str, str] = {
-            "const0": "constant_0",
-            "const1": "constant_1",
-            "identity": "z",
-            "quadratic": "z^2",
-            "cubic": "z^3",
-            "quartic": "z^4",
-            "expz": "exp",
-            "lnz": "log",
-            "absolute": "abs",
-            "unit_step": "heaviside",
-            "heaviside_step": "heaviside",
-            "relu_z": "relu",
-            "sigmoid": "1_over_1_plus_exp_minus_z",
+    
+    def __init__(self):
+        self.z = sp.Symbol('z')
+        self.functions = self._initialize_functions()
+        
+    def _initialize_functions(self) -> Dict[str, sp.Expr]:
+        """
+        Initialize all basic functions
+        
+        Returns:
+            Dictionary of function names to symbolic expressions
+        """
+        return {
+            # Algebraic functions
+            'constant': sp.Integer(1),
+            'linear': self.z,
+            'quadratic': self.z**2,
+            'cubic': self.z**3,
+            'quartic': self.z**4,
+            'quintic': self.z**5,
+            'sqrt': sp.sqrt(self.z),
+            'cbrt': self.z**(sp.Rational(1, 3)),
+            'reciprocal': 1/self.z,
+            'reciprocal_square': 1/self.z**2,
+            
+            # Exponential and logarithmic
+            'exponential': sp.exp(self.z),
+            'exp2': sp.exp(2*self.z),
+            'exp_neg': sp.exp(-self.z),
+            'logarithm': sp.log(self.z),
+            'log10': sp.log(self.z, 10),
+            'log2': sp.log(self.z, 2),
+            
+            # Trigonometric functions
+            'sine': sp.sin(self.z),
+            'cosine': sp.cos(self.z),
+            'tangent': sp.tan(self.z),
+            'cotangent': sp.cot(self.z),
+            'secant': sp.sec(self.z),
+            'cosecant': sp.csc(self.z),
+            
+            # Inverse trigonometric
+            'arcsin': sp.asin(self.z),
+            'arccos': sp.acos(self.z),
+            'arctan': sp.atan(self.z),
+            'arccot': sp.acot(self.z),
+            'arcsec': sp.asec(self.z),
+            'arccsc': sp.acsc(self.z),
+            
+            # Hyperbolic functions
+            'sinh': sp.sinh(self.z),
+            'cosh': sp.cosh(self.z),
+            'tanh': sp.tanh(self.z),
+            'coth': sp.coth(self.z),
+            'sech': sp.sech(self.z),
+            'csch': sp.csch(self.z),
+            
+            # Inverse hyperbolic
+            'arcsinh': sp.asinh(self.z),
+            'arccosh': sp.acosh(self.z),
+            'arctanh': sp.atanh(self.z),
+            'arccoth': sp.acoth(self.z),
+            'arcsech': sp.asech(self.z),
+            'arccsch': sp.acsch(self.z),
+            
+            # Combined functions
+            'sin_squared': sp.sin(self.z)**2,
+            'cos_squared': sp.cos(self.z)**2,
+            'sin_cos': sp.sin(self.z) * sp.cos(self.z),
+            'exp_sin': sp.exp(self.z) * sp.sin(self.z),
+            'exp_cos': sp.exp(self.z) * sp.cos(self.z),
+            'log_sin': sp.log(sp.sin(self.z)),
+            'log_cos': sp.log(sp.cos(self.z)),
+            
+            # Special combinations
+            'gaussian': sp.exp(-self.z**2),
+            'sigmoid': 1 / (1 + sp.exp(-self.z)),
+            'relu': sp.Max(0, self.z),
+            'softplus': sp.log(1 + sp.exp(self.z)),
+            'swish': self.z / (1 + sp.exp(-self.z)),
         }
-
-        # Provide a canonical sigmoid name (kept out of aliases map as it's an expression)
-        E["1_over_1_plus_exp_minus_z"] = sp.Integer(1) / (sp.Integer(1) + sp.exp(-self.z))
-
-        # Build reverse index with normalized keys
-        self._index: Dict[str, str] = {}
-        for k in list(E.keys()):
-            self._index[_norm(k)] = k
-        for alias, target in self._aliases.items():
-            if target in E:
-                self._index[_norm(alias)] = target
-
-    # --------------------------- Public API ------------------------------
-
+    
     def get_function(self, name: str) -> sp.Expr:
         """
-        Return a SymPy expression f(z) for the requested function name.
-
-        Supports:
-        - direct keys: "exp", "z^3", "sin", "log1p", ...
-        - aliases: "quartic" -> "z^4", ...
-        - family syntax for powers: "power(7)" -> z**7, "power7" -> z**7
-
-        Raises:
-            KeyError if name not found/parsable.
+        Get a function by name
+        
+        Args:
+            name: Function name
+            
+        Returns:
+            Symbolic expression for the function
         """
-        if not isinstance(name, str):
-            raise KeyError("Function name must be a string.")
-
-        key = _norm(name)
-
-        # 1) Exact / alias match:
-        if key in self._index:
-            base = self._index[key]
-            return self._expr[base]
-
-        # 2) Power family parsing: "power(5)", "power5", or "z^5"
-        expr = self._try_parse_power_family(key)
-        if expr is not None:
-            return expr
-
-        # 3) If user typed raw "z^N" (covered already) or "z**N"
-        if key.startswith("z**"):
-            try:
-                n = int(key[3:])
-                return self.z ** n
-            except Exception:
-                pass
-
-        raise KeyError(f"Unknown basic function '{name}'. Try one of: {', '.join(self.get_function_names()[:20])} ...")
-
-    def get_function_names(self) -> List[str]:
+        if name not in self.functions:
+            raise ValueError(f"Unknown function: {name}")
+        return self.functions[name]
+    
+    def get_all_functions(self) -> Dict[str, sp.Expr]:
         """
-        Return a sorted list of supported (canonical) function keys.
-        Includes sample entries for the power family.
+        Get all available functions
+        
+        Returns:
+            Dictionary of all functions
         """
-        names = sorted(set(self._expr.keys()))
-        # add representative power() entries
-        names += [f"power({n})" for n in (2, 3, 4, 5, 6, 7)]
-        return sorted(names)
-
-    # --------------------------- Helpers --------------------------------
-
-    def _try_parse_power_family(self, key: str) -> sp.Expr | None:
+        return self.functions.copy()
+    
+    def get_function_names(self) -> list:
         """
-        Parse power family notations:
-            - "power(7)"  -> z**7
-            - "power7"    -> z**7
-            - "z^7"       -> z**7 (already covered in fixed map but keep for safety)
+        Get list of all function names
+        
+        Returns:
+            List of function names
         """
-        if key.startswith("power(") and key.endswith(")"):
-            inner = key[len("power("):-1]
-            try:
-                n = int(inner)
-                return self.z ** n
-            except Exception:
-                return None
-
-        if key.startswith("power") and len(key) > len("power"):
-            maybe_n = key[len("power"):]
-            try:
-                n = int(maybe_n)
-                return self.z ** n
-            except Exception:
-                return None
-
-        if key.startswith("z^"):
-            try:
-                n = int(key[2:])
-                return self.z ** n
-            except Exception:
-                return None
-
-        return None
+        return list(self.functions.keys())
+    
+    def evaluate_function(self, name: str, value: float) -> float:
+        """
+        Evaluate a function at a specific value
+        
+        Args:
+            name: Function name
+            value: Value to evaluate at
+            
+        Returns:
+            Function value
+        """
+        func = self.get_function(name)
+        return float(func.subs(self.z, value))
+    
+    def get_derivative(self, name: str, order: int = 1) -> sp.Expr:
+        """
+        Get the derivative of a function
+        
+        Args:
+            name: Function name
+            order: Order of derivative
+            
+        Returns:
+            Derivative expression
+        """
+        func = self.get_function(name)
+        for _ in range(order):
+            func = sp.diff(func, self.z)
+        return func
+    
+    def get_integral(self, name: str) -> sp.Expr:
+        """
+        Get the indefinite integral of a function
+        
+        Args:
+            name: Function name
+            
+        Returns:
+            Integral expression
+        """
+        func = self.get_function(name)
+        return sp.integrate(func, self.z)
+    
+    def get_function_properties(self, name: str) -> Dict[str, Any]:
+        """
+        Get properties of a function
+        
+        Args:
+            name: Function name
+            
+        Returns:
+            Dictionary of function properties
+        """
+        func = self.get_function(name)
+        
+        return {
+            'name': name,
+            'expression': str(func),
+            'latex': sp.latex(func),
+            'is_polynomial': func.is_polynomial(self.z),
+            'is_rational': func.is_rational_function(self.z),
+            'is_algebraic': func.is_algebraic_expr(self.z),
+            'is_transcendental': not func.is_algebraic_expr(self.z),
+            'degree': sp.degree(func, self.z) if func.is_polynomial(self.z) else None,
+            'derivative': str(self.get_derivative(name)),
+            'integral': str(self.get_integral(name))
+        }
+    
+    def create_composite_function(self, f_name: str, g_name: str) -> sp.Expr:
+        """
+        Create composite function f(g(z))
+        
+        Args:
+            f_name: Outer function name
+            g_name: Inner function name
+            
+        Returns:
+            Composite function expression
+        """
+        f = self.get_function(f_name)
+        g = self.get_function(g_name)
+        return f.subs(self.z, g)
+    
+    def create_linear_combination(self, functions: Dict[str, float]) -> sp.Expr:
+        """
+        Create linear combination of functions
+        
+        Args:
+            functions: Dictionary of function names to coefficients
+            
+        Returns:
+            Linear combination expression
+        """
+        result = 0
+        for name, coeff in functions.items():
+            result += coeff * self.get_function(name)
+        return result
+    
+    def create_product(self, function_names: list) -> sp.Expr:
+        """
+        Create product of functions
+        
+        Args:
+            function_names: List of function names
+            
+        Returns:
+            Product expression
+        """
+        result = 1
+        for name in function_names:
+            result *= self.get_function(name)
+        return result
