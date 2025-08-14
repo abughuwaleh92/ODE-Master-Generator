@@ -1,266 +1,290 @@
+# api_server.py
+# FastAPI backend for Master Generators (generation, training, novelty, storage)
+from __future__ import annotations
 
-# -*- coding: utf-8 -*-
-"""
-api_server.py
-=============
+import os
+import json
+import sqlite3
+import datetime as dt
+from typing import Any, Dict, List, Optional
 
-FastAPI backend for Master Generators.
-- Build ODE via Theorem 4.2 from a free-form template and f(z).
-- Persist and list ODEs (SQLite / Postgres via DATABASE_URL).
-- ML: train/predict enriched labels.
-- DL: train/score novelty.
-- Triage: compute complexity & novelty for stored ODEs.
-
-Run:
-    uvicorn api_server:app --reload --host 0.0.0.0 --port 8000
-"""
-
-import os, json, pickle, datetime as dt
-from typing import Any, Dict, List, Optional, Tuple
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 import sympy as sp
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field
+from sympy import Eq
 
-from core_master_generators import (
-    Theorem42, GeneratorBuilder, safe_eval_f_of_z,
-    ode_to_json, expr_from_srepr, count_symbolic_complexity,
-    GeneratorPatternLearner, NoveltyDetector
-)
+# Import core
+try:
+    from core_master_generators import (
+        Theorem42, GeneratorBuilder, TemplateConfig,
+        safe_eval_f_of_z, ode_to_json, expr_from_srepr,
+        GeneratorPatternLearner, NoveltyDetector
+    )
+except Exception:
+    from mg_core.core_master_generators import (
+        Theorem42, GeneratorBuilder, TemplateConfig,
+        safe_eval_f_of_z, ode_to_json, expr_from_srepr,
+        GeneratorPatternLearner, NoveltyDetector
+    )
 
-# ----------------------------------------------------------------------------
-# Database (SQLAlchemy)
-# ----------------------------------------------------------------------------
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
-from sqlalchemy.orm import declarative_base, sessionmaker
+# --------------------- Storage (SQLite) ---------------------
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:////mnt/data/masters.db")
-engine = create_engine(DATABASE_URL, future=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
-Base = declarative_base()
+DB_URL = os.getenv("DATABASE_URL", "sqlite:///data/odes.db")
+DB_PATH = DB_URL.replace("sqlite:///", "")
 
-class ODERecord(Base):
-    __tablename__ = "odes"
-    id = Column(Integer, primary_key=True, index=True)
-    lhs_srepr = Column(Text, nullable=False)
-    rhs_srepr = Column(Text, nullable=False)
-    lhs_latex = Column(Text, nullable=False)
-    rhs_latex = Column(Text, nullable=False)
-    meta_json = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=dt.datetime.utcnow)
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
-Base.metadata.create_all(bind=engine)
+def _db_conn():
+    return sqlite3.connect(DB_PATH)
 
-# ----------------------------------------------------------------------------
-# Models
-# ----------------------------------------------------------------------------
-class BuildRequest(BaseModel):
-    f_str: str = Field(..., description="f(z) as a SymPy expression string")
-    template: str = Field(..., description="Generator template using y, Dy1, Dy2, ..., Dym")
-    n: str = Field("n", description="Integer like '4' or 'n' for symbolic")
-    m: Optional[str] = Field(None, description="Integer like '2' or None for symbolic m")
-    alpha: str = Field("alpha", description="alpha expression")
-    beta: str = Field("beta", description="beta expression")
+def init_db():
+    with _db_conn() as con:
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS odes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            template TEXT NOT NULL,
+            f_str TEXT NOT NULL,
+            n_repr TEXT NOT NULL,
+            m_repr TEXT NOT NULL,
+            complex_form INTEGER NOT NULL,
+            lhs_srepr TEXT NOT NULL,
+            rhs_srepr TEXT NOT NULL,
+            lhs_latex TEXT NOT NULL,
+            rhs_latex TEXT NOT NULL,
+            meta_json TEXT NOT NULL
+        )
+        """)
+init_db()
+
+def save_ode_row(payload: Dict[str, Any]) -> int:
+    with _db_conn() as con:
+        cur = con.cursor()
+        cur.execute("""
+            INSERT INTO odes (created_at, template, f_str, n_repr, m_repr, complex_form,
+                              lhs_srepr, rhs_srepr, lhs_latex, rhs_latex, meta_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            dt.datetime.utcnow().isoformat() + "Z",
+            payload["template"],
+            payload["f_str"],
+            payload["n_repr"],
+            payload["m_repr"],
+            1 if payload["complex_form"] else 0,
+            payload["lhs_srepr"],
+            payload["rhs_srepr"],
+            payload["lhs_latex"],
+            payload["rhs_latex"],
+            json.dumps(payload.get("meta", {}), ensure_ascii=False)
+        ))
+        return cur.lastrowid
+
+def list_odes(limit: int = 20, offset: int = 0) -> List[Dict[str, Any]]:
+    with _db_conn() as con:
+        cur = con.cursor()
+        cur.execute("""
+            SELECT id, created_at, template, f_str, n_repr, m_repr, complex_form,
+                   lhs_srepr, rhs_srepr, lhs_latex, rhs_latex, meta_json
+            FROM odes
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+        """, (limit, offset))
+        rows = cur.fetchall()
+    out = []
+    for r in rows:
+        out.append({
+            "id": r[0],
+            "created_at": r[1],
+            "template": r[2],
+            "f_str": r[3],
+            "n_repr": r[4],
+            "m_repr": r[5],
+            "complex_form": bool(r[6]),
+            "lhs_srepr": r[7],
+            "rhs_srepr": r[8],
+            "lhs_latex": r[9],
+            "rhs_latex": r[10],
+            "meta": json.loads(r[11] or "{}"),
+        })
+    return out
+
+# --------------------- ML/DL Singletons ---------------------
+
+LEARNER = GeneratorPatternLearner()
+NOVELTY = NoveltyDetector()
+
+# --------------------- Pydantic Models ---------------------
+
+class GenerateRequest(BaseModel):
+    template: str
+    f_str: str
+    n_mode: str = "symbolic"   # "symbolic" or "numeric"
+    n_value: int = 2
+    m_mode: str = "symbolic"   # "symbolic" or "numeric"
+    m_value: int = 3
     complex_form: bool = True
     persist: bool = False
-
-class ODERecordIn(BaseModel):
-    lhs_srepr: str
-    rhs_srepr: str
-    lhs_latex: str
-    rhs_latex: str
     meta: Optional[Dict[str, Any]] = None
 
-class TrainMLItem(BaseModel):
+class GenerateResponse(BaseModel):
+    id: Optional[int] = None
+    lhs_latex: str
+    rhs_latex: str
     lhs_srepr: str
     rhs_srepr: str
-    labels: Dict[str, int]
+    lhs_str: str
+    rhs_str: str
+    complexity_lhs: Dict[str, int]
+    complexity_rhs: Dict[str, int]
+    meta: Dict[str, Any]
 
-class TrainMLRequest(BaseModel):
-    items: List[TrainMLItem]
+class TrainPayload(BaseModel):
+    samples: List[Dict[str, Any]]  # each: {lhs_srepr, rhs_srepr, meta}
 
-class PredictItem(BaseModel):
+class ClassifyRequest(BaseModel):
     lhs_srepr: str
     rhs_srepr: str
 
-class PredictRequest(BaseModel):
-    items: List[PredictItem]
+class ClassifyResponse(BaseModel):
+    linear: int
+    stiffness: int
+    solvability: int
 
-class TrainDLItem(BaseModel):
-    ode_str: str
-    target: float
+class NoveltyRequest(BaseModel):
+    lhs_srepr: str
+    rhs_srepr: str
 
-class TrainDLRequest(BaseModel):
-    items: List[TrainDLItem]
+class NoveltyResponse(BaseModel):
+    score: float
 
-class ScoreDLRequest(BaseModel):
-    ode_strs: List[str]
+# --------------------- FastAPI App ---------------------
 
-# ----------------------------------------------------------------------------
-# App state
-# ----------------------------------------------------------------------------
-app = FastAPI(title="Master Generators API")
-ML_PATH = "/mnt/data/models/ml.pkl"
-DL_PATH = "/mnt/data/models/dl.pt"
-os.makedirs("/mnt/data/models", exist_ok=True)
+app = FastAPI(title="Master Generators API", version="1.0.0")
 
-class State:
-    def __init__(self):
-        self.ml = GeneratorPatternLearner()
-        self.dl = NoveltyDetector()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+)
 
-state = State()
-
-# Try restore ML
-if os.path.exists(ML_PATH):
-    try:
-        with open(ML_PATH, 'rb') as f:
-            state.ml = pickle.load(f)
-    except Exception:
-        pass
-# Try restore DL (PyTorch)
-try:
-    import torch
-    if os.path.exists(DL_PATH) and state.dl.available:
-        state.dl.model.load_state_dict(torch.load(DL_PATH, map_location='cpu'))
-except Exception:
-    pass
-
-# ----------------------------------------------------------------------------
-# Helpers
-# ----------------------------------------------------------------------------
-def parse_nm(n_str: str, m_str: Optional[str], T: Theorem42):
-    n_val = T.n if n_str.strip().lower() == 'n' else int(n_str)
-    m_val = None if (m_str is None or not str(m_str).strip()) else int(m_str)
-    return n_val, m_val
-
-def parse_ab(a_str: str, b_str: str, T: Theorem42):
-    ns = {'alpha': T.alpha, 'beta': T.beta, 'pi': sp.pi, 'I': sp.I}
-    a = sp.sympify(a_str, locals=ns)
-    b = sp.sympify(b_str, locals=ns)
-    return a, b
-
-# ----------------------------------------------------------------------------
-# Endpoints
-# ----------------------------------------------------------------------------
 @app.get("/health")
 def health():
-    return {"status": "ok", "now": dt.datetime.utcnow().isoformat()}
+    return {"ok": True, "version": app.version}
 
-@app.post("/build_ode")
-def build_ode(req: BuildRequest):
+# --------------------- Endpoints ---------------------
+
+@app.post("/generate", response_model=GenerateResponse)
+def generate(req: GenerateRequest):
     try:
-        baseT = Theorem42()
-        n_val, m_val = parse_nm(req.n, req.m, baseT)
-        alpha, beta = parse_ab(req.alpha, req.beta, baseT)
-        T = Theorem42(alpha=alpha, beta=beta, n=n_val)
-        f = safe_eval_f_of_z(req.f_str); f_callable = lambda z: f(z)
-        builder = GeneratorBuilder(T, f_callable, n_val, m_val, req.complex_form)
-        lhs, rhs = builder.build(req.template)
-        data = ode_to_json(lhs, rhs, meta={
-            "f_str": req.f_str, "template": req.template, "n": req.n, "m": req.m or "symbolic",
-            "alpha": str(alpha), "beta": str(beta), "complex_form": req.complex_form
+        # Construct theorem object
+        if req.n_mode == "symbolic":
+            T = Theorem42(n="n")
+            n_repr = "n"
+        else:
+            if req.n_value <= 0:
+                raise HTTPException(status_code=400, detail="n_value must be positive integer.")
+            T = Theorem42(n=int(req.n_value))
+            n_repr = str(int(req.n_value))
+
+        f = safe_eval_f_of_z(req.f_str)
+        G = GeneratorBuilder(T, TemplateConfig(alpha=T.alpha, beta=T.beta, n=T.n, m_sym=T.m_sym))
+
+        if req.m_mode == "symbolic":
+            m_arg = T.m_sym
+            m_repr = "m"
+        else:
+            if req.m_value <= 0:
+                raise HTTPException(status_code=400, detail="m_value must be positive integer.")
+            m_arg = int(req.m_value)
+            m_repr = str(int(req.m_value))
+
+        lhs, rhs = G.build(
+            template=req.template,
+            f=f,
+            m=m_arg,
+            n_override=None,
+            complex_form=req.complex_form
+        )
+
+        payload = json.loads(ode_to_json(lhs, rhs, meta=req.meta or {}))
+        # augment with ids + params
+        payload["meta"].update({
+            "template": req.template, "f_str": req.f_str,
+            "n_repr": n_repr, "m_repr": m_repr,
+            "complex_form": req.complex_form
         })
-        if req.persist:
-            with SessionLocal() as db:
-                rec = ODERecord(lhs_srepr=data["lhs_srepr"], rhs_srepr=data["rhs_srepr"],
-                                lhs_latex=data["lhs_latex"], rhs_latex=data["rhs_latex"],
-                                meta_json=json.dumps(data.get("meta", {})))
-                db.add(rec); db.commit(); db.refresh(rec)
-                data["id"] = rec.id
-        return data
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
 
-@app.post("/store/ode")
-def store_ode(rec: ODERecordIn):
-    try:
-        with SessionLocal() as db:
-            row = ODERecord(lhs_srepr=rec.lhs_srepr, rhs_srepr=rec.rhs_srepr,
-                            lhs_latex=rec.lhs_latex, rhs_latex=rec.rhs_latex,
-                            meta_json=json.dumps(rec.meta or {}))
-            db.add(row); db.commit(); db.refresh(row)
-            return {"status":"ok", "id": row.id}
+        row_id = None
+        if req.persist:
+            save_payload = {
+                "template": req.template,
+                "f_str": req.f_str,
+                "n_repr": n_repr,
+                "m_repr": m_repr,
+                "complex_form": req.complex_form,
+                "lhs_srepr": payload["lhs_srepr"],
+                "rhs_srepr": payload["rhs_srepr"],
+                "lhs_latex": payload["lhs_latex"],
+                "rhs_latex": payload["rhs_latex"],
+                "meta": payload["meta"]
+            }
+            row_id = save_ode_row(save_payload)
+
+        return GenerateResponse(
+            id=row_id,
+            lhs_latex=payload["lhs_latex"],
+            rhs_latex=payload["rhs_latex"],
+            lhs_srepr=payload["lhs_srepr"],
+            rhs_srepr=payload["rhs_srepr"],
+            lhs_str=payload["lhs_str"],
+            rhs_str=payload["rhs_str"],
+            complexity_lhs=payload["complexity_lhs"],
+            complexity_rhs=payload["complexity_rhs"],
+            meta=payload["meta"]
+        )
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+
+@app.post("/train")
+def train(payload: TrainPayload):
+    try:
+        ds = []
+        for item in payload.samples:
+            lhs = expr_from_srepr(item["lhs_srepr"])
+            rhs = expr_from_srepr(item["rhs_srepr"])
+            meta = item.get("meta", {})
+            ds.append((lhs, rhs, meta))
+        LEARNER.train(ds)
+        return {"ok": True, "trained_on": len(ds)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Training failed: {e}")
+
+@app.post("/classify", response_model=ClassifyResponse)
+def classify(req: ClassifyRequest):
+    try:
+        lhs = expr_from_srepr(req.lhs_srepr)
+        rhs = expr_from_srepr(req.rhs_srepr)
+        pred = LEARNER.predict([(lhs, rhs)])[0]
+        return ClassifyResponse(**pred)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Classification failed: {e}")
+
+@app.post("/novelty", response_model=NoveltyResponse)
+def novelty(req: NoveltyRequest):
+    try:
+        lhs = expr_from_srepr(req.lhs_srepr)
+        rhs = expr_from_srepr(req.rhs_srepr)
+        score = NOVELTY.score(lhs, rhs)
+        return NoveltyResponse(score=float(score))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Novelty scoring failed: {e}")
 
 @app.get("/odes")
-def list_odes(limit: int = Query(20, ge=1, le=200)):
-    with SessionLocal() as db:
-        rows = db.query(ODERecord).order_by(ODERecord.id.desc()).limit(limit).all()
-        out = []
-        for r in rows:
-            out.append({"id": r.id, "lhs_latex": r.lhs_latex, "rhs_latex": r.rhs_latex, "meta": json.loads(r.meta_json or "{}")})
-        return out
-
-@app.get("/ode/{oid}")
-def get_ode(oid: int):
-    with SessionLocal() as db:
-        r = db.query(ODERecord).filter(ODERecord.id==oid).first()
-        if not r:
-            raise HTTPException(status_code=404, detail="not found")
-        return {"id": r.id, "lhs_srepr": r.lhs_srepr, "rhs_srepr": r.rhs_srepr,
-                "lhs_latex": r.lhs_latex, "rhs_latex": r.rhs_latex,
-                "meta": json.loads(r.meta_json or "{}"), "created_at": r.created_at.isoformat()}
-
-@app.post("/ml/train")
-def ml_train(req: TrainMLRequest):
+def get_odes(limit: int = Query(20, ge=1, le=200), offset: int = Query(0, ge=0)):
     try:
-        dataset = []
-        for it in req.items:
-            L = expr_from_srepr(it.lhs_srepr)
-            R = expr_from_srepr(it.rhs_srepr)
-            dataset.append({"lhs": L, "rhs": R, "labels": it.labels})
-        info = state.ml.train(dataset)
-        # Persist ML model if sklearn available
-        try:
-            with open(ML_PATH, 'wb') as f:
-                pickle.dump(state.ml, f)
-        except Exception:
-            pass
-        return {"status": "ok", "info": info}
+        return {"items": list_odes(limit=limit, offset=offset)}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.post("/ml/predict")
-def ml_predict(req: PredictRequest):
-    try:
-        pairs = [(expr_from_srepr(it.lhs_srepr), expr_from_srepr(it.rhs_srepr)) for it in req.items]
-        preds = state.ml.predict(pairs)
-        return {"preds": preds}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.post("/dl/train")
-def dl_train(req: TrainDLRequest):
-    try:
-        pairs = [(it.ode_str, float(it.target)) for it in req.items]
-        info = state.dl.quick_train(pairs, epochs=3)
-        # Save torch state if available
-        try:
-            import torch
-            torch.save(state.dl.model.state_dict(), DL_PATH)
-        except Exception:
-            pass
-        return {"status": "ok", "info": info}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.post("/dl/score")
-def dl_score(req: ScoreDLRequest):
-    try:
-        scores = state.dl.novelty_score(req.ode_strs)
-        return {"scores": scores}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.get("/triage/{oid}")
-def triage(oid: int):
-    with SessionLocal() as db:
-        r = db.query(ODERecord).filter(ODERecord.id==oid).first()
-        if not r:
-            raise HTTPException(status_code=404, detail="not found")
-        L = expr_from_srepr(r.lhs_srepr); R = expr_from_srepr(r.rhs_srepr)
-        feats_L = count_symbolic_complexity(L); feats_R = count_symbolic_complexity(R)
-        score = state.dl.novelty_score([sp.srepr(sp.Eq(L, R))])[0]
-        return {"features": {"lhs": feats_L, "rhs": feats_R}, "novelty": score}
+        raise HTTPException(status_code=500, detail=f"Listing failed: {e}")
