@@ -1,70 +1,48 @@
-# syntax=docker/dockerfile:1.4
+# ----- Dockerfile -----
+FROM python:3.11-slim
 
-# Stage 1: Build stage
-FROM python:3.10-slim AS builder
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y \
-    gcc \
-    g++ \
-    python3-dev \
-    libgfortran5 \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
+# System packages: nginx, supervisor, envsubst (from gettext-base)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    nginx supervisor gettext-base ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
 WORKDIR /app
 
-# Copy requirements and install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir --user -r requirements.txt
+# Copy requirements and install (single Streamlit range; no conflicts)
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Stage 2: Runtime stage
-FROM python:3.10-slim
+# Copy your application code (adjust/add paths as needed)
+# Expect these files to be present in the repo root:
+#   - master_generators_app.py (Streamlit UI)
+#   - api_server.py            (FastAPI backend)
+#   - core_master_generators.py (the core)
+COPY master_generators_app.py /app/master_generators_app.py
+COPY api_server.py            /app/api_server.py
+COPY core_master_generators.py /app/core_master_generators.py
+# If you’ve packaged the core as a module dir, include it too:
+# COPY mg_core /app/mg_core
 
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y \
-    libgfortran5 \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+# Streamlit config
+RUN mkdir -p /app/.streamlit
+COPY .streamlit/config.toml /app/.streamlit/config.toml
 
-# Create non-root user
-RUN useradd -m -u 1000 appuser
+# Nginx & Supervisor configs and entrypoint
+COPY deploy/nginx.conf.template /etc/nginx/conf.d/default.conf.template
+COPY deploy/supervisord.conf    /etc/supervisor/conf.d/supervisord.conf
+COPY deploy/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
+ && rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf || true
 
-# Set working directory
-WORKDIR /app
+# Railway sets $PORT; default to 8080 for local use
+ENV PORT=8080 \
+    MG_API_BASE=/api
 
-# Copy Python packages from builder
-COPY --from=builder /root/.local /home/appuser/.local
+# Logs to stdout/stderr
+ENV STREAMLIT_SERVER_HEADLESS=true
 
-# Copy application files
-COPY --chown=appuser:appuser . .
-
-# Create necessary directories
-RUN mkdir -p models data logs static/css static/js static/images \
-    && chown -R appuser:appuser /app
-
-# Switch to non-root user
-USER appuser
-
-# Add local bin to PATH
-ENV PATH=/home/appuser/.local/bin:$PATH
-
-# Expose ports
-EXPOSE 8501 8000
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
-
-# Create startup script
-RUN echo '#!/bin/bash\n\
-set -e\n\
-echo "Starting Master Generators Application..."\n\
-python startup_check.py\n\
-streamlit run master_generators_app.py --server.port=8501 --server.address=0.0.0.0 &\n\
-python api_server.py\n\
-wait' > start.sh && chmod +x start.sh
-
-# Run the application
-CMD ["./start.sh"]
+# Start: render nginx with $PORT, run supervisor (nginx+uvicorn+streamlit)
+CMD ["bash", "-lc", "docker-entrypoint.sh"]
