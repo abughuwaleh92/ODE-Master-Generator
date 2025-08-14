@@ -740,142 +740,154 @@ def page_generator_constructor():
                 st.write("LHS constructed.")
 
 
-def page_master_theorem():
-    st.header("🎯 Apply Master Theorem 4.1")
-    st.markdown('<div class="info-box">Build the exact solution \\(y(x)\\) using Theorem 4.1, then construct RHS as \\(L[y]\\).</div>', unsafe_allow_html=True)
+def page_apply_master_theorem():
+    st.header("🎯 Apply Master Theorem")
+
+    st.markdown(
+        """
+        <div class="info-box">
+        <strong>What this does:</strong> It builds the exact solution via Theorem 4.1 given a function
+        \(f(z)\) and parameters \((\\alpha, \\beta, n, M)\). If you have built a generator \(L\) in the
+        constructor, we form the complete ODE by computing \(\\mathrm{RHS} = L[y]\) symbolically.
+        A small numerical residual check is then performed.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     # Function selection
-    source_lib = st.selectbox("Function Library", ["Basic","Special"], index=0)
-    func_names = []
-    if source_lib == "Basic" and st.session_state.get("basic_functions"):
-        try:
-            func_names = st.session_state["basic_functions"].get_function_names()  # type: ignore
-        except Exception:
-            func_names = ["identity","z","exp","sin","cos","log1p","poly2","poly3"]
-    elif source_lib == "Special" and st.session_state.get("special_functions"):
-        try:
-            func_names = st.session_state["special_functions"].get_function_names()  # type: ignore
-        except Exception:
-            func_names = ["bessel_j0","exp","sin"]
-    else:
-        func_names = ["identity","z","exp","sin","cos","log1p","poly2","poly3"]
-    func_name = st.selectbox("Select f(z)", func_names, index=min(2,len(func_names)-1))
-
-    # Parameters
-    st.subheader("Parameters")
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2 = st.columns(2)
     with col1:
-        alpha = st.text_input("α (symbolic allowed)", "1")
+        lib = st.selectbox("Function Library", ["Basic", "Special"])
+        if lib == "Basic" and BasicFunctions is not None:
+            func_names = st.session_state.basic_functions.get_function_names()
+        elif lib == "Special" and SpecialFunctions is not None:
+            func_names = st.session_state.special_functions.get_function_names()
+        else:
+            func_names = []
+        func_name = st.selectbox("Select f(z)", func_names) if func_names else st.text_input("Enter f(z) name or expression")
+
     with col2:
-        beta = st.text_input("β (symbolic allowed)", "1")
-    with col3:
-        n = st.number_input("n (positive integer)", min_value=1, max_value=12, value=1, step=1)
-    with col4:
-        M = st.text_input("M (symbolic allowed)", "0")
-
-    exact_mode = st.checkbox("Exact (symbolic) parameters", value=True)
-
-    def to_exact(v: str) -> sp.Expr:
-        try:
-            return sp.nsimplify(v, [sp.E, sp.pi], rational=True)
-        except Exception:
-            return sp.sympify(v)
-
-    α = to_exact(alpha) if exact_mode else sp.sympify(alpha)
-    β = to_exact(beta) if exact_mode else sp.sympify(beta)
-    𝑀 = to_exact(M) if exact_mode else sp.sympify(M)
+        alpha = st.number_input("α", -10.0, 10.0, 1.0, 0.1)
+        beta = st.number_input("β", 0.1, 10.0, 1.0, 0.1)
+        n = st.slider("n (positive integer)", 1, 6, 1)
+        M = st.number_input("M", -10.0, 10.0, 0.0, 0.1)
 
     if st.button("🚀 Generate ODE", type="primary", use_container_width=True):
-        with st.spinner("Applying Master Theorem 4.1 and constructing RHS..."):
+        with st.spinner("Applying Theorem 4.1 and constructing RHS..."):
             try:
-                f_expr = get_function_expr(source_lib, func_name)
-                x = X
+                # Resolve f(z) as SymPy expression
+                f_expr = get_function_expr(lib, func_name)
+                x = sp.Symbol("x", real=True)
 
-                # y(x) via Theorem 4.1
-                solution = theorem_4_1_solution_expr(f_expr, α, β, int(n), 𝑀, x)
-
-                # construct RHS using current generator
+                # Prefer official solver when generator exists
                 gen_spec = st.session_state.get("current_generator")
-                if gen_spec is not None:
+                solution = None
+                rhs = None
+                generator_lhs = None
+                used_solver = False
+
+                if gen_spec is not None and MasterTheoremSolver is not None and MasterTheoremParameters is not None:
                     try:
-                        rhs = apply_generator_to(solution, gen_spec, x)
-                        generator_lhs = gen_spec.lhs
+                        params = MasterTheoremParameters(f_z=f_expr, alpha=alpha, beta=beta, n=int(n), M=M)
+                        solver = st.session_state.get("theorem_solver") or MasterTheoremSolver()
+                        st.session_state.theorem_solver = solver
+                        res = solver.apply_theorem_4_1(gen_spec, params)
+                        # Adapt to possible dict shape
+                        sol = res.get("solution", None) if isinstance(res, dict) else None
+                        # prefer real part for display
+                        solution = safe_simplify(sp.re(sol)) if sol is not None else None
+                        rhs = (res.get("rhs", None) if isinstance(res, dict) else None) or \
+                              (res.get("ode", {}).get("rhs", None) if isinstance(res, dict) and "ode" in res else None)
+                        generator_lhs = getattr(gen_spec, "lhs", sp.Symbol("L[y]"))
+                        used_solver = solution is not None and rhs is not None
                     except Exception as e:
-                        logger.warning(f"Failed to apply generator to solution: {e}")
-                        generator_lhs = sp.Function("y")(x)
-                        rhs = solution
-                else:
-                    generator_lhs = sp.Function("y")(x)
-                    rhs = solution
+                        logger.warning(f"MasterTheoremSolver failed; falling back to manual construction: {e}")
 
-                # classification
-                order = 0
-                nonlin = False
-                if gen_spec and hasattr(gen_spec, "terms"):
-                    if gen_spec.terms:
-                        order = max(int(t.get("derivative_order", 0)) for t in gen_spec.terms)
-                        for t in gen_spec.terms:
-                            if int(t.get("power", 1)) != 1:
-                                nonlin = True
-                            ft = str(t.get("function_type", "identity")).lower()
-                            if ft not in ("identity","none"):
-                                nonlin = True
+                if not used_solver:
+                    # Manual build: y(x) then RHS = L[y]
+                    solution = theorem_4_1_solution_expr(f_expr, alpha, beta, int(n), M, x)
+                    if gen_spec is not None and hasattr(gen_spec, "lhs"):
+                        try:
+                            rhs = apply_generator_to(solution, gen_spec, x)
+                            generator_lhs = gen_spec.lhs
+                        except Exception as e:
+                            logger.warning(f"Failed to apply generator to solution: {e}")
+                            # Placeholder RHS only if generator application failed
+                            z = next(iter(f_expr.free_symbols)) if f_expr.free_symbols else sp.Symbol("z")
+                            rhs = safe_simplify(sp.pi * (f_expr.subs(z, alpha + beta) + M))
+                            generator_lhs = sp.Symbol("L[y]")
+                            st.warning("Using a placeholder RHS because applying the generator failed.")
+                    else:
+                        # No generator: placeholder RHS (clearly labeled)
+                        z = next(iter(f_expr.free_symbols)) if f_expr.free_symbols else sp.Symbol("z")
+                        rhs = safe_simplify(sp.pi * (f_expr.subs(z, alpha + beta) + M))
+                        generator_lhs = sp.Symbol("L[y]")
+                        st.info("No generator specified; showing a placeholder RHS.")
 
-                ode_type = "Nonlinear" if nonlin else "Linear"
+                # Verification (residual) if we have a concrete generator
+                verification_note = ""
+                if gen_spec is not None and hasattr(gen_spec, "lhs"):
+                    try:
+                        Ly = apply_generator_to(solution, gen_spec, x)
+                        residual = safe_simplify(Ly - rhs)
+                        fnum = sp.lambdify(x, residual, "numpy")
+                        pts = np.array([-1.0, -0.5, 0.0, 0.5, 1.0])
+                        vals = np.array([float(sp.N(fnum(t))) for t in pts])
+                        maxabs = float(np.max(np.abs(vals)))
+                        verification_note = f"Max |L[y]-RHS| on test points = {maxabs:.2e}"
+                        if maxabs < 1e-7:
+                            st.success("✅ Solution verified numerically on test points.")
+                        else:
+                            st.warning("⚠️ Residual is not tiny; check generator terms and parameters.")
+                    except Exception as e:
+                        verification_note = f"Verification skipped (error: {e})"
+                        logger.debug(verification_note)
 
-                # initial condition sample
-                y0 = nsimplify_safe(sp.simplify(solution.subs(x, 0)))
-
-                # store
+                # Persist
                 result = {
-                    "generator": nsimplify_safe(generator_lhs),
-                    "solution": nsimplify_safe(solution),
-                    "rhs": nsimplify_safe(rhs),
-                    "parameters": {"alpha": α, "beta": β, "n": int(n), "M": 𝑀},
+                    "generator": generator_lhs,
+                    "solution": solution,
+                    "rhs": rhs,
+                    "parameters": {"alpha": sp.sympify(alpha), "beta": sp.sympify(beta), "n": int(n), "M": sp.sympify(M)},
                     "function_used": func_name,
-                    "type": ode_type.lower(),
-                    "order": int(order),
+                    "type": ("Linear" if getattr(gen_spec, "is_linear", False) else "Nonlinear") if gen_spec else "Unknown",
+                    "order": getattr(gen_spec, "order", 0) if gen_spec else 0,
                     "classification": {
-                        "type": ode_type,
-                        "order": int(order),
-                        "linearity": "nonlinear" if nonlin else "linear",
+                        "type": ("Linear" if getattr(gen_spec, "is_linear", False) else "Nonlinear") if gen_spec else "Unknown",
+                        "order": getattr(gen_spec, "order", "Unknown") if gen_spec else "Unknown",
                         "field": "Mathematical Physics",
                         "applications": ["Research Equation"],
                     },
-                    "initial_conditions": {"y(0)": y0},
+                    "initial_conditions": {"y(0)": safe_simplify(solution.subs(x, 0))},
                     "timestamp": datetime.now().isoformat(),
-                    "generator_number": len(st.session_state["generated_odes"]) + 1,
+                    "generator_number": len(st.session_state.generated_odes) + 1,
+                    "verification_note": verification_note,
                 }
-                st.session_state["generated_odes"].append(result)
+                st.session_state.generated_odes.append(result)
 
-                st.markdown('<div class="result-box"><b>✅ ODE Generated Successfully</b></div>', unsafe_allow_html=True)
-
-                tabs = st.tabs(["📐 Equation", "💡 Solution", "🏷️ Classification", "📤 Export"])
+                # Show
+                tabs = st.tabs(["📐 ODE", "💡 Solution", "🧪 Verification", "📤 Export"])
                 with tabs[0]:
-                    st.markdown("### Complete ODE")
-                    st.latex(LaTeXExporter.sympy_to_latex(result["generator"]) + " = " + LaTeXExporter.sympy_to_latex(result["rhs"]))
+                    st.latex(sp.latex(generator_lhs) + " = " + sp.latex(rhs))
                 with tabs[1]:
-                    st.markdown("### Exact Solution")
-                    st.latex("y(x) = " + LaTeXExporter.sympy_to_latex(result["solution"]))
-                    st.markdown("### Initial Conditions")
-                    st.latex("y(0) = " + LaTeXExporter.sympy_to_latex(y0))
+                    st.latex("y(x) = " + sp.latex(solution))
+                    st.caption(f"Initial condition:  y(0) = {sp.latex(result['initial_conditions']['y(0)'])}")
                 with tabs[2]:
-                    st.markdown("### Classification")
-                    c = result["classification"]
-                    st.write(f"**Type:** {c.get('type')}")
-                    st.write(f"**Order:** {c.get('order')}")
-                    st.write(f"**Linearity:** {c.get('linearity')}")
-                    st.write(f"**Field:** {c.get('field')}")
-                    st.write(f"**Applications:** {', '.join(c.get('applications', []))}")
+                    note = result.get("verification_note", "")
+                    if note:
+                        st.info(note)
+                    if generator_lhs == sp.Symbol("L[y]"):
+                        st.warning("Placeholder RHS shown (no generator or application failed).")
                 with tabs[3]:
                     latex_doc = LaTeXExporter.generate_latex_document(result, include_preamble=True)
-                    st.download_button("📄 Download LaTeX", latex_doc, file_name="ode_solution.tex", mime="text/x-latex")
-                    # Also JSON export
-                    st.download_button("📦 Download JSON", json.dumps(result, default=str, indent=2), file_name="ode_solution.json", mime="application/json")
+                    st.download_button("📄 Download LaTeX", latex_doc, "ode_solution.tex", "text/x-latex", use_container_width=True)
+                    pkg = LaTeXExporter.create_export_package(result, include_extras=True)
+                    st.download_button("📦 Download Package (ZIP)", pkg, f"ode_package_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip", "application/zip", use_container_width=True)
 
             except Exception as e:
                 st.error(f"Error generating ODE: {e}")
-                logger.error(traceback.format_exc())
+                logger.error("Generation error:\n" + traceback.format_exc())
 
 
 def _resolve_factories():
@@ -1182,4 +1194,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
