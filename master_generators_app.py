@@ -1707,7 +1707,7 @@ def analysis_classification_page():
     d1, d2 = st.columns(2)
     with d1:
         orders = [ode.get("order", 0) for ode in st.session_state.generated_odes]
-        fig = px.histogram(orders, title="Order Distribution", nbins=10)
+        fig = px.histogram(x=orders, title="Order Distribution", nbins=10)
         fig.update_layout(xaxis_title="Order", yaxis_title="Count")
         st.plotly_chart(fig, use_container_width=True)
     with d2:
@@ -2277,4 +2277,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
