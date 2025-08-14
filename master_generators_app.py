@@ -2000,7 +2000,7 @@ def examples_library_page():
             },
             {
                 "name": "Exponential Nonlinearity",
-                "generator": "exp(y") + exp(y') = RHS",
+                "generator": "exp(y'') + exp(y') = RHS",
                 "parameters": {"alpha": 0, "beta": 1, "n": 1, "M": 0},
                 "function": "log(z+1)",
                 "description": "Exponential transformation of derivatives",
