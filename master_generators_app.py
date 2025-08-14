@@ -37,9 +37,8 @@ APP_VERSION = "2.1.1"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("master_generators_app")
 
-# Add src/ to path
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
-
+# Add src to path for imports
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src'))
 # -----------------------------------------------------------------------------
 # Optional / external dependencies and feature flags
 # -----------------------------------------------------------------------------
