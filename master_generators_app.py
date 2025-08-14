@@ -1,98 +1,205 @@
 # master_generators_app.py
-# Streamlit UI for Master Generators (Theorem 4.2, symbolic n/m, free-form generators, ML/DL, API probe)
+# Streamlit UI for Master Generators (Theorem 4.2) with robust core-call compatibility
 from __future__ import annotations
 
 import os
 import json
-import time
 import traceback
 from typing import Any, Dict, Optional, Tuple
 
-# --- Streamlit (compatible 1.28+ and 1.33+) ---
-import streamlit as st
-
-# --- SymPy ---
 import sympy as sp
 from sympy import Eq
 
-# --- Optional outbound HTTP for API probe ---
+import streamlit as st
+
+# Optional HTTP for API probe
 try:
-    import requests
+    import requests  # type: ignore
 except Exception:
     requests = None
 
-# --- Import shim for the core ---
-# We try local file, then a package `mg_core`, then dynamic import.
+# ---- Import shim for the core ----
+# We support both a flat file and a packaged core (mg_core.core_master_generators)
+CORE_IMPORT_OK = False
+core_err = None
 try:
     from core_master_generators import (
         Theorem42, GeneratorBuilder, TemplateConfig,
         safe_eval_f_of_z, ode_to_json, expr_from_srepr,
         GeneratorLibrary, GeneratorPatternLearner, NoveltyDetector
     )
-except Exception:
+    CORE_IMPORT_OK = True
+except Exception as e1:
     try:
         from mg_core.core_master_generators import (
             Theorem42, GeneratorBuilder, TemplateConfig,
             safe_eval_f_of_z, ode_to_json, expr_from_srepr,
             GeneratorLibrary, GeneratorPatternLearner, NoveltyDetector
         )
-    except Exception as e:
-        st.error("Cannot import core_master_generators. "
-                 "Ensure core_master_generators.py is next to this file "
-                 "or install the package `mg_core`.")
-        st.stop()
+        CORE_IMPORT_OK = True
+    except Exception as e2:
+        core_err = (e1, e2)
+        CORE_IMPORT_OK = False
 
-# ---------- App Config ----------
+if not CORE_IMPORT_OK:
+    st.error(
+        "Cannot import `core_master_generators`. "
+        "Place `core_master_generators.py` next to this file or install the `mg_core` package."
+    )
+    if core_err:
+        st.code("\n".join([repr(core_err[0]), repr(core_err[1])]))
+    st.stop()
+
+# ---- Page config ----
 st.set_page_config(page_title="Master Generators (Theorem 4.2)", layout="wide")
 
-# ---------- Session State ----------
+# ---- Session init ----
 if "learner" not in st.session_state:
     st.session_state.learner = GeneratorPatternLearner()
 if "novelty" not in st.session_state:
     st.session_state.novelty = NoveltyDetector()
 if "trainset" not in st.session_state:
     st.session_state.trainset = []  # list of (lhs_expr, rhs_expr, meta)
+if "current_ode" not in st.session_state:
+    st.session_state.current_ode = None
 
-# ---------- Helpers ----------
+# ---- Helpers ----
 
-def _build_theorem(n_mode: str, n_value: Optional[int]) -> Theorem42:
-    """Create Theorem42 with symbolic or numeric n."""
+def hr():
+    st.markdown("---")
+
+def to_latex(lhs: sp.Expr, rhs: sp.Expr) -> str:
+    return sp.latex(Eq(lhs, rhs))
+
+def build_theorem(n_mode: str, n_value: Optional[int]) -> Theorem42:
+    """
+    Build Theorem42 with symbolic or numeric n.
+    Some cores accept str('n'); others require a SymPy Symbol. We try both.
+    """
     if n_mode == "Symbolic (n)":
-        return Theorem42(n="n")
+        # Try SymPy symbol first
+        try:
+            return Theorem42(n=sp.Symbol("n"))
+        except TypeError:
+            return Theorem42(n="n")
+        except Exception:
+            return Theorem42()  # as last resort
     else:
-        if n_value is None or n_value <= 0:
+        if n_value is None or int(n_value) <= 0:
             raise ValueError("Numeric n must be a positive integer.")
         return Theorem42(n=int(n_value))
 
-def _latex_eq(lhs: sp.Expr, rhs: sp.Expr) -> str:
-    return sp.latex(Eq(lhs, rhs))
+def make_builder(T: Theorem42) -> GeneratorBuilder:
+    """
+    Compatibility wrapper around GeneratorBuilder construction.
+    Supports:
+      - GeneratorBuilder(T, TemplateConfig(...))
+      - GeneratorBuilder(T)
+      - legacy: (GeneratorBuilder().init(T)) or init(T, TemplateConfig(...))
+    """
+    cfg = TemplateConfig(
+        alpha=getattr(T, "alpha", sp.Symbol("alpha")),
+        beta=getattr(T, "beta", sp.Symbol("beta")),
+        n=getattr(T, "n", sp.Symbol("n")),
+        m_sym=getattr(T, "m_sym", sp.Symbol("m")),
+    )
+    # Try preferred signature: (theorem, config)
+    try:
+        return GeneratorBuilder(T, cfg)  # type: ignore[arg-type]
+    except TypeError:
+        pass
+    except Exception:
+        pass
+    # Try minimal: (theorem)
+    try:
+        return GeneratorBuilder(T)  # type: ignore[arg-type]
+    except TypeError:
+        pass
+    except Exception:
+        pass
+    # Legacy: instance + .init(...)
+    gb = GeneratorBuilder  # class
+    try:
+        inst = gb()  # type: ignore[call-arg]
+        if hasattr(inst, "init"):
+            try:
+                return inst.init(T, cfg)  # type: ignore[attr-defined]
+            except TypeError:
+                return inst.init(T)  # type: ignore[attr-defined]
+        # If no .init, but constructor requires no args:
+        return inst  # type: ignore[return-value]
+    except Exception as e:
+        raise TypeError(
+            f"Cannot create GeneratorBuilder with any supported signature: {e}"
+        )
 
-def _make_builder(T: Theorem42) -> GeneratorBuilder:
-    return GeneratorBuilder(T, TemplateConfig(alpha=T.alpha, beta=T.beta, n=T.n, m_sym=T.m_sym))
+def call_build(G: Any, *, template: str, f: Any, m: Any, complex_form: bool) -> Tuple[sp.Expr, sp.Expr]:
+    """
+    Robust call into GeneratorBuilder.build(), trying common signatures.
+    Prioritized signature:
+        build(template=..., f=..., m=..., n_override=None, complex_form=True)
+    Fallbacks try removing unknown keywords / renaming flags.
+    """
+    # 1) Preferred keyworded signature
+    try:
+        return G.build(template=template, f=f, m=m, n_override=None, complex_form=complex_form)
+    except TypeError:
+        pass
+    # 2) Without n_override
+    try:
+        return G.build(template=template, f=f, m=m, complex_form=complex_form)
+    except TypeError:
+        pass
+    # 3) Positional with complex_form
+    try:
+        return G.build(template, f, m, complex_form)
+    except TypeError:
+        pass
+    # 4) Positional without complex_form
+    try:
+        return G.build(template, f, m)
+    except TypeError as e:
+        raise TypeError(f"GeneratorBuilder.build() signature mismatch: {e}")
 
-def _download(data: str, filename: str, label: str) -> None:
-    st.download_button(label, data=data.encode("utf-8"), file_name=filename, mime="application/json")
+def ui_presets() -> Tuple[str, str]:
+    """
+    Provide preset (template, f_str) without instantiating GeneratorLibrary.
+    """
+    # Return values from static/class helpers when available, else built-ins
+    try:
+        return GeneratorLibrary.preset_pantograph_linear()  # type: ignore[attr-defined]
+    except Exception:
+        return ("y + Dy2", "z")
 
-def _hr():
-    st.markdown("---")
+def ui_presets_nonlinear() -> Tuple[str, str]:
+    try:
+        return GeneratorLibrary.preset_nonlinear_wrap()  # type: ignore[attr-defined]
+    except Exception:
+        return ("exp(Dy2) + y", "sin(z)")
 
-# ---------- UI Pages ----------
+def ui_presets_multi() -> Tuple[str, str]:
+    try:
+        return GeneratorLibrary.preset_multiorder_mix()  # type: ignore[attr-defined]
+    except Exception:
+        return ("y + Dy1 + Dy3 + sinh(Dym)", "exp(z)")
+
+# ---- Pages ----
 
 def page_generators():
-    st.title("Master Generators — Compose, Symbolize, Generate")
+    st.title("Master Generators — Compose & Generate (Theorem 4.2)")
 
     colL, colR = st.columns([7, 5])
 
     with colL:
-        st.subheader("1) Compose a Generator (free form)")
+        st.subheader("1) Compose LHS freely")
         st.markdown(
             """
-            **Template language** (LHS):
-            - `y` → the unknown \(y(x)\)  
-            - `DyK` → \(y^{(K)}(x)\), e.g. `Dy1`, `Dy2`, `Dy3`  
-            - `Dym` → \(y^{(m)}(x)\) (when \(m\) is symbolic)  
-            - Aliases: `y^(m)` → `Dym`, `y^(3)` → `Dy3`  
-            - Wrap with any SymPy func: `exp(Dy2)`, `sinh(Dym)`, `cos(y)`, `log(1+y)`  
+            **Atoms**:  
+            - `y` → \( y(x) \)  
+            - `DyK` → \( y^{(K)}(x) \), e.g. `Dy1`, `Dy2`, `Dy3`  
+            - `Dym` → \( y^{(m)}(x) \) when \(m\) is symbolic  
+            - `y^(m)` is accepted as an alias for `Dym`  
+            - Wraps: `exp(Dy2)`, `sinh(Dym)`, `cos(y)`, `log(1+y)`, etc.
             """
         )
 
@@ -107,21 +214,19 @@ def page_generators():
             index=0,
         )
 
-        default_template = "y + Dy2"
-        default_f = "z"
+        default_template, default_f = ("y + Dy2", "z")
         if preset == "Pantograph (linear): y + Dy2 with f(z)=z":
-            default_template, default_f = GeneratorLibrary.preset_pantograph_linear()
+            default_template, default_f = ui_presets()
         elif preset == "Nonlinear wrap: exp(Dy2) + y with f(z)=sin(z)":
-            default_template, default_f = GeneratorLibrary.preset_nonlinear_wrap()
+            default_template, default_f = ui_presets_nonlinear()
         elif preset == "Multi-order mix: y + Dy1 + Dy3 + sinh(Dym) with f(z)=exp(z)":
-            default_template, default_f = GeneratorLibrary.preset_multiorder_mix()
+            default_template, default_f = ui_presets_multi()
 
-        template = st.text_input("Template for LHS (free form):", value=default_template, help="Example: y + exp(Dy2) + sinh(Dym) or y^(m) + y^(3)")
-        f_str = st.text_input("Analytic f(z):", value=default_f, help="Any analytic form in SymPy syntax; examples: z, sin(z), exp(z), log(1+z)")
+        template = st.text_input("LHS template", value=default_template)
+        f_str = st.text_input("Analytic f(z)", value=default_f)
 
-        _hr()
-        st.subheader("2) Symbolic parameters (n, m)")
-
+        hr()
+        st.subheader("2) Symbolic parameters")
         c1, c2, c3 = st.columns(3)
         with c1:
             n_mode = st.radio("n is", ["Symbolic (n)", "Numeric"], horizontal=True)
@@ -135,165 +240,153 @@ def page_generators():
             if m_mode == "Numeric":
                 m_value = st.number_input("m (integer ≥ 1)", min_value=1, max_value=999, value=3, step=1)
 
-        complex_form = st.checkbox("Keep complex form (uncheck to take real part)", value=True)
+        complex_form = st.checkbox("Keep complex form (uncheck to take Re)", value=True)
 
-        _hr()
-        st.subheader("3) Build ODE (Theorem 4.2)")
-        build = st.button("Build ODE")
+        hr()
+        st.subheader("3) Build ODE (RHS via Theorem 4.2)")
+        build_btn = st.button("Build ODE")
 
     with colR:
-        st.subheader("Parameters for numeric preview (optional)")
-        alpha_val = st.text_input("alpha (numeric; e.g. 1)", value="1")
-        beta_val  = st.text_input("beta (numeric; e.g. 0.5)", value="0.5")
-        x_val     = st.text_input("x (numeric; e.g. 0.7)", value="0.7")
-        st.caption("These are only used if you click *Evaluate Sample*. They do not affect symbolic construction.")
+        st.subheader("Numeric preview (optional)")
+        alpha_val = st.text_input("alpha", "1")
+        beta_val = st.text_input("beta", "0.5")
+        x_val = st.text_input("x", "0.7")
+        eval_btn = st.button("Evaluate Sample")
 
-        _hr()
-        st.subheader("Evaluate sample")
-        eval_btn = st.button("Evaluate Sample (numeric values above)")
-
-    # Results area
-    if build:
+    if build_btn:
         try:
             f = safe_eval_f_of_z(f_str)
-            T = _build_theorem(n_mode, n_value)
-            G = _make_builder(T)
-
-            # Build
-            lhs, rhs = G.build(
-                template=template,
-                f=f,
-                m=(T.m_sym if m_mode == "Symbolic (m)" else int(m_value)),
-                n_override=None,
-                complex_form=complex_form
-            )
-
-            st.success("ODE constructed.")
-            st.latex(_latex_eq(lhs, rhs))
-
-            # JSON export
-            meta = {
-                "template": template,
-                "f_str": f_str,
-                "n_mode": n_mode,
-                "n_value": int(n_value) if n_mode == "Numeric" else "n",
-                "m_mode": m_mode,
-                "m_value": int(m_value) if m_mode == "Numeric" else "m",
-                "complex_form": complex_form
-            }
-            ode_json = ode_to_json(lhs, rhs, meta=meta)
-            _hr()
-            st.subheader("Serialized ODE (JSON)")
-            st.json(json.loads(ode_json))
-            _download(ode_json, filename="ode.json", label="⬇️ Download ODE JSON")
-
-            # Keep current ODE in state for ML/DL page
-            st.session_state.current_ode = (lhs, rhs, meta)
-
         except Exception as e:
-            st.error(f"Failed to build ODE.\n{e}")
+            st.error(f"Invalid f(z): {e}")
+            return
+
+        try:
+            T = build_theorem(n_mode, n_value)
+            G = make_builder(T)
+        except Exception as e:
+            st.error(f"Failed to initialize builder: {e}")
             st.code(traceback.format_exc())
+            return
+
+        try:
+            m_arg = getattr(T, "m_sym", sp.Symbol("m")) if m_mode == "Symbolic (m)" else int(m_value)  # type: ignore[arg-type]
+            lhs, rhs = call_build(G, template=template, f=f, m=m_arg, complex_form=complex_form)
+        except Exception as e:
+            st.error(f"Failed to build ODE: {e}")
+            st.code(traceback.format_exc())
+            return
+
+        st.success("ODE constructed.")
+        st.latex(to_latex(lhs, rhs))
+
+        # JSON
+        meta = {
+            "template": template,
+            "f_str": f_str,
+            "n_mode": n_mode,
+            "n_value": (int(n_value) if n_mode == "Numeric" else "n"),
+            "m_mode": m_mode,
+            "m_value": (int(m_value) if m_mode == "Numeric" else "m"),
+            "complex_form": complex_form,
+        }
+        ser = ode_to_json(lhs, rhs, meta=meta)
+        st.subheader("Serialized ODE (JSON)")
+        st.json(json.loads(ser))
+        st.download_button("⬇️ Download ODE JSON", data=ser.encode("utf-8"), file_name="ode.json", mime="application/json")
+
+        st.session_state.current_ode = (lhs, rhs, meta)
 
     if eval_btn:
-        try:
-            if "current_ode" not in st.session_state:
-                st.warning("Build an ODE first.")
-            else:
-                lhs, rhs, _ = st.session_state.current_ode
+        if not st.session_state.current_ode:
+            st.warning("Build an ODE first.")
+        else:
+            lhs, rhs, _ = st.session_state.current_ode
+            try:
                 subs = {
                     sp.Symbol("alpha"): sp.sympify(alpha_val),
                     sp.Symbol("beta"): sp.sympify(beta_val),
                     sp.Symbol("x"): sp.sympify(x_val),
                 }
-                lhs_num = sp.N(lhs.subs(subs))
-                rhs_num = sp.N(rhs.subs(subs))
-                st.write("**Numeric preview** (with alpha, beta, x):")
-                st.write(f"LHS = {lhs_num}")
-                st.write(f"RHS = {rhs_num}")
-        except Exception as e:
-            st.error(f"Evaluation failed.\n{e}")
-            st.code(traceback.format_exc())
+                st.write("**Numeric preview**")
+                st.write(f"LHS = {sp.N(lhs.subs(subs))}")
+                st.write(f"RHS = {sp.N(rhs.subs(subs))}")
+            except Exception as e:
+                st.error(f"Evaluation failed: {e}")
+                st.code(traceback.format_exc())
 
-    _hr()
+    hr()
     st.subheader("Where to hook in more")
     st.markdown(
         """
-        - Add more **preset recipes** here (pantograph families, multi‑order mixes, nonlinear wraps).
-        - Extend **templates**: introduce named blocks (e.g., `G1 = y + Dy2`) and reuse in the textarea.
-        - Use the **API Probe** page to persist ODEs/models to the FastAPI backend.
-        - Enrich ML labels (stiffness, linearity degree, solvability class), and let the Transformer score novelty/complexity.
+        - Add more **preset recipes** (pantograph families, multi-order mixes, nonlinear wraps).
+        - Extend template DSL, e.g., named blocks and reuse.
+        - Use **API Probe** page to persist ODEs/models to FastAPI.
+        - Enrich labels (stiffness, linearity degree, solvability) and triage by novelty score.
         """
     )
 
-
 def page_ml():
-    st.title("ML & DL — Classify, Rank, and Train")
+    st.title("ML & DL — Classify, Rank, Train")
 
-    if "current_ode" not in st.session_state:
-        st.info("Build or load an ODE in the Generators page first.")
+    if not st.session_state.current_ode:
+        st.info("Build an ODE on the Generators page first.")
         return
 
     lhs, rhs, meta = st.session_state.current_ode
-
     st.subheader("Selected ODE")
     st.latex(sp.latex(Eq(lhs, rhs)))
 
-    # Novelty score (Transformer or heuristic)
     novelty = st.session_state.novelty
     score = novelty.score(lhs, rhs)
     st.metric("Novelty/Complexity Score", f"{score:.4f}")
 
-    _hr()
+    hr()
     st.subheader("Classification (linearity, stiffness, solvability)")
     learner = st.session_state.learner
     preds = learner.predict([(lhs, rhs)])
     st.json(preds[0])
 
-    _hr()
+    hr()
     st.subheader("Training data")
     with st.expander("Append current ODE to training set"):
         col1, col2, col3 = st.columns(3)
-        linear = col1.selectbox("linear", options=[0, 1], index=0, help="0: nonlinear, 1: linear")
+        linear = col1.selectbox("linear", options=[0, 1], index=0)
         stiff  = col2.selectbox("stiffness", options=[0, 1, 2], index=0)
         solv   = col3.selectbox("solvability", options=[0, 1, 2], index=0)
-
-        if st.button("➕ Add to training set"):
+        if st.button("➕ Add"):
             st.session_state.trainset.append((lhs, rhs, {"linear": linear, "stiffness": stiff, "solvability": solv}))
-            st.success(f"Added. Training set size: {len(st.session_state.trainset)}")
+            st.success(f"Added. Size: {len(st.session_state.trainset)}")
 
-    with st.expander("Bulk load training set (JSONL; each line has lhs_srepr, rhs_srepr, meta)"):
+    with st.expander("Bulk load training set (JSONL: lhs_srepr, rhs_srepr, meta)"):
         up = st.file_uploader("Upload JSONL", type=["jsonl", "txt"])
         if up is not None:
-            lines = up.read().decode("utf-8").strip().splitlines()
+            lines = up.read().decode("utf-8").splitlines()
             added = 0
             for line in lines:
                 try:
                     obj = json.loads(line)
-                    lhs_e = expr_from_srepr(obj["lhs_srepr"])
-                    rhs_e = expr_from_srepr(obj["rhs_srepr"])
-                    meta_e = obj.get("meta", {})
-                    st.session_state.trainset.append((lhs_e, rhs_e, meta_e))
+                    l = expr_from_srepr(obj["lhs_srepr"])
+                    r = expr_from_srepr(obj["rhs_srepr"])
+                    m = obj.get("meta", {})
+                    st.session_state.trainset.append((l, r, m))
                     added += 1
                 except Exception as e:
-                    st.warning(f"Skipped a line: {e}")
+                    st.warning(f"Skipped: {e}")
             st.success(f"Loaded {added} samples.")
 
-    _hr()
-    if st.button("🧠 Train classifier (sklearn if installed; else heuristics active)"):
+    if st.button("🧠 Train classifier (sklearn if present; else heuristics)"):
         try:
-            learner.train(st.session_state.trainset)
-            st.success("Training finished.")
+            st.session_state.learner.train(st.session_state.trainset)
+            st.success("Training complete.")
         except Exception as e:
             st.error(f"Training failed: {e}")
 
-    # Predict again (post-train)
     preds2 = learner.predict([(lhs, rhs)])
     st.subheader("Prediction (post-train)")
     st.json(preds2[0])
 
-
 def page_api_probe():
-    st.title("API Probe — FastAPI backend integration")
+    st.title("API Probe — FastAPI backend")
 
     if requests is None:
         st.warning("The `requests` package is not installed. API probe disabled.")
@@ -301,28 +394,27 @@ def page_api_probe():
 
     base = st.text_input("Base URL", value=os.getenv("MG_API_BASE", "http://localhost:8000"))
 
-    _hr()
+    hr()
     st.subheader("Health")
-    if st.button("Check /health"):
+    if st.button("GET /health"):
         try:
             r = requests.get(f"{base}/health", timeout=5)
             st.code(f"HTTP {r.status_code}\n{r.text}")
         except Exception as e:
             st.error(e)
 
-    _hr()
+    hr()
     st.subheader("Generate (POST /generate)")
-    gen_col1, gen_col2 = st.columns(2)
-
-    with gen_col1:
-        template = st.text_input("template", value="y + Dy2")
-        f_str = st.text_input("f_str", value="z")
-        n_mode = st.selectbox("n mode", options=["symbolic", "numeric"], index=0)
-        n_value = st.number_input("n (used if numeric)", min_value=1, max_value=999, value=2, step=1)
-        m_mode = st.selectbox("m mode", options=["symbolic", "numeric"], index=1)
-        m_value = st.number_input("m (used if numeric)", min_value=1, max_value=999, value=3, step=1)
-        complex_form = st.checkbox("complex_form", value=True)
-    with gen_col2:
+    c1, c2 = st.columns(2)
+    with c1:
+        template = st.text_input("template", value="y + Dy2", key="api_template")
+        f_str    = st.text_input("f_str", value="z", key="api_fstr")
+        n_mode   = st.selectbox("n_mode", options=["symbolic", "numeric"], index=0, key="api_nmode")
+        n_value  = st.number_input("n_value", min_value=1, max_value=999, value=2, step=1, key="api_nvalue")
+        m_mode   = st.selectbox("m_mode", options=["symbolic", "numeric"], index=1, key="api_mmode")
+        m_value  = st.number_input("m_value", min_value=1, max_value=999, value=3, step=1, key="api_mvalue")
+        complex_form = st.checkbox("complex_form", value=True, key="api_cplx")
+    with c2:
         if st.button("POST /generate"):
             payload = {
                 "template": template,
@@ -332,35 +424,33 @@ def page_api_probe():
                 "m_mode": m_mode,
                 "m_value": int(m_value),
                 "complex_form": complex_form,
-                "persist": True
+                "persist": True,
             }
             try:
-                r = requests.post(f"{base}/generate", json=payload, timeout=20)
+                r = requests.post(f"{base}/generate", json=payload, timeout=30)
                 st.code(f"HTTP {r.status_code}")
                 st.json(r.json())
             except Exception as e:
                 st.error(e)
 
-    _hr()
+    hr()
     st.subheader("Train (POST /train)")
-    with st.expander("Build payload from current training set"):
-        if st.button("POST /train (from app memory)"):
-            if not st.session_state.trainset:
-                st.warning("Training set is empty.")
-            else:
-                def _ser(expr):
-                    return sp.srepr(expr)
-                items = [{"lhs_srepr": _ser(l), "rhs_srepr": _ser(r), "meta": m} for (l, r, m) in st.session_state.trainset]
-                try:
-                    r = requests.post(f"{base}/train", json={"samples": items}, timeout=60)
-                    st.code(f"HTTP {r.status_code}")
-                    st.json(r.json())
-                except Exception as e:
-                    st.error(e)
+    if st.button("POST /train (from in-app memory)"):
+        if not st.session_state.trainset:
+            st.warning("Training set is empty.")
+        else:
+            def _ser(expr): return sp.srepr(expr)
+            items = [{"lhs_srepr": _ser(l), "rhs_srepr": _ser(r), "meta": m} for (l, r, m) in st.session_state.trainset]
+            try:
+                r = requests.post(f"{base}/train", json={"samples": items}, timeout=60)
+                st.code(f"HTTP {r.status_code}")
+                st.json(r.json())
+            except Exception as e:
+                st.error(e)
 
-    _hr()
+    hr()
     st.subheader("List ODEs (GET /odes)")
-    if st.button("GET /odes"):
+    if st.button("GET /odes?limit=10"):
         try:
             r = requests.get(f"{base}/odes?limit=10", timeout=10)
             st.code(f"HTTP {r.status_code}")
@@ -368,16 +458,15 @@ def page_api_probe():
         except Exception as e:
             st.error(e)
 
-    st.caption("Use this page to validate and evolve the API; the UI above already supports the core workflows.")
+def main():
+    st.sidebar.title("Navigation")
+    page = st.sidebar.radio("Go to", ["Generators", "ML & DL", "API Probe"], index=0)
+    if page == "Generators":
+        page_generators()
+    elif page == "ML & DL":
+        page_ml()
+    else:
+        page_api_probe()
 
-
-# ---------- Router ----------
-st.sidebar.title("Navigation")
-page = st.sidebar.radio("Go to", ["Generators", "ML & DL", "API Probe"], index=0)
-
-if page == "Generators":
-    page_generators()
-elif page == "ML & DL":
-    page_ml()
-else:
-    page_api_probe()
+if __name__ == "__main__":
+    main()
