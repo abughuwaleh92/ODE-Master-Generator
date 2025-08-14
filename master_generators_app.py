@@ -3,7 +3,7 @@ Master Generators for ODEs — Complete App (Symbolic-Exact Mode + All Services 
 
 - Robust import discovery for factories (linear/nonlinear) no matter which src module they live in.
 - Theorem 4.1 (Master Theorem) implemented symbolically with SymPy.
-- Exact-mode toggle to keep parameters and output fully symbolic (no long decimals for e, pi).
+- Exact-mode toggle to keep parameters and output fully symbolic.
 - RHS construction: apply LHS operator L[y] by substituting symbolic y(x) (supports derivatives and shifts).
 - ML/DL, Novelty detection, Export/LaTeX, Batch generation, Visualization pages included.
 """
@@ -15,14 +15,11 @@ import sys
 import io
 import json
 import time
-import math
 import base64
-import pickle
 import zipfile
 import logging
 import traceback
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -31,6 +28,7 @@ import sympy as sp
 import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
+from sympy.core.function import AppliedUndef  # for y(x) pattern
 
 # ----------------------------- Logging ---------------------------------------
 logging.basicConfig(level=logging.INFO)
@@ -45,7 +43,6 @@ if SRC_DIR not in sys.path:
 # ----------------------------- Imports from src ------------------------------
 HAVE_SRC = True
 
-# Gracious import probing because your project may place factories in different modules.
 def _probe_factories():
     """
     Probe multiple candidate modules for the same factories.
@@ -93,7 +90,6 @@ def _probe_factories():
         "UIComponents": None,
     }
 
-    # core generators / theorem likely in these
     candidates = [
         "src.generators.master_generator",
         "src.generators.linear_generators",
@@ -113,7 +109,6 @@ def _probe_factories():
         "src.ui.components",
     ]
 
-    # lazy import helper
     def _imp(module: str):
         try:
             return __import__(module, fromlist=["*"])
@@ -132,7 +127,6 @@ def _probe_factories():
                 out[name] = getattr(mod, name)
                 return
 
-    # Try to map names to modules (in priority order)
     _set("MasterGenerator", ["src.generators.master_generator"])
     _set("EnhancedMasterGenerator", ["src.generators.master_generator"])
     _set("CompleteMasterGenerator", ["src.generators.master_generator"])
@@ -193,7 +187,6 @@ except Exception as e:
     PROBED = {}
     logger.warning(f"Failed to probe src modules: {e}")
 
-# convenient aliases (may be None if not found)
 MasterGenerator = PROBED.get("MasterGenerator")
 EnhancedMasterGenerator = PROBED.get("EnhancedMasterGenerator")
 CompleteMasterGenerator = PROBED.get("CompleteMasterGenerator")
@@ -283,7 +276,6 @@ class LaTeXExporter:
         if expr is None:
             return ""
         try:
-            # Try to bring back E, pi etc.
             expr = sp.nsimplify(expr, [sp.E, sp.pi, sp.I], rational=True)
         except Exception:
             pass
@@ -382,12 +374,9 @@ class LaTeXExporter:
 # =============================================================================
 # Symbolic helpers (Master Theorem 4.1 + operator application)
 # =============================================================================
-from sympy.core.function import AppliedUndef  # for y(x) pattern
-
 def get_function_expr(source: str, name: str) -> sp.Expr:
     """
     Obtain f(z) as a SymPy expression from BasicFunctions / SpecialFunctions.
-    The src libraries differ in return types across projects; we normalize.
     """
     z = sp.Symbol("z")
     lib = None
@@ -406,25 +395,19 @@ def get_function_expr(source: str, name: str) -> sp.Expr:
     else:
         raise ValueError(f"Function '{name}' not found.")
 
-    # Try to convert to f(z) expression
     try:
         if callable(f_obj):
-            test = f_obj(z)
-            return sp.sympify(test)
-        else:
-            return sp.sympify(f_obj)
+            return sp.sympify(f_obj(z))
+        return sp.sympify(f_obj)
     except Exception:
-        # last attempt: treat the name itself symbolically
         return sp.Symbol(name)
 
 def theorem_4_1_solution_expr(f_expr: sp.Expr, alpha, beta, n: int, M, x: sp.Symbol) -> sp.Expr:
     """
-    Symbolic solution according to the Master Theorem 4.1 used in your app content.
     y(x) = π/(2n) * sum_{s=1}^{n} [ 2 f(α + β) - ( ψ_s + φ_s ) ] + π M
-    where
-      ω_s = (2s-1)π/(2n),
-      ψ_s = f(α + β*exp(i x cos ω_s - x sin ω_s)),
-      φ_s = f(α + β*exp(-i x cos ω_s - x sin ω_s))
+    with ω_s = (2s-1)π/(2n),
+         ψ_s = f(α + β*exp(i x cos ω_s - x sin ω_s)),
+         φ_s = f(α + β*exp(-i x cos ω_s - x sin ω_s))
     """
     z = sp.Symbol("z")
     terms = []
@@ -434,7 +417,6 @@ def theorem_4_1_solution_expr(f_expr: sp.Expr, alpha, beta, n: int, M, x: sp.Sym
         φ_s = f_expr.subs(z, alpha + beta * sp.exp(-sp.I * x * sp.cos(ω) - x * sp.sin(ω)))
         terms.append(2 * f_expr.subs(z, alpha + beta) - (ψ_s + φ_s))
     y = sp.pi / (2 * n) * sum(terms) + sp.pi * M
-    # Try to keep exact/compact form
     try:
         y = sp.nsimplify(y, [sp.E, sp.pi, sp.I], rational=True)
     except Exception:
@@ -443,31 +425,24 @@ def theorem_4_1_solution_expr(f_expr: sp.Expr, alpha, beta, n: int, M, x: sp.Sym
 
 def apply_lhs_to_solution(lhs_expr: sp.Expr, solution_y: sp.Expr, x: sp.Symbol, y_name: str = "y") -> sp.Expr:
     """
-    Compute RHS = LHS[y] by substituting y(x) and its derivatives into lhs_expr.
-    Supports y(x), y'(x), y''(x), ..., y(x/a) (a could be any subexpr).
+    Compute RHS = LHS[y] by substituting y and its derivatives/shifts into lhs_expr.
     """
     subs_map: Dict[sp.Expr, sp.Expr] = {}
-
-    # 1) Substitute any y(arg) -> solution_y.subs(x, arg)
+    # y(arg)
     for f in lhs_expr.atoms(AppliedUndef):
         if f.func.__name__ == y_name and len(f.args) == 1:
             arg = f.args[0]
             subs_map[f] = sp.simplify(solution_y.subs(x, arg))
-
-    # 2) Substitute derivatives Derivative(y(arg), x, k) -> d^k/dx^k [ solution_y(x)->x=arg ]
+    # d^k/dx^k y(arg)
     for d in lhs_expr.atoms(sp.Derivative):
         base = d.expr
         if isinstance(base, AppliedUndef) and base.func.__name__ == y_name and len(base.args) == 1:
             arg = base.args[0]
-            # order of derivative with respect to x
             try:
-                # SymPy newer versions
                 order = sum(c for v, c in d.variable_count if v == x)
             except Exception:
-                # Fallback for older
                 order = sum(1 for v in d.variables if v == x)
             subs_map[d] = sp.diff(solution_y.subs(x, arg), (x, order))
-
     try:
         rhs = sp.simplify(lhs_expr.xreplace(subs_map))
     except Exception:
@@ -506,6 +481,64 @@ def init_state():
         st.session_state.extended_theorem = ExtendedMasterTheorem()
 
 # =============================================================================
+# Small helpers
+# =============================================================================
+def enum_to_values(E) -> List[str]:
+    try:
+        if hasattr(E, "__members__"):
+            return [m.value if hasattr(m, "value") else str(m) for m in E.__members__.values()]
+        return [e.value if hasattr(e, "value") else str(e) for e in list(E)]
+    except Exception:
+        return []
+
+def _guess_order_from_lhs(lhs: Any, x: sp.Symbol) -> int:
+    try:
+        max_order = 0
+        for d in sp.preorder_traversal(lhs):
+            if isinstance(d, sp.Derivative):
+                try:
+                    ord_ = sum(c for v, c in d.variable_count if v == x)
+                except Exception:
+                    ord_ = sum(1 for v in d.variables if v == x)
+                max_order = max(max_order, int(ord_))
+        return max_order
+    except Exception:
+        return 0
+
+def _is_linear_lhs(lhs: Any, x: sp.Symbol) -> bool:
+    try:
+        y = sp.Function("y")
+        # powers of y or derivatives?
+        for p in sp.preorder_traversal(lhs):
+            if isinstance(p, sp.Pow):
+                base = p.base
+                if base.has(y(x)) or any(isinstance(a, sp.Derivative) and a.expr == y(x) for a in base.atoms(sp.Derivative)):
+                    if p.exp != 1:
+                        return False
+        # nonlinear functions wrapping y(..)?
+        for fun in lhs.atoms(AppliedUndef):
+            if fun.func.__name__ != "y" and fun.args and any(arg.has(y(x)) for arg in fun.args):
+                return False
+        return True
+    except Exception:
+        return False
+
+def _torch_cuda_available() -> bool:
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+def _latex_table(rows: List[Dict[str, Any]]) -> str:
+    lines = [r"\begin{tabular}{|c|c|c|c|c|}\hline",
+             r"ID & Type & Generator & Function & Order \\ \hline"]
+    for r in rows[:30]:
+        lines.append(f"{r.get('ID','')} & {r.get('Type','')} & {r.get('Generator','')} & {r.get('Function','')} & {r.get('Order','')} \\\\")
+    lines.append(r"\hline\end{tabular}")
+    return "\n".join(lines)
+
+# =============================================================================
 # UI Pages
 # =============================================================================
 def page_dashboard():
@@ -522,37 +555,36 @@ def page_dashboard():
         st.markdown(f'<div class="metric-card"><h4>Analyses</h4><h2>{len(st.session_state.analysis_results)}</h2></div>', unsafe_allow_html=True)
     if st.session_state.generated_odes:
         st.subheader("Recent ODEs")
-        df = pd.DataFrame(st.session_state.generated_odes)[["type","order","function_used","timestamp"]].tail(6)
-        st.dataframe(df, use_container_width=True)
+        cols = ["type","order","function_used","timestamp"]
+        df = pd.DataFrame(st.session_state.generated_odes)
+        show = [c for c in cols if c in df.columns]
+        st.dataframe(df[show].tail(6), use_container_width=True)
 
 def page_generator_constructor():
     st.header("🔧 Generator Constructor")
-    if not GeneratorConstructor or not DerivativeTerm:
-        st.warning("GeneratorConstructor / DerivativeTerm not available from src/.")
+    if not (GeneratorSpecification and DerivativeTerm):
+        st.warning("GeneratorSpecification / DerivativeTerm not available from src/.")
         return
-    constructor = GeneratorConstructor()
+
+    # Build term UI
     with st.expander("➕ Add Generator Term", expanded=True):
+        # Derivative order, type, coeff, power
         col1, col2, col3, col4 = st.columns(4)
         with col1:
             deriv_order = st.selectbox("Derivative Order", [0,1,2,3,4,5], index=0)
         with col2:
-            func_type = st.selectbox(
-                "Function Type",
-                [t.value if hasattr(t, "value") else str(t) for t in (DerivativeType if hasattr(DerivativeType, "__iter__") else list(DerivativeType))] 
-                if DerivativeType else ["identity","sin","cos","exp","log","power"]
-            )
+            dt_options = enum_to_values(DerivativeType) if DerivativeType else ["identity","sin","cos","exp","log","power"]
+            func_type_val = st.selectbox("Function Type", dt_options)
         with col3:
             coefficient = st.number_input("Coefficient", value=1.0, step=0.1)
         with col4:
             power = st.number_input("Power", min_value=1, max_value=5, value=1)
 
+        # Operator type, scaling, shift
         col1b, col2b, col3b = st.columns(3)
         with col1b:
-            operator_type = st.selectbox(
-                "Operator Type",
-                [t.value if hasattr(t, "value") else str(t) for t in (OperatorType if hasattr(OperatorType, "__iter__") else list(OperatorType))]
-                if OperatorType else ["standard","delay","advance"]
-            )
+            op_options = enum_to_values(OperatorType) if OperatorType else ["standard","delay","advance"]
+            operator_val = st.selectbox("Operator Type", op_options)
         with col2b:
             scaling = st.number_input("Scaling (a) [for delay/advance]", value=2.0, step=0.1)
         with col3b:
@@ -560,22 +592,32 @@ def page_generator_constructor():
 
         if st.button("Add Term", type="primary", use_container_width=True):
             try:
-                term = DerivativeTerm(
+                # rebuild enums from values if available
+                ftype = DerivativeType(func_type_val) if DerivativeType else func_type_val
+                otype = OperatorType(operator_val) if OperatorType else operator_val
+
+                needs_scale = "delay" in str(operator_val).lower() or "advance" in str(operator_val).lower()
+                kwargs = dict(
                     derivative_order=deriv_order,
                     coefficient=coefficient,
                     power=power,
-                    function_type=DerivativeType(func_type) if DerivativeType else func_type,
-                    operator_type=OperatorType(operator_type) if OperatorType else operator_type,
-                    scaling=scaling if operator_type in ("delay","advance") else None,
-                    shift=shift if operator_type in ("delay","advance") else None,
+                    function_type=ftype,
+                    operator_type=otype,
                 )
+                if needs_scale:
+                    kwargs["scaling"] = scaling
+                    kwargs["shift"] = shift
+
+                term = DerivativeTerm(**kwargs)
                 st.session_state.generator_terms.append(term)
-                st.success("Term added.")
+                desc = getattr(term, "get_description", lambda: str(term))()
+                st.success(f"Added term: {desc}")
             except Exception as e:
                 st.error(f"Failed to add term: {e}")
 
+    # Current terms list
     if st.session_state.generator_terms:
-        st.subheader("Current Terms")
+        st.subheader("📝 Current Generator Terms")
         for idx, term in enumerate(st.session_state.generator_terms):
             cols = st.columns([8,1])
             with cols[0]:
@@ -586,19 +628,37 @@ def page_generator_constructor():
                     st.session_state.generator_terms.pop(idx)
                     st.experimental_rerun()
 
-        if st.button("Build Generator Spec", type="primary", use_container_width=True):
+        # Build generator specification (NO add_term!)
+        if st.button("🔨 Build Generator Specification", type="primary", use_container_width=True):
             try:
-                for t in st.session_state.generator_terms:
-                    constructor.add_term(t)
-                spec = GeneratorSpecification(terms=st.session_state.generator_terms, name=f"Custom Generator #{len(st.session_state.generated_odes)+1}")
+                spec = GeneratorSpecification(
+                    terms=st.session_state.generator_terms,
+                    name=f"Custom Generator #{len(st.session_state.generated_odes)+1}"
+                )
                 st.session_state.current_generator = spec
                 st.success("Generator Specification created.")
-                if hasattr(spec, "lhs"):
-                    st.latex(sp.latex(spec.lhs) + " = \\text{RHS}")
+
+                # Resolve LHS for display
+                lhs = getattr(spec, "lhs", None)
+                if lhs is None and hasattr(spec, "get_lhs"):
+                    try:
+                        lhs = spec.get_lhs()
+                    except Exception:
+                        lhs = None
+                if lhs is None and hasattr(spec, "build_lhs"):
+                    try:
+                        lhs = spec.build_lhs()
+                    except Exception:
+                        lhs = None
+
+                if lhs is not None:
+                    st.latex(sp.latex(lhs) + " = \\text{RHS}")
+                else:
+                    st.info("Specification built, but no .lhs property found to display.")
             except Exception as e:
                 st.error(f"Failed to build specification: {e}")
 
-        if st.button("Clear All Terms", use_container_width=True):
+        if st.button("🗑️ Clear All Terms", use_container_width=True):
             st.session_state.generator_terms = []
             st.session_state.current_generator = None
             st.experimental_rerun()
@@ -624,14 +684,13 @@ def page_apply_master_theorem():
         func_name = st.selectbox("Choose f(z)", func_names)
 
     with colR:
-        alpha = st.text_input("α", value="1")      # text => exact by default
+        alpha = st.text_input("α", value="1")
         beta  = st.text_input("β", value="1")
         n     = st.number_input("n (integer ≥ 1)", min_value=1, max_value=10, value=1, step=1)
         M     = st.text_input("M", value="0")
 
-    # -------------------- EXACT MODE BLOCK (as requested) --------------------
+    # -------------------- EXACT MODE BLOCK (requested) --------------------
     use_exact = st.checkbox("Exact (symbolic) parameters", value=True)
-
     def to_exact(v):
         try:
             # Convert floats like 1.0 -> 1, 0.5 -> 1/2; keep symbols exact
@@ -666,10 +725,24 @@ def page_apply_master_theorem():
 
                 # Build RHS = LHS[y] using current generator if available
                 gen_spec = st.session_state.get("current_generator")
-                if gen_spec is not None and hasattr(gen_spec, "lhs") and gen_spec.lhs is not None:
+                if gen_spec is not None:
+                    generator_lhs = getattr(gen_spec, "lhs", None)
+                    if generator_lhs is None and hasattr(gen_spec, "get_lhs"):
+                        try:
+                            generator_lhs = gen_spec.get_lhs()
+                        except Exception:
+                            generator_lhs = None
+                    if generator_lhs is None and hasattr(gen_spec, "build_lhs"):
+                        try:
+                            generator_lhs = gen_spec.build_lhs()
+                        except Exception:
+                            generator_lhs = None
+                else:
+                    generator_lhs = None
+
+                if generator_lhs is not None:
                     try:
-                        rhs = apply_lhs_to_solution(gen_spec.lhs, solution, x, y_name="y")
-                        generator_lhs = gen_spec.lhs
+                        rhs = apply_lhs_to_solution(generator_lhs, solution, x, y_name="y")
                     except Exception as e:
                         logger.warning(f"Failed to apply generator LHS to solution: {e}")
                         # fallback RHS (still symbolic)
@@ -677,17 +750,16 @@ def page_apply_master_theorem():
                         rhs = sp.pi * (f_expr.subs(z, α + β) - f_expr.subs(z, α + β*sp.exp(-x))) + sp.pi * 𝑀
                         generator_lhs = sp.Symbol("LHS")
                 else:
-                    # fallback: if no LHS available, present a constructed RHS from the s=1 pattern (n=1)
+                    # fallback: if no LHS available, construct a symbolic RHS that depends on f
                     z = sp.Symbol("z")
                     rhs = sp.pi * (f_expr.subs(z, α + β) - f_expr.subs(z, α + β*sp.exp(-x))) + sp.pi * 𝑀
                     generator_lhs = sp.Symbol("LHS")
 
-                # Classification (best effort using src classifier)
+                # Classification (best effort)
                 classification = {}
-                if ODEClassifier:
-                    try:
+                try:
+                    if ODEClassifier:
                         classifier = st.session_state.ode_classifier
-                        # Provide a small dict for the classifier
                         c_in = {"ode": generator_lhs, "solution": solution, "rhs": rhs}
                         c_out = classifier.classify_ode(c_in)
                         classification = c_out.get("classification", {})
@@ -697,14 +769,7 @@ def page_apply_master_theorem():
                             classification["applications"] = c_out.get("applications", ["Research Equation"])
                         classification["order"] = classification.get("order", _guess_order_from_lhs(generator_lhs, x))
                         classification["type"] = classification.get("type", "Linear" if _is_linear_lhs(generator_lhs, x) else "Nonlinear")
-                    except Exception:
-                        classification = {
-                            "field": "Mathematical Physics",
-                            "applications": ["Research Equation"],
-                            "order": _guess_order_from_lhs(generator_lhs, x),
-                            "type": "Linear" if _is_linear_lhs(generator_lhs, x) else "Nonlinear",
-                        }
-                else:
+                except Exception:
                     classification = {
                         "field": "Mathematical Physics",
                         "applications": ["Research Equation"],
@@ -712,7 +777,6 @@ def page_apply_master_theorem():
                         "type": "Linear" if _is_linear_lhs(generator_lhs, x) else "Nonlinear",
                     }
 
-                # Prepare save bundle
                 result = {
                     "generator": generator_lhs,
                     "solution": solution,
@@ -750,41 +814,6 @@ def page_apply_master_theorem():
             except Exception as e:
                 st.error(f"Generation failed: {e}")
                 st.exception(e)
-
-def _guess_order_from_lhs(lhs: Any, x: sp.Symbol) -> int:
-    try:
-        max_order = 0
-        for d in sp.preorder_traversal(lhs):
-            if isinstance(d, sp.Derivative):
-                try:
-                    ord_ = sum(c for v, c in d.variable_count if v == x)
-                except Exception:
-                    ord_ = sum(1 for v in d.variables if v == x)
-                if ord_ > max_order:
-                    max_order = ord_
-        return int(max_order)
-    except Exception:
-        return 0
-
-def _is_linear_lhs(lhs: Any, x: sp.Symbol) -> bool:
-    # Best-effort quick test: if y and its derivatives only appear linearly.
-    # This is conservative (might mark some nonlinear as linear if wrapped oddly).
-    try:
-        y = sp.Function("y")
-        # If any powers of y or derivatives appear (>1), likely nonlinear
-        powers = [p for p in sp.preorder_traversal(lhs) if isinstance(p, sp.Pow)]
-        for p in powers:
-            base = p.base
-            if base.has(y(x)) or any(isinstance(a, sp.Derivative) and a.expr == y(x) for a in base.atoms(sp.Derivative)):
-                if p.exp != 1:
-                    return False
-        # if sin(y'), exp(y''), log(y), etc. => nonlinear
-        for fun in lhs.atoms(AppliedUndef):
-            if fun.func.__name__ != "y" and fun.args and any(arg.has(y(x)) for arg in fun.args):
-                return False
-        return True
-    except Exception:
-        return False
 
 def page_ml():
     st.header("🤖 ML Pattern Learning")
@@ -831,7 +860,6 @@ def page_ml():
             )
             st.session_state.ml_trained = True
             st.success("Training finished.")
-            # Plot history if present
             hist = getattr(trainer, "history", {})
             if hist.get("train_loss"):
                 fig = go.Figure()
@@ -859,13 +887,6 @@ def page_ml():
                             st.write({k: v for k, v in res.items() if k not in ["ode","solution"]})
                 except Exception as e:
                     st.warning(f"Failed to generate #{i+1}: {e}")
-
-def _torch_cuda_available() -> bool:
-    try:
-        import torch
-        return torch.cuda.is_available()
-    except Exception:
-        return False
 
 def page_batch():
     st.header("📊 Batch ODE Generation")
@@ -898,7 +919,7 @@ def page_batch():
                 func_pool += st.session_state.special_functions.get_function_names()
             except Exception:
                 pass
-        func_pool = func_pool[:50]  # limit
+        func_pool = func_pool[:50]
 
         for i in range(num_odes):
             try:
@@ -914,13 +935,26 @@ def page_batch():
                 x = sp.Symbol("x", real=True)
                 f_expr = get_function_expr(source, f_name)
                 y = theorem_4_1_solution_expr(f_expr, sp.nsimplify(α), sp.nsimplify(β), n, sp.nsimplify(M), x)
-                lhs = st.session_state.current_generator.lhs if st.session_state.get("current_generator") else sp.Symbol("LHS")
-                rhs = apply_lhs_to_solution(lhs, y, x, y_name="y") if lhs != sp.Symbol("LHS") else sp.Symbol("RHS")
+                lhs = None
+                spec = st.session_state.get("current_generator")
+                if spec is not None:
+                    lhs = getattr(spec, "lhs", None)
+                    if lhs is None and hasattr(spec, "get_lhs"):
+                        try: lhs = spec.get_lhs()
+                        except Exception: lhs = None
+                    if lhs is None and hasattr(spec, "build_lhs"):
+                        try: lhs = spec.build_lhs()
+                        except Exception: lhs = None
+                if lhs is not None:
+                    rhs = apply_lhs_to_solution(lhs, y, x, y_name="y")
+                else:
+                    lhs = sp.Symbol("LHS")
+                    rhs = sp.Symbol("RHS")
 
                 rec = {
                     "ID": i+1,
                     "Type": "linear" if _is_linear_lhs(lhs, x) else "nonlinear",
-                    "Generator": st.session_state.get("current_generator", {"name":"-" }).get("name","-") if hasattr(st.session_state.get("current_generator"), "name") else "-",
+                    "Generator": getattr(spec, "name", "-") if spec is not None else "-",
                     "Function": f_name,
                     "Order": _guess_order_from_lhs(lhs, x),
                     "α": α, "β": β, "n": n, "M": M,
@@ -946,14 +980,6 @@ def page_batch():
             latex_tbl = _latex_table(results)
             st.download_button("📝 Download LaTeX Table", latex_tbl, file_name="batch_odes.tex", mime="text/x-latex")
 
-def _latex_table(rows: List[Dict[str, Any]]) -> str:
-    lines = [r"\begin{tabular}{|c|c|c|c|c|}\hline",
-             r"ID & Type & Generator & Function & Order \\ \hline"]
-    for r in rows[:30]:
-        lines.append(f"{r.get('ID','')} & {r.get('Type','')} & {r.get('Generator','')} & {r.get('Function','')} & {r.get('Order','')} \\\\")
-    lines.append(r"\hline\end{tabular}")
-    return "\n".join(lines)
-
 def page_novelty():
     st.header("🔍 Novelty Detection")
     if not ODENoveltyDetector:
@@ -964,8 +990,18 @@ def page_novelty():
     ode_obj = None
     if mode == "Use Current Generator":
         spec = st.session_state.get("current_generator")
-        if spec and hasattr(spec, "lhs"):
-            ode_obj = {"ode": spec.lhs, "type": "custom", "order": _guess_order_from_lhs(spec.lhs, sp.Symbol("x"))}
+        if spec:
+            lhs = getattr(spec, "lhs", None)
+            if lhs is None and hasattr(spec, "get_lhs"):
+                try: lhs = spec.get_lhs()
+                except Exception: lhs = None
+            if lhs is None and hasattr(spec, "build_lhs"):
+                try: lhs = spec.build_lhs()
+                except Exception: lhs = None
+            if lhs is not None:
+                ode_obj = {"ode": lhs, "type": "custom", "order": _guess_order_from_lhs(lhs, sp.Symbol("x"))}
+            else:
+                st.warning("Generator found but no LHS attribute to analyze.")
         else:
             st.warning("No generator available. Build one in the constructor.")
     elif mode == "Enter ODE LaTeX/Text":
@@ -1025,10 +1061,8 @@ def page_visualize():
     x = sp.Symbol("x", real=True)
     try:
         y = ode["solution"]
-        plot_type = st.selectbox("Plot", ["Solution"], index=0)
         if st.button("Generate Plot", type="primary"):
             xs = np.linspace(-5, 5, 600)
-            # Sympy lambdify with safe modules
             yfn = sp.lambdify([x], y, "numpy")
             ys = np.array([yfn(val) for val in xs], dtype=np.complex128)
             fig = go.Figure()
