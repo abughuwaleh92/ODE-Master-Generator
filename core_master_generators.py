@@ -1,200 +1,328 @@
+# core_master_generators.py
+# Shared core for Master Generators UI/API.
+# Implements Theorem 4.2 (general form), generator composition, and ML/DL wrappers.
 
-# -*- coding: utf-8 -*-
-"""
-core_master_generators.py
-=========================
+from __future__ import annotations
 
-Shared core for Master Generators:
-- Theorem 4.2 (compact Stirling-number form)
-- GeneratorBuilder
-- GeneratorLibrary (presets)
-- ML (GeneratorPatternLearner) with enriched labels
-- DL (NoveltyDetector) for triage
-
-Safe to import from Streamlit app and FastAPI server.
-"""
-
-import os, re, json, math, cmath, types
+import re
+import json
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Callable, Union
+from typing import Any, Dict, List, Optional, Tuple, Callable
 
 import sympy as sp
-import numpy as np
+from sympy import Eq
+from sympy.functions.combinatorial.numbers import stirling  # stirling(n,k,kind=2) for Stirling S(n,k)
 
-# Optional ML/DL
-try:
-    import sklearn
-    from sklearn.pipeline import Pipeline
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.multiclass import OneVsRestClassifier
-    HAVE_SK = True
-except Exception:
-    HAVE_SK = False
-
-try:
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-    HAVE_TORCH = True
-except Exception:
-    HAVE_TORCH = False
-
-
-# =============================================================================
+# ---------------------------------------------------------------------
 # Utilities
-# =============================================================================
-def safe_latex(expr: sp.Expr) -> str:
-    try:
-        return sp.latex(sp.simplify(expr))
-    except Exception:
-        return sp.latex(expr)
+# ---------------------------------------------------------------------
 
-def safe_eval_f_of_z(expr_str: str) -> sp.Lambda:
-    z = sp.Symbol('z', complex=True)
-    ns = {k: getattr(sp, k) for k in dir(sp) if not k.startswith('_')}
-    ns.update({'z': z, 'i': sp.I, 'I': sp.I, 'pi': sp.pi, 'PI': sp.pi, 'E': sp.E})
+def _sympy_ns() -> Dict[str, Any]:
+    """A safe SymPy namespace for sympify, including common functions."""
+    ns = {name: getattr(sp, name) for name in dir(sp) if not name.startswith("_")}
+    # Short aliases commonly used by users
+    ns.update({
+        "I": sp.I, "pi": sp.pi, "E": sp.E,
+        "sin": sp.sin, "cos": sp.cos, "tan": sp.tan,
+        "sinh": sp.sinh, "cosh": sp.cosh, "tanh": sp.tanh,
+        "exp": sp.exp, "log": sp.log, "sqrt": sp.sqrt,
+        "Abs": sp.Abs, "re": sp.re, "im": sp.im,
+    })
+    return ns
+
+
+def safe_eval_f_of_z(f_str: str) -> Callable[[sp.Expr], sp.Expr]:
+    """
+    Returns a symbolic callable f(arg) from a string f_str using a variable 'z'.
+    Example inputs: "sin(z)", "exp(z)", "log(1+z)", "cosh(z**2-3*z)".
+    """
+    z = sp.Symbol('z')
     try:
-        expr = eval(expr_str, {"__builtins__": {}}, ns)
+        f_expr = sp.sympify(f_str, locals={**_sympy_ns(), "z": z})
     except Exception as e:
-        raise ValueError(f"Invalid f(z): {e}")
-    return sp.Lambda(z, expr)
+        raise ValueError(f"Cannot parse f(z) from string: {f_str!r}. Error: {e}")
 
-def stringify_expr(expr: sp.Expr) -> str:
-    return sp.srepr(sp.simplify(expr))
+    def f(arg: sp.Expr) -> sp.Expr:
+        return sp.simplify(f_expr.xreplace({z: arg}))
 
-def count_symbolic_complexity(expr: sp.Expr) -> Dict[str, Any]:
-    """
-    Heuristic complexity metrics for triage.
-    """
-    s = stringify_expr(expr)
-    deriv_orders = [int(m) for m in re.findall(r"Derivative\(.*?,\s*\(Symbol\('x'\),\s*(\d+)\)\)", s)]
-    max_order = max(deriv_orders) if deriv_orders else 0
-    nonlin_tokens = ['Pow(Derivative', 'sin', 'cos', 'sinh', 'cosh', 'exp', 'log']
-    uses_nonlin = any(tok in s for tok in nonlin_tokens)
-    pantograph_like = 'Function(' in s and 'x' in s and '/Symbol' in s  # crude
-    uniq = len(set(s))
+    return f
+
+
+def count_symbolic_complexity(expr: sp.Expr) -> Dict[str, int]:
+    """A few cheap metrics to help rank/rate complexity."""
+    atoms = list(expr.atoms())
+    ops = sum(1 for _ in sp.preorder_traversal(expr))
+    depth = expr.count_ops(visual=True)
     return {
-        "max_order": int(max_order),
-        "uses_nonlin": bool(uses_nonlin),
-        "pantograph_like": bool(pantograph_like),
-        "symbol_length": len(s),
-        "unique_chars": int(uniq)
+        "n_atoms": len(atoms),
+        "n_preorder_nodes": ops,
+        "count_ops_visual": depth,
     }
 
-# =============================================================================
-# Theorem 4.2 (compact form)
-# =============================================================================
-@dataclass
+
+def ode_to_json(lhs: sp.Expr, rhs: sp.Expr, meta: Optional[Dict[str, Any]] = None) -> str:
+    """Serialize an ODE LHS=RHS with metadata (LaTeX and a SymPy string form)."""
+    payload = {
+        "lhs_latex": sp.latex(lhs),
+        "rhs_latex": sp.latex(rhs),
+        "lhs_str": str(lhs),
+        "rhs_str": str(rhs),
+        "lhs_srepr": sp.srepr(lhs),
+        "rhs_srepr": sp.srepr(rhs),
+        "complexity_lhs": count_symbolic_complexity(lhs),
+        "complexity_rhs": count_symbolic_complexity(rhs),
+        "meta": meta or {},
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def expr_from_srepr(srepr_str: str) -> sp.Expr:
+    """
+    Reconstruct a SymPy expression from either a normal parseable string or an srepr-like form.
+    We first try sympify; if it fails, we fallback to eval with a sanitized locals dictionary.
+    IMPORTANT: Provide integer-assumed symbols for s, j, m, n to keep Derivative(..., (alpha, j)) valid.
+    """
+    # Build locals with integer assumptions for indices
+    x = sp.symbols('x', real=True)
+    alpha = sp.symbols('alpha', real=True)
+    beta = sp.symbols('beta', real=True)
+    n = sp.symbols('n', integer=True, positive=True)
+    m = sp.symbols('m', integer=True, positive=True)
+    j = sp.symbols('j', integer=True, positive=True)
+    s = sp.symbols('s', integer=True, positive=True)
+
+    loc = {**_sympy_ns(),
+           "x": x, "alpha": alpha, "beta": beta,
+           "n": n, "m": m, "j": j, "s": s}
+
+    # Try a normal sympify first
+    try:
+        return sp.sympify(srepr_str, locals=loc)
+    except Exception:
+        pass
+
+    # Fallback: eval of srepr (Symbol('x'), Derivative(...))
+    # Build a minimal constructor environment for srepr strings.
+    ctor = {}
+    # Expose SymPy constructors used by srepr
+    for name in (
+        "Symbol", "Function", "Integer", "Rational", "Float",
+        "Add", "Mul", "Pow", "ExpBase", "Pow", "Derivative",
+        "sin", "cos", "tan", "sinh", "cosh", "tanh",
+        "exp", "log", "Abs", "re", "im",
+        "Integral", "Sum", "Product", "Piecewise", "Eq",
+    ):
+        if hasattr(sp, name):
+            ctor[name] = getattr(sp, name)
+    ctor.update(loc)
+
+    try:
+        return eval(srepr_str, {"__builtins__": {}}, ctor)
+    except Exception as e:
+        raise ValueError(f"Cannot reconstruct SymPy expression from srepr/str. Error: {e}\nInput:\n{srepr_str}")
+
+
+# ---------------------------------------------------------------------
+# Theorem 4.2 — general compact form
+# ---------------------------------------------------------------------
+
 class Theorem42:
-    x: sp.Symbol = sp.Symbol('x', real=True)
-    alpha: sp.Symbol = sp.Symbol('alpha', real=True)
-    beta: sp.Symbol = sp.Symbol('beta', positive=True)
-    n: Union[int, sp.Symbol] = sp.Symbol('n', integer=True, positive=True)
-    m_sym: sp.Symbol = sp.Symbol('m', integer=True, positive=True)
+    """
+    Implements the generalized (compact) form of Theorem 4.2 suitable for
+    arbitrary analytic f, supporting symbolic 'n' and symbolic/numeric 'm'.
 
-    def omega(self, s: sp.Symbol) -> sp.Expr:
-        return (2*s - 1)*sp.pi/(2*self.n)
+    Key objects:
+        ω_s := (2s−1)π/(2n)
+        λ_s := exp(i x cos ω_s − x sin ω_s)
+        \bar{λ}_s := exp(−i x cos ω_s − x sin ω_s)
+        ψ := f(α + β λ_s),   φ := f(α + β \bar{λ}_s)
+        ζ := exp(−x sin ω_s)
 
-    def zeta(self, s: sp.Symbol) -> sp.Expr:
-        w = self.omega(s)
-        return sp.exp(-self.x*sp.sin(w)) * sp.exp(sp.I*self.x*sp.cos(w))
+    m-th derivative (symbolic form):
+        y^{(m)}(x) = − π/(2n) Σ_{s=1..n} Σ_{j=1..m} S(m,j) (β ζ)^j [ λ^m ∂^j_α ψ + \bar{λ}^m ∂^j_α φ ]
 
-    def lambda_phase(self, s: sp.Symbol) -> sp.Expr:
-        w = self.omega(s)
-        return sp.exp(sp.I*(sp.pi/2 + w))
+    where S(m,j) is the Stirling number of the second kind.
 
-    def psi(self, f: Callable[[sp.Symbol], sp.Expr], s: sp.Symbol) -> sp.Expr:
-        return f(self.alpha + self.beta*self.zeta(s))
+    The base function y(x) is:
+        y(x) = π/(2n) Σ_{s=1..n} [ 2 f(α+β) − ψ − φ ].
+    """
 
-    def phi(self, f: Callable[[sp.Symbol], sp.Expr], s: sp.Symbol) -> sp.Expr:
-        w = self.omega(s)
-        zbar = sp.exp(-self.x*sp.sin(w)) * sp.exp(-sp.I*self.x*sp.cos(w))
-        return f(self.alpha + self.beta*zbar)
+    def __init__(
+        self,
+        x: Optional[sp.Symbol] = None,
+        alpha: Optional[sp.Symbol] = None,
+        beta: Optional[sp.Symbol] = None,
+        n: Any = "n",
+        m_sym: Optional[sp.Symbol] = None
+    ):
+        self.x = x or sp.symbols("x", real=True)
+        self.alpha = alpha if alpha is not None else sp.symbols("alpha", real=True)
+        self.beta = beta if beta is not None else sp.symbols("beta", real=True)
 
-    def y_base(self, f: Callable, n_override: Optional[Union[int, sp.Symbol]] = None) -> sp.Expr:
-        n_ = self.n if n_override is None else n_override
-        s = sp.Symbol('s', integer=True, positive=True)
-        expr = (sp.pi/(2*n_)) * sp.summation(
-            2*f(self.alpha + self.beta) - self.psi(f, s) - self.phi(f, s),
-            (s, 1, n_)
+        # n may be a number or a positive integer Symbol
+        if isinstance(n, (int, sp.Integer)):
+            self.n = int(n)
+        else:
+            self.n = sp.symbols(str(n), integer=True, positive=True)
+
+        # canonical integer dummy symbols
+        self.s = sp.symbols("s", integer=True, positive=True)  # s = 1..n
+        self.j = sp.symbols("j", integer=True, positive=True)  # j = 1..m
+
+        # symbolic m (if not passed numerically)
+        self.m_sym = m_sym if isinstance(m_sym, sp.Symbol) else sp.symbols("m", integer=True, positive=True)
+
+        # y(x) symbol for LHS use
+        self.yfun = sp.Function("y")(self.x)
+
+    # ---- building blocks ----
+
+    def _omega(self) -> sp.Expr:
+        return sp.pi * (2*self.s - 1) / (2*self.n)
+
+    def _lam(self) -> sp.Expr:
+        w = self._omega()
+        return sp.exp(sp.I*self.x*sp.cos(w) - self.x*sp.sin(w))
+
+    def _lam_bar(self) -> sp.Expr:
+        w = self._omega()
+        return sp.exp(-sp.I*self.x*sp.cos(w) - self.x*sp.sin(w))
+
+    def _zeta(self) -> sp.Expr:
+        w = self._omega()
+        return sp.exp(-self.x*sp.sin(w))
+
+    def _psi(self, f: Callable[[sp.Expr], sp.Expr]) -> sp.Expr:
+        return f(self.alpha + self.beta*self._lam())
+
+    def _phi(self, f: Callable[[sp.Expr], sp.Expr]) -> sp.Expr:
+        return f(self.alpha + self.beta*self._lam_bar())
+
+    # ---- outputs ----
+
+    def y_base(self, f: Callable[[sp.Expr], sp.Expr], n_override: Optional[Any] = None) -> sp.Expr:
+        nval = self.n if n_override is None else n_override
+        s = self.s
+        expr = sp.pi/(2*nval) * sp.summation(
+            2*f(self.alpha + self.beta) - self._psi(f) - self._phi(f),
+            (s, 1, nval)
         )
         return sp.simplify(expr)
 
-    def y_derivative(self,
-                     f: Callable,
-                     m: Optional[Union[int, sp.Symbol]] = None,
-                     n_override: Optional[Union[int, sp.Symbol]] = None,
-                     complex_form: bool = True) -> sp.Expr:
-        n_ = self.n if n_override is None else n_override
-        s = sp.Symbol('s', integer=True, positive=True)
-        if m is None:
-            m = self.m_sym
+    def y_derivative(
+        self,
+        f: Callable[[sp.Expr], sp.Expr],
+        m: Optional[Any] = None,
+        n_override: Optional[Any] = None,
+        complex_form: bool = True
+    ) -> sp.Expr:
+        """
+        General m-th derivative of y(x). For numeric m we emit a fully explicit sum;
+        for symbolic m we return nested symbolic sums with Derivative(..., (alpha, j)),
+        where j is an integer Symbol, which is what SymPy requires.
+        """
+        nval = self.n if n_override is None else n_override
+        s, j = self.s, self.j
 
-        j = sp.Symbol('j', integer=True, positive=True)
-        lam = self.lambda_phase(s)
-        z = self.zeta(s)
-        psi = self.psi(f, s)
-        phi = self.phi(f, s)
-        dpsi_j = lambda jj: sp.diff(psi, self.alpha, jj)
-        dphi_j = lambda jj: sp.diff(phi, self.alpha, jj)
-        pref = -(sp.pi/(2*n_))
+        lam, lamp = self._lam(), self._lam_bar()
+        zeta = self._zeta()
 
-        S = sp.functions.combinatorial.numbers.stirling
-        inner = sp.Sum(
-            S(m, j, kind=2) * (
-                (self.beta*z)**j * lam**m * dpsi_j(j)
-                + (self.beta*sp.conjugate(z))**j * sp.conjugate(lam)**m * dphi_j(j)
-            ),
-            (j, 1, m)
-        )
-        total = pref * sp.Sum(inner, (s, 1, n_))
+        # Numeric m branch (fast and eager)
+        if isinstance(m, (int, sp.Integer)):
+            m = int(m)
+            if m <= 0:
+                return sp.S.Zero
 
-        # Expand if both are numeric
-        if isinstance(m, (int, sp.Integer)) and isinstance(n_, (int, sp.Integer)):
-            total = sp.simplify(total.doit())
+            inner = sp.S.Zero
+            for jj in range(1, m+1):
+                S = stirling(m, jj, kind=2)  # exact integer
+                dpsi = sp.Derivative(self._psi(f), (self.alpha, jj))
+                dphi = sp.Derivative(self._phi(f), (self.alpha, jj))
+                term = S * (self.beta**jj) * (zeta**jj) * (lam**m)  * dpsi \
+                     + S * (self.beta**jj) * (zeta**jj) * (lamp**m) * dphi
+                inner += term
+            result = -sp.pi/(2*nval) * sp.summation(inner, (s, 1, nval))
+            return result
 
-        if not complex_form:
-            total = sp.re(total)
-        return sp.simplify(total)
+        # Symbolic m branch (safe with integer j)
+        m_sym = self.m_sym if m is None else m
+        S2 = stirling(m_sym, j, kind=2)
+        dpsi = sp.Derivative(self._psi(f), (self.alpha, j))   # j is integer symbol
+        dphi = sp.Derivative(self._phi(f), (self.alpha, j))
+        summand = S2 * (self.beta**j) * (zeta**j) * (lam**m_sym)  * dpsi \
+                + S2 * (self.beta**j) * (zeta**j) * (lamp**m_sym) * dphi
+        expr = -sp.pi/(2*nval) * sp.summation(sp.summation(summand, (j, 1, m_sym)), (s, 1, nval))
+        return expr if complex_form else sp.re(expr)
 
 
-# =============================================================================
-# Generator Builder
-# =============================================================================
+# ---------------------------------------------------------------------
+# Generator builder
+# ---------------------------------------------------------------------
+
+@dataclass
+class TemplateConfig:
+    alpha: Any = sp.symbols("alpha", real=True)
+    beta: Any = sp.symbols("beta", real=True)
+    n: Any = sp.symbols("n", integer=True, positive=True)
+    m_sym: Any = sp.symbols("m", integer=True, positive=True)
+
+
 class GeneratorBuilder:
-    def __init__(self, T: Theorem42, f: Callable, n_val: Union[int, sp.Symbol],
-                 m_val: Optional[Union[int, sp.Symbol]], complex_form: bool):
-        self.T = T
-        self.f = f
-        self.n_val = n_val
-        self.m_val = m_val
-        self.complex_form = complex_form
-        self.x = T.x
-        self.yfun = sp.Function('y')(self.x)
-        self._cache: Dict[Union[int, str], sp.Expr] = {}
+    """
+    Builds an ODE from a free-form template (LHS) and computes the RHS via Theorem 4.2.
+    Template language:
+        - y            → the solution symbol
+        - Dy1, Dy2     → derivatives (1st, 2nd, …)
+        - Dym          → m‑th derivative if m is symbolic
+        - y^(m), y^(3) → aliases for Dym, Dy3
+        - Any SymPy function wrapper, e.g. exp(Dy2), sinh(Dym), cos(y), log(1+y)
 
-    def _parse_orders(self, template: str) -> Tuple[List[int], bool]:
-        orders = sorted({int(m) for m in re.findall(r'Dy(\d+)', template)})
-        uses_dym = bool(re.search(r'\bDym\b', template))
-        return orders, uses_dym
+    Example template:
+        "y + exp(Dy2) + sinh(Dym)"
+        "y^(m) + y^(2) + sinh(y^(3))"
+    """
 
-    def _y_exact(self) -> sp.Expr:
-        key = "y"
-        if key not in self._cache:
-            self._cache[key] = sp.simplify(self.T.y_base(self.f, n_override=self.n_val))
-        return self._cache[key]
+    def __init__(self, theorem: Theorem42, config: Optional[TemplateConfig] = None):
+        self.T = theorem
+        self.cfg = config or TemplateConfig()
+        self.x = self.T.x
+        self.yfun = self.T.yfun
+        self.m_val: Optional[Any] = None  # numeric or symbolic m (None -> symbolic)
 
-    def _y_deriv_exact(self, m: Union[int, sp.Symbol]) -> sp.Expr:
-        key = f"m={m}"
-        if key not in self._cache:
-            self._cache[key] = sp.simplify(self.T.y_derivative(self.f, m=m, n_override=self.n_val,
-                                                               complex_form=self.complex_form))
-        return self._cache[key]
+    # --- parsing helpers ---
+
+    @staticmethod
+    def _alias(template: str) -> str:
+        """Map y^(m) → Dym, y^(k) → Dyk for integer k."""
+        s = re.sub(r"y\^\(\s*m\s*\)", "Dym", template)
+        s = re.sub(r"y\^\(\s*(\d+)\s*\)", lambda m: f"Dy{m.group(1)}", s)
+        return s
+
+    @staticmethod
+    def _orders_in_template(template: str) -> List[int]:
+        """Extract derivative orders explicitly referenced as DyK (e.g., Dy1, Dy2, Dy10)."""
+        return sorted({int(m) for m in re.findall(r"\bDy(\d+)\b", template)})
+
+    @staticmethod
+    def _uses_dym(template: str) -> bool:
+        return bool(re.search(r"\bDym\b", template))
+
+    # --- namespaces ---
 
     def _namespace(self, lhs: bool, orders: List[int], uses_dym: bool) -> Dict[str, Any]:
-        ns = {k: getattr(sp, k) for k in dir(sp) if not k.startswith('_')}
+        """
+        Build the evaluation namespace for sympify(template, locals=ns).
+        - On LHS: y is y(x), DyK are Derivative(y(x), (x, K)), Dym is a placeholder if m is symbolic.
+        - On RHS: y is y_base(expr), DyK are y^(K), Dym is y^(m) (symbolic sums if m is symbolic).
+        """
+        ns = _sympy_ns()
         ns.update({"x": self.x, "alpha": self.T.alpha, "beta": self.T.beta, "pi": sp.pi, "I": sp.I})
+        # expose m to the template
+        if self.m_val is None or isinstance(self.m_val, sp.Symbol):
+            ns["m"] = self.T.m_sym
+        else:
+            ns["m"] = int(self.m_val)
+
         if lhs:
             ns["y"] = self.yfun
             for k in orders:
@@ -203,224 +331,236 @@ class GeneratorBuilder:
                 if isinstance(self.m_val, (int, sp.Integer)):
                     ns["Dym"] = sp.Derivative(self.yfun, (self.x, int(self.m_val)))
                 else:
-                    ns["Dym"] = sp.Symbol("Dym")
+                    ns["Dym"] = sp.Symbol("Dym")  # placeholder on LHS if m is symbolic
         else:
-            ns["y"] = self._y_exact()
-            for k in orders:
-                ns[f"Dy{k}"] = self._y_deriv_exact(k)
-            if uses_dym:
-                mv = self.m_val if self.m_val is not None else self.T.m_sym
-                ns["Dym"] = self._y_deriv_exact(mv)
+            # RHS exact expressions from Theorem 4.2
+            # we cannot build these before f is known; the caller will set these keys
+            pass
         return ns
 
-    def build(self, template: str) -> Tuple[sp.Expr, sp.Expr]:
-        # Preprocess aliases: y^(m) -> Dym, y^(k) (integer) -> Dyk
-        def _alias(s: str) -> str:
-            s = re.sub(r"y\^\(\s*m\s*\)", "Dym", s)
-            s = re.sub(r"y\^\(\s*(\d+)\s*\)", lambda m: f"Dy{m.group(1)}", s)
-            return s
-        template = _alias(template)
+    # --- public API ---
 
-        orders, uses_dym = self._parse_orders(template)
+    def build(
+        self,
+        template: str,
+        f: Callable[[sp.Expr], sp.Expr],
+        m: Optional[Any] = None,
+        n_override: Optional[Any] = None,
+        complex_form: bool = True
+    ) -> Tuple[sp.Expr, sp.Expr]:
+        """
+        Build LHS (from template) and RHS (by substituting y, DyK, Dym with Theorem42 outputs).
+        """
+        self.m_val = m
+        template = self._alias(template)
+        orders = self._orders_in_template(template)
+        uses_dym = self._uses_dym(template)
+
+        # LHS namespace
         ns_lhs = self._namespace(lhs=True, orders=orders, uses_dym=uses_dym)
+        try:
+            lhs = sp.sympify(template, locals=ns_lhs)
+        except Exception as e:
+            raise ValueError(f"Cannot parse LHS template: {e}\nTemplate: {template}")
+
+        # Build RHS substitution dictionary
+        rhs_map: Dict[str, sp.Expr] = {}
+        rhs_map["y"] = self.T.y_base(f, n_override=n_override)
+        for k in orders:
+            rhs_map[f"Dy{k}"] = self.T.y_derivative(f, m=k, n_override=n_override, complex_form=complex_form)
+        if uses_dym:
+            rhs_map["Dym"] = self.T.y_derivative(
+                f,
+                m=(self.m_val if self.m_val is not None else self.T.m_sym),
+                n_override=n_override,
+                complex_form=complex_form
+            )
+
+        # RHS namespace is same as LHS but with symbols bound to expressions
         ns_rhs = self._namespace(lhs=False, orders=orders, uses_dym=uses_dym)
+        ns_rhs.update(rhs_map)
+
         try:
-            lhs = eval(template, {"__builtins__": {}}, ns_lhs)
+            rhs = sp.sympify(template, locals=ns_rhs)
         except Exception as e:
-            raise ValueError(f"LHS parse error: {e}")
-        try:
-            rhs = eval(template, {"__builtins__": {}}, ns_rhs)
-        except Exception as e:
-            raise ValueError(f"RHS construction error: {e}")
+            raise ValueError(f"Cannot build RHS from Theorem 4.2: {e}\nTemplate: {template}")
+
         return sp.simplify(lhs), sp.simplify(rhs)
 
 
-# =============================================================================
-# Preset library (recipes)
-# =============================================================================
-class GeneratorLibrary:
-    def __init__(self, T: Theorem42):
-        self.T = T
+# ---------------------------------------------------------------------
+# ML & DL (graceful fallbacks)
+# ---------------------------------------------------------------------
 
-    def pantograph_linear(self, f: Callable) -> Dict[str, sp.Expr]:
-        x, a, b, n = self.T.x, self.T.alpha, self.T.beta, self.T.n
-        y = self.T.y_base(f)
-        # Example: y''(x) + y(x/a) - y(x)
-        lhs = sp.diff(y, x, 2) + sp.Function('y')(x/sp.Symbol('a')) - sp.Function('y')(x)
-        g = f(a + b*sp.exp(-x))
-        rhs = sp.pi*( f(a+b) - f(a + b*sp.exp(-x)) ) \
-              - sp.pi*b*sp.exp(-x)*sp.diff(g, a, 1) \
-              - sp.pi*b**2*sp.exp(-2*x)*sp.diff(g, a, 2)
-        return {"lhs": sp.simplify(lhs), "rhs": sp.simplify(rhs), "solution": sp.simplify(self.T.y_base(f))}
-
-    def multi_order_mix(self, f: Callable, orders=(1,2,3)) -> Dict[str, sp.Expr]:
-        x = self.T.x
-        y = self.T.y_base(f)
-        lhs = sum(sp.diff(y, x, k) for k in orders) + y
-        # naive RHS via substitution of exact y into same functional form:
-        rhs = sum(self.T.y_derivative(f, m=k, complex_form=True) for k in orders) + self.T.y_base(f)
-        return {"lhs": sp.simplify(lhs), "rhs": sp.simplify(rhs), "solution": sp.simplify(self.T.y_base(f))}
-
-    def nonlinear_wrap(self, f: Callable, wrap: Callable[[sp.Expr], sp.Expr]) -> Dict[str, sp.Expr]:
-        x = self.T.x
-        y = self.T.y_base(f)
-        lhs = wrap(sp.diff(y, x, 2)) + y
-        rhs = wrap(self.T.y_derivative(f, m=2, complex_form=True)) + self.T.y_base(f)
-        return {"lhs": sp.simplify(lhs), "rhs": sp.simplify(rhs), "solution": sp.simplify(self.T.y_base(f))}
-
-
-# =============================================================================
-# ML with enriched labels
-# =============================================================================
 class GeneratorPatternLearner:
     """
-    Multi-head classifier:
-      - linearity: {0,1}
-      - stiffness: {0,1,2,...} (user-defined)
-      - solvability: {0,1,2,...} (user-defined)
-    Each head is a separate pipeline; falls back to heuristics if sklearn missing.
+    Multi-head classifier for:
+      - linearity (0/1)
+      - stiffness bucket (int)
+      - solvability class (int)
+    If scikit-learn is unavailable, falls back to simple heuristics.
     """
-    def __init__(self) -> None:
-        self.available = HAVE_SK
-        if self.available:
-            base = Pipeline([("tfidf", TfidfVectorizer(ngram_range=(1,3), min_df=1, max_features=20000)),
-                             ("clf", LogisticRegression(max_iter=800))])
-            self.pipe_linearity = Pipeline(base.steps.copy())
-            self.pipe_stiffness = Pipeline(base.steps.copy())
-            self.pipe_solvability = Pipeline(base.steps.copy())
-        else:
-            self.pipe_linearity = self.pipe_stiffness = self.pipe_solvability = None
+    def __init__(self):
+        try:
+            from sklearn.feature_extraction.text import TfidfVectorizer
+            from sklearn.linear_model import LogisticRegression
+            self._TfidfVectorizer = TfidfVectorizer
+            self._LogisticRegression = LogisticRegression
+            self._sk_ok = True
+        except Exception:
+            self._sk_ok = False
 
-    def _stringify(self, L: sp.Expr, R: sp.Expr) -> str:
-        return stringify_expr(sp.Eq(L, R))
+        self.vec = None
+        self.clf_lin = None
+        self.clf_stiff = None
+        self.clf_solv = None
 
-    def train(self, dataset: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        dataset: list of { 'lhs': sympy.Expr, 'rhs': sympy.Expr,
-                           'labels': {'linearity': int, 'stiffness': int, 'solvability': int} }
-        """
-        if not dataset:
-            return {"status": "error", "message": "empty dataset"}
-        X = [ self._stringify(d['lhs'], d['rhs']) for d in dataset ]
-        Y_lin = [ int(d['labels'].get('linearity', 0)) for d in dataset ]
-        Y_sti = [ int(d['labels'].get('stiffness', 0)) for d in dataset ]
-        Y_sol = [ int(d['labels'].get('solvability', 0)) for d in dataset ]
-        if not self.available:
-            return {"status": "fallback", "message": "sklearn not available; using heuristics."}
-        self.pipe_linearity.fit(X, Y_lin)
-        self.pipe_stiffness.fit(X, Y_sti)
-        self.pipe_solvability.fit(X, Y_sol)
-        return {"status": "ok"}
+    @staticmethod
+    def _textualize(lhs: sp.Expr, rhs: sp.Expr) -> str:
+        return f"{sp.srepr(lhs)} || {sp.srepr(rhs)}"
 
-    def predict(self, pairs: List[Tuple[sp.Expr, sp.Expr]]) -> List[Dict[str, int]]:
-        X = [ self._stringify(L, R) for (L,R) in pairs ]
+    def train(self, data: List[Tuple[sp.Expr, sp.Expr, Dict[str, int]]]) -> None:
+        X = [self._textualize(l, r) for (l, r, _) in data]
+        y_lin = [meta.get("linear", 0) for (_, _, meta) in data]
+        y_stiff = [meta.get("stiffness", 0) for (_, _, meta) in data]
+        y_solv = [meta.get("solvability", 0) for (_, _, meta) in data]
+
+        if not self._sk_ok:
+            # Heuristic fallback: nothing to train
+            self.vec = None
+            return
+
+        self.vec = self._TfidfVectorizer(ngram_range=(1, 2), max_features=20000)
+        Xv = self.vec.fit_transform(X)
+
+        self.clf_lin = self._LogisticRegression(max_iter=1000).fit(Xv, y_lin)
+        self.clf_stiff = self._LogisticRegression(max_iter=1000).fit(Xv, y_stiff)
+        self.clf_solv = self._LogisticRegression(max_iter=1000).fit(Xv, y_solv)
+
+    def predict(self, lhs_rhs_list: List[Tuple[sp.Expr, sp.Expr]]) -> List[Dict[str, int]]:
         out = []
-        if not self.available:
-            # simple heuristics
-            for x in X:
-                lin = 0 if ("Pow(Derivative" not in x and "sin" not in x and "exp" not in x and "sinh" not in x) else 1
-                sti = 1 if "Derivative" in x and "exp" in x else 0
-                sol = 1 if "y" in x else 0
-                out.append({"linearity": lin, "stiffness": sti, "solvability": sol})
+        if not self._sk_ok or self.vec is None:
+            # Heuristic: detect "exp" etc. as nonlinear
+            for lhs, rhs in lhs_rhs_list:
+                txt = f"{lhs} {rhs}"
+                linear = 0 if re.search(r"exp|log|sin|cos|sinh|cosh|tanh", txt) else 1
+                stiff = 1 if "exp" in txt else 0
+                solv = 1 if "Integral" in sp.srepr(rhs) else 0
+                out.append({"linear": linear, "stiffness": stiff, "solvability": solv})
             return out
-        out.append({"linearity": int(self.pipe_linearity.predict(X)[0]) if X else 0,
-                    "stiffness": int(self.pipe_stiffness.predict(X)[0]) if X else 0,
-                    "solvability": int(self.pipe_solvability.predict(X)[0]) if X else 0})
-        # For multiple pairs
-        if len(X)>1:
-            out = [{"linearity": int(a), "stiffness": int(b), "solvability": int(c)}
-                   for a,b,c in zip(self.pipe_linearity.predict(X),
-                                    self.pipe_stiffness.predict(X),
-                                    self.pipe_solvability.predict(X))]
+
+        X = [self._textualize(l, r) for (l, r) in lhs_rhs_list]
+        Xv = self.vec.transform(X)
+        out.append({
+            "linear": int(self.clf_lin.predict(Xv)[0]),
+            "stiffness": int(self.clf_stiff.predict(Xv)[0]),
+            "solvability": int(self.clf_solv.predict(Xv)[0]),
+        })
+        if len(lhs_rhs_list) > 1:
+            # batch
+            out = [{"linear": int(a), "stiffness": int(b), "solvability": int(c)}
+                   for a, b, c in zip(self.clf_lin.predict(Xv),
+                                      self.clf_stiff.predict(Xv),
+                                      self.clf_solv.predict(Xv))]
         return out
 
 
-# =============================================================================
-# DL Novelty Detector (Tiny Transformer)
-# =============================================================================
-class TinyTransformer(nn.Module):
-    def __init__(self, vocab_size=512, d_model=128, nhead=4, num_layers=2, max_len=256):
-        super().__init__()
-        self.embed = nn.Embedding(vocab_size, d_model)
-        self.pos = nn.Parameter(torch.randn(1, max_len, d_model)*0.02)
-        enc_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-        self.out = nn.Linear(d_model, 1)
-    def forward(self, x):
-        h = self.embed(x) + self.pos[:, :x.size(1), :]
-        h = self.encoder(h)
-        h = h.mean(dim=1)
-        return self.out(h).squeeze(-1)
-
 class NoveltyDetector:
-    def __init__(self, vocab: Optional[Dict[str,int]]=None, max_len: int=256):
-        self.available = HAVE_TORCH
-        self.max_len = max_len
-        if vocab is None:
-            chars = list("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+-*/^()=,._{}[]| <>eEpiI")
-            self.vocab = {ch:i+2 for i,ch in enumerate(chars)}
-            self.vocab["<pad>"] = 0
-            self.vocab["<unk>"] = 1
-        else:
-            self.vocab = vocab
-        if self.available:
-            self.model = TinyTransformer(vocab_size=len(self.vocab), max_len=max_len)
-            self.opt = optim.Adam(self.model.parameters(), lr=3e-4)
-            self.loss_fn = nn.MSELoss()
-        else:
-            self.model = None
+    """
+    Tiny novelty/complexity scorer using a Transformer encoder (PyTorch),
+    with a deterministic heuristic fallback if torch is unavailable.
+    """
+    def __init__(self, dim: int = 128, n_heads: int = 4, n_layers: int = 2):
+        self.available = False
+        self.model = None
+        self.token = None
+        try:
+            import torch
+            import torch.nn as nn
+            self.torch = torch
+            self.nn = nn
+            self.available = True
 
-    def encode(self, s: str) -> np.ndarray:
-        ids = [ self.vocab.get(ch, 1) for ch in s[:self.max_len] ]
-        if len(ids)<self.max_len:
-            ids += [0]*(self.max_len-len(ids))
-        return np.array(ids, dtype=np.int64)
+            class TinyTransformer(nn.Module):
+                def __init__(self, vocab=4096, dim=dim, n_heads=n_heads, n_layers=n_layers):
+                    super().__init__()
+                    self.emb = nn.Embedding(vocab, dim)
+                    encoder_layer = nn.TransformerEncoderLayer(d_model=dim, nhead=n_heads, batch_first=True)
+                    self.enc = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+                    self.head = nn.Linear(dim, 1)
 
-    def novelty_score(self, ode_strs: List[str]) -> List[float]:
+                def forward(self, x):
+                    h = self.emb(x)
+                    h = self.enc(h)
+                    h = h.mean(dim=1)
+                    return self.head(h).squeeze(-1)
+
+            self.model = TinyTransformer()
+        except Exception:
+            self.available = False
+
+    @staticmethod
+    def _tokenize(expr: sp.Expr, vocab: int = 4096) -> List[int]:
+        # very simple hash tokenizer
+        toks = []
+        for node in sp.preorder_traversal(expr):
+            toks.append((hash(type(node).__name__) ^ hash(str(node.func if hasattr(node, "func") else node))) % vocab)
+        return toks[:512] or [1]
+
+    def score(self, lhs: sp.Expr, rhs: sp.Expr) -> float:
         if not self.available:
-            return [min(1.0, 0.1 + 0.9*len(set(s))/max(10, len(s))) for s in ode_strs]
-        self.model.eval()
-        outs = []
+            # heuristic novelty: (structure) + (rhs depth)
+            c = count_symbolic_complexity(rhs)
+            return 0.5 * c["n_preorder_nodes"] + 0.5 * c["count_ops_visual"]
+
+        torch = self.torch
         with torch.no_grad():
-            for s in ode_strs:
-                x = torch.tensor(self.encode(s))[None, :]
-                y = torch.sigmoid(self.model(x)).item()
-                outs.append(float(y))
-        return outs
+            lt = self._tokenize(lhs)
+            rt = self._tokenize(rhs)
+            ids = torch.tensor([lt + [0] + rt], dtype=torch.long)
+            s = self.model(ids).item()
+            return float(s)
 
-    def quick_train(self, pairs: List[Tuple[str, float]], epochs: int=3, batch_size: int=16):
-        if not self.available or not pairs:
-            return {"status":"skipped"}
-        self.model.train()
-        xs = torch.stack([ torch.tensor(self.encode(s)) for s,_ in pairs ])
-        ys = torch.tensor([ t for _,t in pairs ], dtype=torch.float32)
-        N = xs.size(0)
-        for ep in range(epochs):
-            perm = torch.randperm(N)
-            for i in range(0, N, batch_size):
-                idx = perm[i:i+batch_size]
-                xb, yb = xs[idx], ys[idx]
-                self.opt.zero_grad()
-                pred = torch.sigmoid(self.model(xb))
-                loss = self.loss_fn(pred, yb)
+    def train_pairs(self, pairs_with_target: List[Tuple[sp.Expr, sp.Expr, float]], epochs: int = 3, lr: float = 1e-3):
+        if not self.available or not pairs_with_target:
+            return
+        torch = self.torch
+        nn = self.nn
+        opt = torch.optim.Adam(self.model.parameters(), lr=lr)
+        loss_fn = nn.MSELoss()
+        for _ in range(epochs):
+            for lhs, rhs, y in pairs_with_target:
+                lt = self._tokenize(lhs)
+                rt = self._tokenize(rhs)
+                ids = torch.tensor([lt + [0] + rt], dtype=torch.long)
+                target = torch.tensor([y], dtype=torch.float32)
+                pred = self.model(ids)
+                loss = loss_fn(pred, target)
+                opt.zero_grad()
                 loss.backward()
-                self.opt.step()
-        return {"status":"ok", "epochs":epochs}
+                opt.step()
 
 
-# =============================================================================
-# Helpers to (de)serialize SymPy expressions for API/DB
-# =============================================================================
-def expr_from_srepr(s: str) -> sp.Expr:
-    return sp.sympify(s, locals={})
+# ---------------------------------------------------------------------
+# Preset recipes
+# ---------------------------------------------------------------------
 
-def ode_to_json(lhs: sp.Expr, rhs: sp.Expr, meta: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
-    data = {
-        "lhs_srepr": stringify_expr(lhs),
-        "rhs_srepr": stringify_expr(rhs),
-        "lhs_latex": safe_latex(lhs),
-        "rhs_latex": safe_latex(rhs),
-    }
-    if meta:
-        data["meta"] = meta
-    return data
+class GeneratorLibrary:
+    """A few ready-made presets for the UI page."""
+    @staticmethod
+    def preset_pantograph_linear() -> Tuple[str, str]:
+        # A simple pantograph-like linear template
+        return ("y + Dy2", "z")  # f(z) = z
+
+    @staticmethod
+    def preset_nonlinear_wrap() -> Tuple[str, str]:
+        return ("exp(Dy2) + y", "sin(z)")
+
+    @staticmethod
+    def preset_multiorder_mix() -> Tuple[str, str]:
+        return ("y + Dy1 + Dy3 + sinh(Dym)", "exp(z)")
+
+
+# ---------------------------------------------------------------------
+# End
+# ---------------------------------------------------------------------
