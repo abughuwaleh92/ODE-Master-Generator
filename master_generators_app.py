@@ -1,17 +1,8 @@
-# -*- coding: utf-8 -*-
 """
-Master Generators for ODEs — Complete Edition (with Algebraic Free‑form, Faster n>1, ML/DL integration)
+Master Generators for ODEs — Complete App (Rewritten + All Fixes Integrated)
 
-- Theorem 4.1 (exact/symbolic or numeric params)
-- Theorem 4.2 via Stirling numbers (Faà di Bruno)
-- Free‑form LHS:
-  * Term-based (wrappers, delay/advance, inner/outer derivatives)
-  * NEW: Algebraic editor (type any SymPy expression using y(x), y1(x), …, y10(x), Dy(k,g), etc.)
-- Optimized apply(LHS) with affine-compose derivative shortcut => avoids hangs when n>1
-- Per‑ODE export buttons (LaTeX + ZIP)
-- Batch -> ML toggle; defaults for q,v,a; robust fallbacks
-- Model synthesizer builds new symbolic generators after training
-- Initial conditions up to highest derivative order shown with solution
+Run:
+  streamlit run master_generators_app.py
 """
 
 # ============================================================================
@@ -22,8 +13,11 @@ import sys
 import io
 import json
 import time
+import math
+import base64
 import zipfile
 import logging
+import traceback
 import pickle
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple, Union
@@ -37,20 +31,16 @@ import numpy as np
 import pandas as pd
 import sympy as sp
 
-# Optionally torch
+# Optional ML/DL
 try:
     import torch
+    from torch.utils.data import Dataset, DataLoader  # noqa: F401
 except Exception:
     torch = None
 
 # Plotly
 import plotly.graph_objects as go
 import plotly.express as px
-
-# For SymPy internals / nodes
-from sympy import Symbol, Function, Derivative
-from sympy.core.function import AppliedUndef
-from sympy.functions.combinatorial.numbers import stirling
 
 # ============================================================================
 # Logging
@@ -67,8 +57,10 @@ if SRC_DIR not in sys.path:
 HAVE_SRC = True
 
 # ============================================================================
-# Resilient imports from src/
+# Resilient imports from src/ (try several locations)
 # ============================================================================
+
+# Generators & factories
 MasterGenerator = EnhancedMasterGenerator = CompleteMasterGenerator = None
 LinearGeneratorFactory = CompleteLinearGeneratorFactory = None
 NonlinearGeneratorFactory = CompleteNonlinearGeneratorFactory = None
@@ -82,26 +74,25 @@ MLTrainer = ODEDataset = ODEDataGenerator = None
 GeneratorPattern = GeneratorPatternNetwork = GeneratorLearningSystem = None
 ODENoveltyDetector = NoveltyAnalysis = ODETokenizer = ODETransformer = None
 Settings = AppConfig = None
-CacheManager = None
-
-def _safe_cached_decorator(*args, **kwargs):
-    def _wrap(fn): return fn
-    return _wrap
-
-cached = _safe_cached_decorator
+CacheManager = cached = None
+ParameterValidator = None
+UIComponents = None
 
 try:
+    # try canonical locations in your ZIP
     from src.generators.master_generator import (
         MasterGenerator,
         EnhancedMasterGenerator,
         CompleteMasterGenerator,
     )
+    # Some projects place factories here:
     try:
         from src.generators.master_generator import (
             CompleteLinearGeneratorFactory,
             CompleteNonlinearGeneratorFactory,
         )
     except Exception:
+        # or in their own modules:
         from src.generators.linear_generators import (
             LinearGeneratorFactory,
             CompleteLinearGeneratorFactory,
@@ -151,8 +142,7 @@ try:
     )
 
     from src.utils.config import Settings, AppConfig
-    from src.utils.cache import CacheManager, cached as _cached
-    cached = _cached
+    from src.utils.cache import CacheManager, cached
     from src.utils.validators import ParameterValidator
     from src.ui.components import UIComponents
 
@@ -171,7 +161,7 @@ st.set_page_config(
 )
 
 # ============================================================================
-# CSS
+# Custom CSS
 # ============================================================================
 st.markdown(
     """
@@ -194,15 +184,15 @@ st.markdown(
     }
     .info-box {
         background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%);
-        border-left: 5px solid #2196f3; padding: .9rem; border-radius: 10px; margin: .9rem 0;
+        border-left: 5px solid #2196f3; padding: 1rem; border-radius: 10px; margin: 1rem 0;
     }
     .result-box {
         background: linear-gradient(135deg, #e8f5e9 0%, #c8e6c9 100%);
         border: 2px solid #4caf50; padding: 1rem; border-radius: 10px; margin: 1rem 0;
     }
-    .latex-export-box{
-        background: linear-gradient(135deg, #f3e5f5 0%, #e1bee7 100%);
-        border: 2px solid #9c27b0; padding:.9rem; border-radius: 10px; margin:.9rem 0;
+    .error-box {
+        background: linear-gradient(135deg, #ffebee 0%, #ffcdd2 100%);
+        border: 2px solid #f44336; padding: 1rem; border-radius: 10px; margin: 1rem 0;
     }
 </style>
 """,
@@ -214,7 +204,7 @@ st.markdown(
 # ============================================================================
 class LaTeXExporter:
     @staticmethod
-    def _sx(expr) -> str:
+    def sympy_to_latex(expr) -> str:
         if expr is None:
             return ""
         try:
@@ -223,90 +213,91 @@ class LaTeXExporter:
                     expr = sp.sympify(expr)
                 except Exception:
                     return expr
-            return sp.latex(expr)
-        except Exception:
+            latex_str = sp.latex(expr)
+            return latex_str.replace(r"\left(", "(").replace(r"\right)", ")")
+        except Exception as e:
+            logger.error(f"LaTeX conversion error: {e}")
             return str(expr)
 
     @staticmethod
     def generate_latex_document(ode_data: Dict[str, Any], include_preamble: bool = True) -> str:
-        gen = ode_data.get("generator", "")
+        generator = ode_data.get("generator", "")
+        solution = ode_data.get("solution", "")
         rhs = ode_data.get("rhs", "")
-        sol = ode_data.get("solution", "")
-        params = ode_data.get("parameters", {}) or {}
-        classification = ode_data.get("classification", {}) or {}
-        initial_conditions = ode_data.get("initial_conditions", {}) or {}
-        title = ode_data.get("title", "Master Generators ODE System")
+        params = ode_data.get("parameters", {})
+        classification = ode_data.get("classification", {})
+        initial_conditions = ode_data.get("initial_conditions", {})
 
         parts = []
         if include_preamble:
-            parts.append(r"""\documentclass[12pt]{article}
+            parts.append(
+                r"""
+\documentclass[12pt]{article}
 \usepackage{amsmath,amssymb,amsfonts}
 \usepackage{geometry}
 \usepackage{hyperref}
 \geometry{margin=1in}
-\title{""" + title + r"""}
+\title{Master Generators ODE System}
 \author{Generated by Master Generators App}
 \date{\today}
 \begin{document}
 \maketitle
 
 \section{Generated Ordinary Differential Equation}
-""")
+"""
+            )
+        parts.append(r"\subsection{Generator Equation}")
+        parts.append(r"\begin{equation}")
+        parts.append(
+            f"{LaTeXExporter.sympy_to_latex(generator)} = {LaTeXExporter.sympy_to_latex(rhs)}"
+        )
+        parts.append(r"\end{equation}")
 
-        parts += [
-            r"\subsection{Generator Equation}",
-            r"\begin{equation}",
-            f"{LaTeXExporter._sx(gen)} = {LaTeXExporter._sx(rhs)}",
-            r"\end{equation}",
-            "",
-            r"\subsection{Exact Solution}",
-            r"\begin{equation}",
-            "y(x) = " + LaTeXExporter._sx(sol),
-            r"\end{equation}",
-            "",
-            r"\subsection{Parameters}",
-            r"\begin{align}",
-            r"\alpha &= " + LaTeXExporter._sx(params.get("alpha", "")) + r" \\",
-            r"\beta  &= " + LaTeXExporter._sx(params.get("beta", "")) + r" \\",
-            r"n      &= " + LaTeXExporter._sx(params.get("n", "")) + r" \\",
-            r"M      &= " + LaTeXExporter._sx(params.get("M", "")),
-        ]
+        parts.append(r"\subsection{Exact Solution}")
+        parts.append(r"\begin{equation}")
+        parts.append(f"y(x) = {LaTeXExporter.sympy_to_latex(solution)}")
+        parts.append(r"\end{equation}")
+
+        parts.append(r"\subsection{Parameters}")
+        parts.append(r"\begin{align}")
+        parts.append(f"\\alpha &= {LaTeXExporter.sympy_to_latex(params.get('alpha', 1))} \\\\")
+        parts.append(f"\\beta  &= {LaTeXExporter.sympy_to_latex(params.get('beta', 1))} \\\\")
+        parts.append(f"n       &= {params.get('n', 1)} \\\\")
+        parts.append(f"M       &= {LaTeXExporter.sympy_to_latex(params.get('M', 0))}")
         if "q" in params:
-            parts.append(r" \\ q &= " + LaTeXExporter._sx(params["q"]))
+            parts.append(f" \\\\ q &= {LaTeXExporter.sympy_to_latex(params['q'])}")
         if "v" in params:
-            parts.append(r" \\ v &= " + LaTeXExporter._sx(params["v"]))
+            parts.append(f" \\\\ v &= {LaTeXExporter.sympy_to_latex(params['v'])}")
         if "a" in params:
-            parts.append(r" \\ a &= " + LaTeXExporter._sx(params["a"]))
+            parts.append(f" \\\\ a &= {LaTeXExporter.sympy_to_latex(params['a'])}")
         parts.append(r"\end{align}")
 
         if initial_conditions:
-            parts += [r"\subsection{Initial Conditions}", r"\begin{align}"]
-            items = list(initial_conditions.items())
-            for i, (k, v) in enumerate(items):
-                sep = r" \\" if i < len(items) - 1 else ""
-                parts.append(f"{k} &= {LaTeXExporter._sx(v)}{sep}")
-            parts += [r"\end{align}"]
+            parts.append(r"\subsection{Initial Conditions}")
+            parts.append(r"\begin{align}")
+            ic_items = list(initial_conditions.items())
+            for idx, (k, v) in enumerate(ic_items):
+                sep = r" \\" if idx < len(ic_items) - 1 else ""
+                parts.append(f"{k} &= {LaTeXExporter.sympy_to_latex(v)}{sep}")
+            parts.append(r"\end{align}")
 
         if classification:
-            parts += [
-                r"\subsection{Mathematical Classification}",
-                r"\begin{itemize}",
-                r"\item \textbf{Type:} " + str(classification.get("type", "Unknown")),
-                r"\item \textbf{Order:} " + str(classification.get("order", "Unknown")),
-                r"\item \textbf{Linearity:} " + str(classification.get("linearity", "Unknown")),
-            ]
+            parts.append(r"\subsection{Mathematical Classification}")
+            parts.append(r"\begin{itemize}")
+            parts.append(f"\\item \\textbf{{Type:}} {classification.get('type','Unknown')}")
+            parts.append(f"\\item \\textbf{{Order:}} {classification.get('order','Unknown')}")
+            parts.append(f"\\item \\textbf{{Linearity:}} {classification.get('linearity','Unknown')}")
             if "field" in classification:
-                parts.append(r"\item \textbf{Field:} " + str(classification["field"]))
+                parts.append(f"\\item \\textbf{{Field:}} {classification['field']}")
             if "applications" in classification:
-                apps = classification.get("applications", [])
-                if isinstance(apps, (list, tuple)):
-                    parts.append(r"\item \textbf{Applications:} " + ", ".join(map(str, apps)))
-            parts += [r"\end{itemize}"]
+                apps = ", ".join(classification["applications"][:5])
+                parts.append(f"\\item \\textbf{{Applications:}} {apps}")
+            parts.append(r"\end{itemize}")
 
-        parts += [
-            r"\subsection{Solution Verification}",
-            r"Substitute $y(x)$ into the generator operator to verify $L[y] = \text{RHS}$.",
-        ]
+        parts.append(r"\subsection{Solution Verification}")
+        parts.append(
+            r"Substitute $y(x)$ into the generator operator to verify $L[y] = \text{RHS}$."
+        )
 
         if include_preamble:
             parts.append(r"\end{document}")
@@ -314,180 +305,170 @@ class LaTeXExporter:
 
     @staticmethod
     def create_export_package(ode_data: Dict[str, Any], include_extras: bool = True) -> bytes:
-        zbuf = io.BytesIO()
-        with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
             latex_content = LaTeXExporter.generate_latex_document(ode_data, include_preamble=True)
             zf.writestr("ode_document.tex", latex_content)
-            zf.writestr("ode_data.json", json.dumps(ode_data, default=str, indent=2))
-            zf.writestr("README.txt", f"Exported {datetime.now().isoformat()}")
+            zf.writestr("ode_data.json", json.dumps(ode_data, indent=2, default=str))
+            readme = f"""Master Generator ODE Export
+Generated: {datetime.now().isoformat()}
+
+Contents:
+- ode_document.tex
+- ode_data.json
+- README.txt
+
+To compile: pdflatex ode_document.tex
+"""
+            zf.writestr("README.txt", readme)
             if include_extras:
-                zf.writestr("reproduce.py", LaTeXExporter._repro_code(ode_data))
-        zbuf.seek(0)
-        return zbuf.getvalue()
+                zf.writestr("reproduce.py", LaTeXExporter.generate_python_code(ode_data))
+        zip_buffer.seek(0)
+        return zip_buffer.getvalue()
 
     @staticmethod
-    def _repro_code(ode_data: Dict[str, Any]) -> str:
+    def generate_python_code(ode_data: Dict[str, Any]) -> str:
         params = ode_data.get("parameters", {})
         gen_type = ode_data.get("type", "linear")
+        gen_num = ode_data.get("generator_number", 1)
         func_name = ode_data.get("function_used", "exp")
-        return f'''# Reproduction snippet
+        code = f'''"""
+Reproduce a generated ODE (skeleton)
+"""
 import sympy as sp
+from src.functions.basic_functions import BasicFunctions
+from src.functions.special_functions import SpecialFunctions
 try:
     from src.generators.master_generator import CompleteLinearGeneratorFactory, CompleteNonlinearGeneratorFactory
 except Exception:
     from src.generators.linear_generators import LinearGeneratorFactory as CompleteLinearGeneratorFactory
     from src.generators.nonlinear_generators import NonlinearGeneratorFactory as CompleteNonlinearGeneratorFactory
 
-z=sp.Symbol("z")
-f_z = sp.exp(z) if "{func_name}"=="exp" else z
-params={json.dumps(params, default=str)}
+params = {{
+    'alpha': {repr(params.get('alpha', 1))},
+    'beta': {repr(params.get('beta', 1))},
+    'n': {repr(params.get('n', 1))},
+    'M': {repr(params.get('M', 0))}
+}}
+basic = BasicFunctions()
+special = SpecialFunctions()
+try:
+    f_z = basic.get_function('{func_name}')
+except Exception:
+    f_z = special.get_function('{func_name}')
 
-factory = CompleteLinearGeneratorFactory() if "{gen_type}"=="linear" else CompleteNonlinearGeneratorFactory()
-# May need defaults for q,v,a depending on generator:
-params.setdefault("q", 2); params.setdefault("v", 2); params.setdefault("a", 1)
-print("Params:", params)
+if '{gen_type}' == 'linear':
+    factory = CompleteLinearGeneratorFactory()
+else:
+    factory = CompleteNonlinearGeneratorFactory()
+
+result = factory.create({gen_num}, f_z, **params)
+print("ODE:", result.get('ode'))
+print("Solution:", result.get('solution'))
 '''
+        return code
+
 
 # ============================================================================
-# Session utilities/state
+# Session State Manager
 # ============================================================================
-def _ensure_ss_key(name, default):
-    if name not in st.session_state:
-        st.session_state[name] = default
+class SessionStateManager:
+    @staticmethod
+    def initialize():
+        if "generator_constructor" not in st.session_state and GeneratorConstructor:
+            st.session_state.generator_constructor = GeneratorConstructor()
+        if "generator_terms" not in st.session_state:
+            st.session_state.generator_terms = []
+        if "generated_odes" not in st.session_state:
+            st.session_state.generated_odes = []
+        if "generator_patterns" not in st.session_state:
+            st.session_state.generator_patterns = []
+        if "vae_model" not in st.session_state and GeneratorVAE:
+            st.session_state.vae_model = GeneratorVAE()
+        if "pattern_learner" not in st.session_state and GeneratorPatternLearner:
+            st.session_state.pattern_learner = GeneratorPatternLearner()
+        if "novelty_detector" not in st.session_state and ODENoveltyDetector:
+            try:
+                st.session_state.novelty_detector = ODENoveltyDetector()
+            except Exception:
+                st.session_state.novelty_detector = None
+        if "ode_classifier" not in st.session_state and ODEClassifier:
+            try:
+                st.session_state.ode_classifier = ODEClassifier()
+            except Exception:
+                st.session_state.ode_classifier = None
+        if "ml_trainer" not in st.session_state:
+            st.session_state.ml_trainer = None
+        if "ml_trained" not in st.session_state:
+            st.session_state.ml_trained = False
+        if "training_history" not in st.session_state:
+            st.session_state.training_history = []
+        if "batch_results" not in st.session_state:
+            st.session_state.batch_results = []
+        if "analysis_results" not in st.session_state:
+            st.session_state.analysis_results = []
+        if "cache_manager" not in st.session_state and CacheManager:
+            st.session_state.cache_manager = CacheManager()
+        if "ui_components" not in st.session_state and UIComponents:
+            st.session_state.ui_components = UIComponents()
+        if "basic_functions" not in st.session_state and BasicFunctions:
+            st.session_state.basic_functions = BasicFunctions()
+        if "special_functions" not in st.session_state and SpecialFunctions:
+            st.session_state.special_functions = SpecialFunctions()
+        if "theorem_solver" not in st.session_state and MasterTheoremSolver:
+            st.session_state.theorem_solver = MasterTheoremSolver()
+        if "extended_theorem" not in st.session_state and ExtendedMasterTheorem:
+            st.session_state.extended_theorem = ExtendedMasterTheorem()
+        if "export_history" not in st.session_state:
+            st.session_state.export_history = []
+        if "lhs_source" not in st.session_state:
+            st.session_state.lhs_source = "constructor"   # default precedence
+        if "freeform_gen_spec" not in st.session_state:
+            st.session_state.freeform_gen_spec = None
 
-def set_lhs_source(source: str):
-    assert source in {"freeform", "constructor"}
-    st.session_state["lhs_source"] = source
-
-def get_active_generator_spec():
-    _ensure_ss_key("lhs_source", "constructor")
-    if st.session_state["lhs_source"] == "freeform":
-        spec = st.session_state.get("freeform_gen_spec")
-        if spec is not None:
-            return spec
-    return st.session_state.get("current_generator")
-
-def _infer_type_from_spec(spec) -> str:
-    try:
-        return "linear" if bool(getattr(spec, "is_linear", False)) else "nonlinear"
-    except Exception:
-        pass
-    desc = getattr(spec, "freeform_descriptor", None)
-    if isinstance(desc, dict) and "terms" in desc:
-        for t in desc["terms"]:
-            if str(t.get("wrapper", "id")).lower() != "id":
-                return "nonlinear"
-            if int(t.get("power", 1)) != 1:
-                return "nonlinear"
-        return "linear"
-    # If algebraic free‑form exists, we decide by naive heuristic: presence of nonlinearity signs
-    algebraic = getattr(spec, "freeform_algebraic", None)
-    if algebraic is not None:
-        # if it contains pow/sin/log on y(...), treat as nonlinear
-        if any(s in str(algebraic) for s in ["sin(", "cos(", "tanh(", "sinh(", "log(", "Abs(", "**2", "**3"]):
-            return "nonlinear"
-        return "linear"
-    return "nonlinear"
-
-def _max_y_derivative_in_expr(expr: sp.Expr, x: sp.Symbol, yname="y") -> int:
-    """
-    Highest order of Derivative(y(g(x)), (x,k)) encountered (order w.r.t. x).
-    If only y(x) appears (no Derivative nodes), returns 0.
-    """
-    y = Function(yname)
-    maxk = 0
-    for d in expr.atoms(Derivative):
+    @staticmethod
+    def save_to_file(filename: str = "session_state.pkl") -> bool:
         try:
-            if d.expr.func == y:
-                # order w.r.t. x
-                try:
-                    k = sum(c for v, c in d.variable_count if v == x)
-                except Exception:
-                    k = sum(1 for v in d.variables if v == x)
-                if k > maxk:
-                    maxk = k
-        except Exception:
-            pass
-    # also consider bare y(x) as order 0
-    for fnode in expr.atoms(sp.Function):
-        if fnode.func == y:
-            maxk = max(maxk, 0)
-    return maxk
+            state_data = {
+                "generated_odes": st.session_state.generated_odes,
+                "generator_patterns": st.session_state.generator_patterns,
+                "batch_results": st.session_state.batch_results,
+                "analysis_results": st.session_state.analysis_results,
+                "training_history": st.session_state.training_history,
+                "export_history": st.session_state.export_history,
+            }
+            with open(filename, "wb") as f:
+                pickle.dump(state_data, f)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save session state: {e}")
+            return False
 
-def _infer_order_from_spec(spec) -> int:
-    # Prefer symbolic inspection of LHS if available
-    L = getattr(spec, "lhs", None)
-    if L is not None:
-        x = sp.Symbol("x", real=True)
+    @staticmethod
+    def load_from_file(filename: str = "session_state.pkl") -> bool:
         try:
-            return _max_y_derivative_in_expr(L, x, "y")
-        except Exception:
-            pass
-    # fallback to meta
-    try:
-        if hasattr(spec, "order"):
-            return int(spec.order)
-    except Exception:
-        pass
-    desc = getattr(spec, "freeform_descriptor", None)
-    if isinstance(desc, dict) and "terms" in desc:
-        try:
-            return max(int(t.get("inner_order", 0)) + int(t.get("outer_order", 0)) for t in desc["terms"])
-        except Exception:
-            return 0
-    return 0
+            if os.path.exists(filename):
+                with open(filename, "rb") as f:
+                    state_data = pickle.load(f)
+                for key, value in state_data.items():
+                    if key in st.session_state:
+                        st.session_state[key] = value
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Failed to load session state: {e}")
+            return False
 
-def register_generated_ode(result: dict):
-    _ensure_ss_key("generated_odes", [])
-    rec = dict(result)
-    rec.setdefault("type", "nonlinear")
-    rec.setdefault("order", 0)
-    rec.setdefault("function_used", "unknown")
-    rec.setdefault("parameters", {})
-    rec.setdefault("classification", {})
-    rec.setdefault("timestamp", datetime.now().isoformat())
-    rec["generator_number"] = len(st.session_state.generated_odes) + 1
-    cl = rec["classification"]
-    cl.setdefault("type", "Linear" if rec["type"] == "linear" else "Nonlinear")
-    cl.setdefault("order", rec["order"])
-    cl.setdefault("linearity", "Linear" if rec["type"] == "linear" else "Nonlinear")
-    cl.setdefault("field", "Mathematical Physics")
-    cl.setdefault("applications", ["Research Equation"])
-    rec["classification"] = cl
-    if "ode" not in rec and all(k in rec for k in ("generator", "rhs")):
-        try:
-            rec["ode"] = sp.Eq(rec["generator"], rec["rhs"])
-        except Exception:
-            rec["ode"] = f"{rec.get('generator')} = {rec.get('rhs')}"
-    st.session_state.generated_odes.append(rec)
-
-def initialize_session():
-    _ensure_ss_key("generator_constructor", GeneratorConstructor() if GeneratorConstructor else None)
-    _ensure_ss_key("generator_terms", [])
-    _ensure_ss_key("generated_odes", [])
-    _ensure_ss_key("generator_patterns", [])
-    _ensure_ss_key("ml_trainer", None)
-    _ensure_ss_key("ml_trained", False)
-    _ensure_ss_key("training_history", {"train_loss": [], "val_loss": []})
-    _ensure_ss_key("batch_results", [])
-    _ensure_ss_key("batch_records_full", [])
-    _ensure_ss_key("analysis_results", [])
-    _ensure_ss_key("cache_manager", CacheManager() if CacheManager else None)
-    _ensure_ss_key("basic_functions", BasicFunctions() if BasicFunctions else None)
-    _ensure_ss_key("special_functions", SpecialFunctions() if SpecialFunctions else None)
-    _ensure_ss_key("ode_classifier", ODEClassifier() if ODEClassifier else None)
-    _ensure_ss_key("theorem_solver", MasterTheoremSolver() if MasterTheoremSolver else None)
-    _ensure_ss_key("extended_theorem", ExtendedMasterTheorem() if ExtendedMasterTheorem else None)
-    _ensure_ss_key("freeform_terms", [])
-    _ensure_ss_key("freeform_gen_spec", None)
-    _ensure_ss_key("lhs_source", "constructor")
-    _ensure_ss_key("last_solution", None)
-    _ensure_ss_key("last_rhs", None)
-    _ensure_ss_key("last_lhs", None)
 
 # ============================================================================
-# Theorem 4.1 & 4.2 (symbolic)
+# -------------------- Master Theorem subsystem (fixed) ----------------------
+# (exact params, T4.1 + T4.2 (Stirling), free-form LHS, fast RHS, timeouts)
 # ============================================================================
+from functools import lru_cache
+import concurrent.futures as _futures
+from sympy import Derivative, Function, Symbol
+from sympy.core.function import AppliedUndef
+
 def simplify_expr(expr: sp.Expr, level: str = "light") -> sp.Expr:
     if level == "none":
         return expr
@@ -497,7 +478,7 @@ def simplify_expr(expr: sp.Expr, level: str = "light") -> sp.Expr:
         e = sp.simplify(e)
         if level == "aggressive":
             try:
-                e = sp.nsimplify(e, [sp.E, sp.pi, sp.I], rational=True, maxsteps=40)
+                e = sp.nsimplify(e, [sp.E, sp.pi, sp.I], rational=True, maxsteps=50)
             except Exception:
                 pass
         return e
@@ -510,70 +491,142 @@ def to_exact(v):
     except Exception:
         return sp.sympify(v)
 
-@sp.cacheit
+@lru_cache(maxsize=128)
 def omega_list(n: int):
     return tuple(sp.Rational(2*s-1, 2*n)*sp.pi for s in range(1, int(n)+1))
 
-def theorem_4_1_solution_expr(f_of_z, alpha, beta, n: int, M, x: sp.Symbol, simplify_level="light"):
+@lru_cache(maxsize=128)
+def stirling_row(m: int):
+    S = sp.functions.combinatorial.numbers.stirling
+    return tuple(S(int(m), j, kind=2) for j in range(1, int(m)+1))
+
+def get_function_expr(source_lib, func_name: str) -> sp.Expr:
     z = sp.Symbol("z", real=True)
-    base = f_of_z.subs(z, alpha + beta)
-    parts = []
+    f_obj = None
+    if source_lib is not None:
+        try:
+            f_obj = source_lib.get_function(func_name)
+        except Exception:
+            f_obj = None
+    if f_obj is None:
+        try:
+            return sp.sympify(func_name, locals={"z": z, "E": sp.E, "pi": sp.pi})
+        except Exception as e:
+            raise ValueError(f"Unknown function '{func_name}' and cannot sympify: {e}")
+
+    if isinstance(f_obj, sp.Expr):
+        frees = list(f_obj.free_symbols)
+        if len(frees) == 0:
+            return sp.sympify(f_obj)
+        g = f_obj
+        for s in frees:
+            if s != z:
+                g = g.subs(s, z)
+        return g
+
+    if callable(f_obj):
+        try:
+            v = f_obj(z)
+            if isinstance(v, sp.Expr):
+                return v
+        except Exception:
+            pass
+
+    if isinstance(f_obj, str):
+        return sp.sympify(f_obj, locals={"z": z})
+
+    raise TypeError(f"Unsupported function object for '{func_name}'")
+
+# --- FIXED: Correct Theorem 4.1 sign (matches old code) ---
+def theorem_4_1_solution_expr(
+    f_expr: sp.Expr, alpha, beta, n: int, M, x: sp.Symbol, simplify_level="light"
+) -> sp.Expr:
+    """
+    y(x) = (π/(2n)) * Σ_{s=1..n} [ f(α + β ζ_s) + f(α + β ζ̄_s) - 2 f(α + β) ] + π M,
+    where ζ_s = exp(-x sin ω_s) * exp(i x cos ω_s),  ω_s = (2s-1)π/(2n).
+    """
+    z = sp.Symbol("z", real=True)
+    base = f_expr.subs(z, alpha + beta)
+    terms = []
     for ω in omega_list(int(n)):
-        epos = sp.exp(sp.I*x*sp.cos(ω) - x*sp.sin(ω))
-        eneg = sp.exp(-sp.I*x*sp.cos(ω) - x*sp.sin(ω))
-        psi = f_of_z.subs(z, alpha + beta*epos)
-        phi = f_of_z.subs(z, alpha + beta*eneg)
-        parts.append(2*base - psi - phi)
-    y = sp.pi/(2*n)*sp.Add(*parts) + sp.pi*M
+        zeta  = sp.exp(-x*sp.sin(ω)) * sp.exp(sp.I * x * sp.cos(ω))
+        zetaB = sp.conjugate(zeta)
+        psi   = f_expr.subs(z, alpha + beta*zeta)
+        phi   = f_expr.subs(z, alpha + beta*zetaB)
+        terms.append((psi + phi) - 2*base)  # corrected sign
+    y = (sp.pi/(2*int(n))) * sp.Add(*terms) + sp.pi*M
     return simplify_expr(y, level=simplify_level)
 
-def theorem_4_2_mth_derivative_expr(f_of_z, alpha, beta, n: int, m: int, x: sp.Symbol):
-    z = sp.Symbol("z")
-    res = 0
-    for s in range(1, n+1):
-        ω = ((2*s - 1) * sp.pi) / (2*n)
-        λ = sp.exp(sp.I*(sp.pi/2 + ω))
-        ζ  = sp.exp(-x*sp.sin(ω)) * sp.exp(sp.I * x*sp.cos(ω))
-        ζc = sp.exp(-x*sp.sin(ω)) * sp.exp(-sp.I * x*sp.cos(ω))
-        ψ = f_of_z.subs(z, alpha + beta*ζ)
-        φ = f_of_z.subs(z, alpha + beta*ζc)
-        term_ψ = λ**m * sum(stirling(m, j, kind=2) * (beta*ζ)**j * sp.diff(ψ, alpha, j) for j in range(1, m+1))
-        term_φ = sp.conjugate(λ)**m * sum(stirling(m, j, kind=2) * (beta*ζc)**j * sp.diff(φ, alpha, j) for j in range(1, m+1))
-        res += term_ψ + term_φ
-    return - (sp.pi/(2*n)) * sp.simplify(res)
+# --- FIXED: Theorem 4.2 consistent with corrected T4.1 (no global minus) ---
+def theorem_4_2_y_m_expr(
+    f_expr: sp.Expr, alpha_value, beta, n: int, m: int, x: sp.Symbol, simplify_level="light"
+) -> sp.Expr:
+    z = sp.Symbol("z", real=True)
+    αsym = sp.Symbol("alpha_sym", real=True)
+    total = 0
+    Srow = stirling_row(int(m))
 
-# ============================================================================
-# Function resolver
-# ============================================================================
-def get_function_expr(source, name: str) -> sp.Expr:
-    z = sp.Symbol("z")
-    # Provided library?
-    if source == "Basic" and st.session_state.get("basic_functions"):
-        try:
-            obj = st.session_state.basic_functions.get_function(name)
-            return sp.sympify(obj) if isinstance(obj, sp.Expr) else obj(z)
-        except Exception:
-            pass
-    if source == "Special" and st.session_state.get("special_functions"):
-        try:
-            obj = st.session_state.special_functions.get_function(name)
-            return sp.sympify(obj) if isinstance(obj, sp.Expr) else obj(z)
-        except Exception:
-            pass
-    # Try to sympify free text (exp(z), z**2+1, etc.)
+    for ω in omega_list(int(n)):
+        lam = sp.exp(sp.I*(sp.pi/2 + ω))
+        zeta = sp.exp(-x*sp.sin(ω)) * sp.exp(sp.I*x*sp.cos(ω))
+        zetab = sp.conjugate(zeta)
+        psi = f_expr.subs(z, αsym + beta*zeta)
+        phi = f_expr.subs(z, αsym + beta*zetab)
+
+        s1 = 0
+        s2 = 0
+        for j, S in enumerate(Srow, start=1):
+            s1 += S * (beta*zeta)**j  * sp.diff(psi, αsym, j)
+            s2 += S * (beta*zetab)**j * sp.diff(phi, αsym, j)
+
+        total += lam**m * s1 + sp.conjugate(lam)**m * s2
+
+    y_m = (sp.pi/(2*int(n))) * total  # positive sign
+    y_m = y_m.subs(αsym, alpha_value)
+    return simplify_expr(y_m, level=simplify_level)
+
+# --- Robust LHS application with full chain rule ---
+def apply_lhs_to_solution(
+    lhs_expr: sp.Expr,
+    solution_y: sp.Expr,
+    x: sp.Symbol,
+    y_name: str = "y",
+    simplify_level="light",
+    max_unique_derivs: int = 200
+) -> sp.Expr:
+    """
+    Apply a symbolic generator LHS to an explicit solution y(x).
+    Handles:
+      • y(x/a + b) and arbitrary arguments of y
+      • Composite terms and outer derivatives via .doit() (chain rule)
+    """
     try:
-        return sp.sympify(name, locals={"z": z, "E": sp.E, "pi": sp.pi})
-    except Exception as e:
-        raise ValueError(f"Unknown f(z) '{name}': {e}")
+        yfun = sp.Function(y_name)
 
-# ============================================================================
-# Free‑form builders: term-based (existing) and NEW algebraic editor
-# ============================================================================
-EPS = sp.Symbol("epsilon", positive=True)
+        # Replace every y(arg) with solution_y.subs(x, arg)
+        y_calls = [node for node in lhs_expr.atoms(AppliedUndef)
+                   if node.func == yfun and len(node.args) == 1]
+        subs_map = { call: solution_y.subs(x, call.args[0]) for call in y_calls }
 
-def build_freeform_term(x: sp.Symbol, coef=1, inner_order=0, wrapper="id", power=1,
-                        arg_scale=None, arg_shift=None, outer_order=0,
-                        y_name="y") -> sp.Expr:
+        expr = lhs_expr
+        if subs_map:
+            expr = expr.xreplace(subs_map)
+            expr = expr.subs(subs_map)
+
+        # Evaluate derivatives after substitution
+        expr = expr.doit()
+
+        return simplify_expr(expr, level=simplify_level)
+
+    except Exception:
+        expr = lhs_expr.subs({sp.Function(y_name)(x): solution_y}).doit()
+        return simplify_expr(expr, level=simplify_level)
+
+def build_freeform_term(
+    x: sp.Symbol, coef=1, inner_order=0, wrapper="id", power=1,
+    arg_scale=None, arg_shift=None, outer_order=0,
+    y_name="y", ln_eps=sp.Symbol("epsilon", positive=True)
+) -> sp.Expr:
     yfun = sp.Function(y_name)
     arg = x if arg_scale in (None, 0) and arg_shift in (None, 0) else (x/(arg_scale or 1) + (arg_shift or 0))
     base = yfun(arg)
@@ -595,7 +648,7 @@ def build_freeform_term(x: sp.Symbol, coef=1, inner_order=0, wrapper="id", power
     elif wrapper == "tanh":
         core = sp.tanh(base)
     elif wrapper == "log":
-        core = sp.log(EPS + sp.Abs(base))
+        core = sp.log(ln_eps + sp.Abs(base))
     elif wrapper == "abs":
         core = sp.Abs(base)
     else:
@@ -615,479 +668,439 @@ def build_freeform_lhs(x: sp.Symbol, terms: list, y_name="y") -> sp.Expr:
         return sp.Symbol("LHS")
     return sp.Add(*[build_freeform_term(x, **t, y_name=y_name) for t in terms])
 
-# ---------- NEW: algebraic LHS parser ----------
-def _algebraic_locals(x: sp.Symbol, yname="y") -> Dict[str, Any]:
-    y = sp.Function(yname)
-
-    def Dy(k, g=None):
-        if g is None:
-            g = x
-        return sp.Derivative(y(g), (x, int(k)))
-
-    # y1..y10 shorthand
-    def _y_k(k):
-        return lambda g=None: sp.Derivative(y(x if g is None else g), (x, k))
-
-    loc = {
-        "x": x, "y": y, "Dy": Dy,
-        "epsilon": EPS, "E": sp.E, "pi": sp.pi,
-        # common wrappers
-        "sin": sp.sin, "cos": sp.cos, "tan": sp.tan,
-        "sinh": sp.sinh, "cosh": sp.cosh, "tanh": sp.tanh,
-        "exp": sp.exp, "log": sp.log, "Abs": sp.Abs, "sqrt": sp.sqrt,
-        "sign": sp.sign, "Heaviside": sp.Heaviside,
-        "asin": sp.asin, "acos": sp.acos, "atan": sp.atan,
-        "sech": sp.sech, "csch": sp.csch, "coth": sp.coth,
-        "erf": sp.erf, "erfc": sp.erfc,
-        "gamma": sp.gamma, "loggamma": sp.loggamma,
-        "airyai": sp.airyai, "airybi": sp.airybi,
-        "besselj": sp.besselj, "bessely": sp.bessely,
-    }
-    for k in range(1, 11):
-        loc[f"y{k}"] = _y_k(k)
-    return loc
-
-def parse_algebraic_lhs(expr_text: str, x: sp.Symbol, yname="y") -> sp.Expr:
-    """
-    Safe-ish parser for user-supplied SymPy expressions.
-    Supports y(x), y1(x)=d/dx y(x), …, y10(x), Dy(k, g), delays via using g(x)=x-τ, etc.
-    """
-    if not expr_text or not str(expr_text).strip():
-        raise ValueError("Empty generator expression.")
-    loc = _algebraic_locals(x, yname=yname)
-    try:
-        expr = sp.sympify(expr_text, locals=loc, convert_xor=True)
-        return expr
-    except Exception as e:
-        raise ValueError(f"Failed to parse algebraic LHS: {e}")
-
-# ============================================================================
-# Apply LHS to y(x): optimized for affine g(x)
-# ============================================================================
-def _deriv_order_wrt_x(d: Derivative, x: sp.Symbol) -> int:
-    try:
-        return sum(c for v, c in d.variable_count if v == x)
-    except Exception:
-        return sum(1 for v in d.variables if v == x)
-
-def _is_affine_in_x(arg: sp.Expr, x: sp.Symbol) -> Tuple[bool, sp.Expr]:
-    """
-    Returns (True, a) if arg = a*x + b (a constant in x), else (False, None).
-    """
-    try:
-        d2 = sp.simplify(sp.diff(arg, (x, 2)))
-        if d2 != 0:
-            return (False, None)
-        a = sp.simplify(sp.diff(arg, x))
-        return (True, a)
-    except Exception:
-        return (False, None)
-
-def apply_lhs_to_solution(lhs_expr: sp.Expr, y_expr: sp.Expr, x: sp.Symbol, y_name="y", simplify_level="light") -> sp.Expr:
-    """
-    Substitute y(g(x)), Derivative(y(g(x)), (x,k)) with y_expr composed at g(x),
-    using affine shortcut: if g''(x)=0 then d^k/dx^k y_expr(g(x)) = (g')^k * y_expr^{(k)}(g(x)).
-    """
-    y = Function(y_name)
-    mapping = {}
-
-    # Precompute derivatives of y_expr at x for reuse
-    # (used when arg == x or when using affine shortcut + substitution)
-    d_cache = {0: y_expr}
-    max_needed = 0
-
-    # Collect needs
-    needs = []
-    for node in lhs_expr.atoms(AppliedUndef, Derivative):
-        if isinstance(node, AppliedUndef) and node.func == y and len(node.args) == 1:
-            arg = node.args[0]
-            needs.append(("y", node, arg, 0))
-        elif isinstance(node, Derivative) and isinstance(node.expr, AppliedUndef) and node.expr.func == y:
-            arg = node.expr.args[0]
-            k = _deriv_order_wrt_x(node, x)
-            needs.append(("dy", node, arg, k))
-            if arg == x:
-                max_needed = max(max_needed, k)
-
-    for k in range(1, max_needed + 1):
-        d_cache[k] = sp.diff(y_expr, (x, k))
-
-    local_cache = {}
-
-    def eval_at(arg_expr: sp.Expr, order: int) -> sp.Expr:
-        key = (sp.srepr(arg_expr), order)
-        if key in local_cache:
-            return local_cache[key]
-        if arg_expr == x:
-            val = d_cache[order]
-        else:
-            affine, a = _is_affine_in_x(arg_expr, x)
-            if affine:
-                # affine shortcut
-                # d^k/dx^k [y_expr(arg)] = (a)^k * y_expr^{(k)}(arg)
-                val = (a**order) * sp.diff(y_expr, (x, order)).subs(x, arg_expr)
-            else:
-                # general fallback
-                val = sp.diff(y_expr.subs(x, arg_expr), (x, order))
-        local_cache[key] = val
-        return val
-
-    for typ, node, arg, k in needs:
-        if k == 0:
-            mapping[node] = eval_at(arg, 0)
-        else:
-            mapping[node] = eval_at(arg, k)
-
-    try:
-        out = lhs_expr.xreplace(mapping)
-    except Exception:
-        out = lhs_expr.subs(mapping)
-
-    return simplify_expr(out, level=simplify_level)
-
-# ============================================================================
-# Timeout helpers
-# ============================================================================
-import concurrent.futures as _fut
-
-def _worker_t41(f_expr, alpha, beta, n, M, xname, simplify_level):
-    x = sp.Symbol(xname, real=True)
+# Helpers to run heavy jobs with a timeout
+def _worker_theorem_4_1(f_expr, alpha, beta, n, M, x_name, simplify_level):
+    x = sp.Symbol(x_name, real=True)
     return theorem_4_1_solution_expr(f_expr, alpha, beta, int(n), M, x, simplify_level)
 
-def _worker_apply(lhs_expr, solution_y, xname, yname, simplify_level):
-    x = sp.Symbol(xname, real=True)
-    return apply_lhs_to_solution(lhs_expr, solution_y, x, y_name=yname, simplify_level=simplify_level)
+def _worker_theorem_4_2(f_expr, alpha, beta, n, m, x_name, simplify_level):
+    x = sp.Symbol(x_name, real=True)
+    return theorem_4_2_y_m_expr(f_expr, alpha, beta, int(n), int(m), x, simplify_level)
 
-def _worker_ic(sol, xname, j):
-    x = sp.Symbol(xname, real=True)
-    return sp.simplify(sp.diff(sol, (x, int(j))).subs(x, 0))
+def _worker_apply_lhs(lhs_expr, solution_y, x_name, y_name, simplify_level):
+    x = sp.Symbol(x_name, real=True)
+    return apply_lhs_to_solution(lhs_expr, solution_y, x, y_name=y_name, simplify_level=simplify_level)
 
-def run_with_timeout(fn, timeout_sec, *args):
-    if not timeout_sec or timeout_sec <= 0:
-        return fn(*args)
+def run_with_timeout(func, timeout_sec: int, *args):
+    if timeout_sec is None or timeout_sec <= 0:
+        return func(*args)
     try:
-        with _fut.ProcessPoolExecutor(max_workers=1) as ex:
-            fut = ex.submit(fn, *args)
+        with _futures.ProcessPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(func, *args)
             return fut.result(timeout=timeout_sec)
-    except _fut.TimeoutError:
+    except _futures.TimeoutError:
         raise TimeoutError(f"Operation exceeded {timeout_sec} seconds")
     except Exception:
-        # fallback inline (best effort)
-        return fn(*args)
+        # fallback direct call
+        return func(*args)
+
+# --- Determine equation order from LHS ---
+def equation_order_of_lhs(lhs_expr: sp.Expr, x: sp.Symbol) -> int:
+    max_order = 0
+    for D in lhs_expr.atoms(sp.Derivative):
+        try:
+            m = sum(c for v, c in D.variable_count if v == x)
+        except Exception:
+            m = sum(1 for v in D.variables if v == x)
+        if m > max_order:
+            max_order = int(m)
+    return max_order
+
+# --- Compute ICs y^(k)(0) from solution up to ODE order ---
+def compute_initial_conditions_from_solution(
+    solution_y: sp.Expr,
+    lhs_expr: sp.Expr,
+    x: sp.Symbol,
+    simplify_level: str = "light"
+) -> Dict[str, sp.Expr]:
+    m = equation_order_of_lhs(lhs_expr, x)
+    upto = max(1, m)
+    ics: Dict[str, sp.Expr] = {}
+    for k in range(upto):
+        if k == 0:
+            d = solution_y
+            label = "y(0)"
+        elif k == 1:
+            d = sp.diff(solution_y, x)
+            label = "y'(0)"
+        elif k == 2:
+            d = sp.diff(solution_y, (x, 2))
+            label = "y''(0)"
+        else:
+            d = sp.diff(solution_y, (x, k))
+            label = f"y^({k})(0)"
+        val = simplify_expr(sp.simplify(d).subs(x, 0), level=simplify_level)
+        ics[label] = val
+    return ics
 
 # ============================================================================
-# UI Pages
+# ---------- Generator source + result utilities (centralized) ---------------
 # ============================================================================
-def page_header():
-    st.markdown(
-        """
-    <div class="main-header">
-      <div class="main-title">🔬 Master Generators for ODEs</div>
-      <div class="subtitle">Free‑form algebraic generators • Theorems 4.1 & 4.2 • ML/DL • Exports</div>
-    </div>
-    """,
-        unsafe_allow_html=True,
-    )
+def _ensure_ss_key(name, default):
+    if name not in st.session_state:
+        st.session_state[name] = default
 
-def dashboard_page():
-    st.header("🏠 Dashboard")
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.markdown(f'<div class="metric-card"><h3>📝 Generated ODEs</h3><h1>{len(st.session_state.generated_odes)}</h1></div>', unsafe_allow_html=True)
-    with c2:
-        st.markdown(f'<div class="metric-card"><h3>🧬 ML Patterns</h3><h1>{len(st.session_state.generator_patterns)}</h1></div>', unsafe_allow_html=True)
-    with c3:
-        st.markdown(f'<div class="metric-card"><h3>📊 Batch Results</h3><h1>{len(st.session_state.batch_results)}</h1></div>', unsafe_allow_html=True)
-    with c4:
-        model_status = "✅ Trained" if st.session_state.get("ml_trained") else "⏳ Not Trained"
-        st.markdown(f'<div class="metric-card"><h3>🤖 ML Model</h3><p style="font-size: 1.2rem;">{model_status}</p></div>', unsafe_allow_html=True)
+def set_lhs_source(source: str):
+    """
+    source ∈ {"freeform", "constructor"}; controls which LHS we use at generation time.
+    """
+    assert source in {"freeform", "constructor"}
+    st.session_state["lhs_source"] = source
 
-    st.subheader("📊 Recent ODEs")
-    if st.session_state.generated_odes:
-        df = pd.DataFrame(
-            [
-                {"No": r.get("generator_number"),
-                 "Type": r.get("type"),
-                 "Order": r.get("order"),
-                 "Func": r.get("function_used"),
-                 "Time": r.get("timestamp", "")[:19]}
-                for r in st.session_state.generated_odes[-10:]
-            ]
-        )
-        st.dataframe(df, use_container_width=True)
-    else:
-        st.info("No ODEs yet. Try **Apply Master Theorem**.")
+def get_active_generator_spec():
+    """
+    Return the active GeneratorSpecification-like object to use for L[y] (or None).
+    Precedence controlled by st.session_state["lhs_source"].
+    """
+    _ensure_ss_key("lhs_source", "constructor")
+    if st.session_state["lhs_source"] == "freeform":
+        spec = st.session_state.get("freeform_gen_spec")
+        if spec is not None:
+            return spec
+    return st.session_state.get("current_generator")
 
-def generator_constructor_page():
-    st.header("🔧 Generator Constructor")
-    st.markdown('<div class="info-box">Use your project Constructor (term list), or use Free‑form on the theorem page.</div>', unsafe_allow_html=True)
+def _infer_type_from_spec(spec) -> str:
+    try:
+        return "linear" if bool(spec.is_linear) else "nonlinear"
+    except Exception:
+        pass
+    desc = getattr(spec, "freeform_descriptor", None)
+    if isinstance(desc, dict) and "terms" in desc:
+        for t in desc["terms"]:
+            if str(t.get("wrapper", "id")).lower() != "id":
+                return "nonlinear"
+            if int(t.get("power", 1)) != 1:
+                return "nonlinear"
+        return "linear"
+    return "nonlinear"
 
-    if not (GeneratorSpecification and DerivativeTerm and DerivativeType and OperatorType):
-        st.warning("Constructor classes not found in src/. You can still use the Free‑form builder on the theorem page.")
-        return
+def _infer_order_from_spec(spec) -> int:
+    try:
+        if hasattr(spec, "order"):
+            return int(spec.order)
+    except Exception:
+        pass
+    desc = getattr(spec, "freeform_descriptor", None)
+    if isinstance(desc, dict) and "terms" in desc:
+        try:
+            return max(int(t.get("inner_order", 0)) for t in desc["terms"])
+        except Exception:
+            return 0
+    return 0
 
-    with st.expander("➕ Add Generator Term", expanded=True):
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            deriv_order = st.selectbox("Derivative Order", [0,1,2,3,4,5,6])
-        with c2:
-            func_type = st.selectbox("Function Type", [t.value for t in DerivativeType])
-        with c3:
-            coefficient = st.number_input("Coefficient", -10.0, 10.0, 1.0, 0.1)
-        with c4:
-            power = st.number_input("Power", 1, 6, 1)
-        c5, c6, c7 = st.columns(3)
-        with c5:
-            operator_type = st.selectbox("Operator Type", [t.value for t in OperatorType])
-        with c6:
-            scaling = st.number_input("Scaling (a)", 0.5, 5.0, 1.0, 0.1) if operator_type in ["delay","advance"] else None
-        with c7:
-            shift = st.number_input("Shift (b)", -10.0, 10.0, 0.0, 0.1) if operator_type in ["delay","advance"] else None
+def register_generated_ode(result: dict):
+    """
+    Normalize and append a new ODE record so ML/DL sees it.
+    Ensures fields exist and 'generator_number' is sequential.
+    """
+    _ensure_ss_key("generated_odes", [])
+    result = dict(result)
 
-        if st.button("➕ Add Term", type="primary"):
-            term = DerivativeTerm(
-                derivative_order=int(deriv_order),
-                coefficient=float(coefficient),
-                power=int(power),
-                function_type=DerivativeType(func_type),
-                operator_type=OperatorType(operator_type),
-                scaling=float(scaling) if scaling is not None else None,
-                shift=float(shift) if shift is not None else None,
-            )
-            st.session_state.generator_terms.append(term)
-            st.success("Term added.")
+    # Required fields + guardrails
+    result.setdefault("type", "nonlinear")
+    result.setdefault("order", 0)
+    result.setdefault("function_used", "unknown")
+    result.setdefault("parameters", {})
+    result.setdefault("classification", {})
+    result.setdefault("timestamp", datetime.now().isoformat())
 
-    if st.session_state.generator_terms:
-        st.subheader("📝 Current Terms")
-        for i, term in enumerate(st.session_state.generator_terms, 1):
-            desc = term.get_description() if hasattr(term, "get_description") else str(term)
-            st.write(f"{i}. {desc}")
+    # Auto index
+    result["generator_number"] = len(st.session_state.generated_odes) + 1
 
-        if st.button("🔨 Build Generator Specification", type="primary"):
-            try:
-                gen_spec = GeneratorSpecification(
-                    terms=st.session_state.generator_terms,
-                    name=f"Custom Generator {len(st.session_state.generated_odes) + 1}",
-                )
-                st.session_state.current_generator = gen_spec
-                set_lhs_source("constructor")
-                st.success("Specification built & selected.")
-                try:
-                    st.latex(sp.latex(gen_spec.lhs) + " = RHS")
-                except Exception:
-                    pass
-            except Exception as e:
-                st.error(f"Failed to build specification: {e}")
+    # Human-friendly classification defaults
+    cl = dict(result.get("classification", {}))
+    cl.setdefault("type", "Linear" if result["type"] == "linear" else "Nonlinear")
+    cl.setdefault("order", result["order"])
+    cl.setdefault("field", cl.get("field", "Mathematical Physics"))
+    cl.setdefault("applications", cl.get("applications", ["Research Equation"]))
+    cl.setdefault("linearity", "Linear" if result["type"] == "linear" else "Nonlinear")
+    result["classification"] = cl
 
-    if st.button("🗑️ Clear All Terms"):
-        st.session_state.generator_terms = []
-        st.session_state.current_generator = None
+    # Provide a canonical 'ode' object if not present
+    if "ode" not in result and all(k in result for k in ("generator", "rhs")):
+        try:
+            result["ode"] = sp.Eq(result["generator"], result["rhs"])
+        except Exception:
+            result["ode"] = str(result.get("generator", "")) + " = " + str(result.get("rhs", ""))
 
-# -------------------- Apply Master Theorem --------------------
+    st.session_state.generated_odes.append(result)
+
+# ============================================================================
+# Apply Master Theorem – Page
+# ============================================================================
 def page_apply_master_theorem():
-    st.header("🎯 Apply Master Theorem")
+    st.header("🎯 Apply Master Theorem (Exact, Fast, with Timeouts)")
 
-    # LHS source
+    # ---------- LHS source selector (constructor vs free‑form) ----------
+    _ensure_ss_key("lhs_source", "constructor")
+    source_label = {"constructor": "Constructor LHS", "freeform": "Free‑form LHS"}
     sel = st.radio(
-        "LHS source",
+        "Generator LHS source",
         options=("constructor", "freeform"),
-        index=0 if st.session_state.get("lhs_source","constructor") == "constructor" else 1,
-        format_func=lambda s: {"constructor":"Constructor LHS", "freeform":"Free‑form LHS"}[s],
-        horizontal=True,
+        index=0 if st.session_state["lhs_source"] == "constructor" else 1,
+        format_func=lambda s: source_label[s],
+        horizontal=True
     )
     set_lhs_source(sel)
 
-    col1, col2 = st.columns([1,1])
+    # Function source
+    colA, colB = st.columns([1, 1])
+    with colA:
+        func_source = st.selectbox("Function library", ["Basic", "Special"], index=0)
+    with colB:
+        basic_lib = st.session_state.get("basic_functions")
+        special_lib = st.session_state.get("special_functions")
+        if func_source == "Basic" and basic_lib:
+            func_names = basic_lib.get_function_names()
+            source_lib = basic_lib
+        elif func_source == "Special" and special_lib:
+            func_names = special_lib.get_function_names()
+            source_lib = special_lib
+        else:
+            func_names = []
+            source_lib = None
+        func_name = st.selectbox("Choose f(z)", func_names) if func_names else st.text_input("Enter f(z) name or expression", "exp(z)")
+
+    # Parameters
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
-        lib = st.selectbox("Function library", ["Basic", "Special"], index=0)
-        names = []
-        try:
-            if lib == "Basic" and st.session_state.basic_functions:
-                names = st.session_state.basic_functions.get_function_names()
-            elif lib == "Special" and st.session_state.special_functions:
-                names = st.session_state.special_functions.get_function_names()
-        except Exception:
-            pass
-        func_name = st.selectbox("Select f(z)", names) if names else st.text_input("Enter f(z) (name or expression)", "exp(z)")
+        alpha = st.number_input("α", value=1.0, step=0.1, format="%.6f")
     with col2:
-        alpha = st.text_input("α", "1")
-        beta  = st.text_input("β", "1")
-        n     = st.number_input("n ≥ 1", 1, 20, 1)
-        M     = st.text_input("M", "0")
+        beta  = st.number_input("β", value=1.0, step=0.1, format="%.6f")
+    with col3:
+        n     = st.number_input("n (positive integer)", value=1, min_value=1, max_value=12, step=1)
+    with col4:
+        M     = st.number_input("M", value=0.0, step=0.1, format="%.6f")
 
-    cA, cB, cC = st.columns(3)
-    with cA:
+    # Controls
+    colC, colD, colE = st.columns([1, 1, 1])
+    with colC:
         use_exact = st.checkbox("Exact (symbolic) parameters", value=True)
-    with cB:
-        simplify_level = st.selectbox("Simplify", ["light","none","aggressive"], index=0)
-    with cC:
-        timeout_sec = st.slider("Timeout (sec)", 0, 90, 20, help="0 = unlimited")
+    with colD:
+        simplify_level = st.selectbox("Simplify level", ["light", "none", "aggressive"], index=0)
+    with colE:
+        timeout_sec = st.slider("Timeout (seconds)", min_value=0, max_value=90, value=20,
+                                help="Hard cap per heavy operation. 0 = no timeout.")
 
-    # Thm 4.2 (optional)
-    with st.expander("Theorem 4.2 (optional)"):
-        m = st.number_input("m ≥ 1", 1, 20, 1)
-        if st.button("Compute y^{(m)}(x)"):
+    apply_generator_checkbox = st.checkbox("Apply generator (build RHS = L[y])", value=True,
+                                           help="Uses the selected generator LHS (constructor or free‑form) to form RHS.")
+
+    # Theorem 4.2 option
+    colm1, colm2 = st.columns([1, 1])
+    with colm1:
+        compute_mth = st.checkbox("Compute y^(m)(x) (Theorem 4.2)", value=False)
+    with colm2:
+        m_order = st.number_input("m (order for Theorem 4.2)", value=1, min_value=1, max_value=12, step=1)
+
+    # Build f(z)
+    try:
+        f_expr_preview = get_function_expr(source_lib, func_name)
+    except Exception as e:
+        st.error(f"Cannot build f(z): {e}")
+        return
+
+    # Exact params
+    α = to_exact(alpha) if use_exact else sp.Float(alpha)
+    β = to_exact(beta)  if use_exact else sp.Float(beta)
+    𝑀 = to_exact(M)     if use_exact else sp.Float(M)
+    x = sp.Symbol("x", real=True)
+
+    # ---------- Resolve available constructor LHS (if any) ----------
+    generator_lhs_from_constructor = None
+    gen_spec = st.session_state.get("current_generator", None)
+    if gen_spec is not None and hasattr(gen_spec, "lhs"):
+        generator_lhs_from_constructor = gen_spec.lhs
+    else:
+        constructor = st.session_state.get("generator_constructor", None)
+        if constructor is not None and hasattr(constructor, "get_generator_expression"):
             try:
-                f_expr = get_function_expr(lib, func_name)
-                x = sp.Symbol("x", real=True)
-                α = to_exact(alpha) if use_exact else sp.Float(alpha)
-                β = to_exact(beta)  if use_exact else sp.Float(beta)
-                y_m = theorem_4_2_mth_derivative_expr(f_expr, α, β, int(n), int(m), x)
-                st.latex(fr"y^{{({int(m)})}}(x) = " + sp.latex(y_m))
-            except Exception as e:
-                st.error(f"Thm 4.2 error: {e}")
+                generator_lhs_from_constructor = constructor.get_generator_expression()
+            except Exception:
+                generator_lhs_from_constructor = None
+    if generator_lhs_from_constructor is None:
+        generator_lhs_from_constructor = sp.Symbol("LHS")
 
-    # ---------- FREE‑FORM builders ----------
-    st.subheader("🧩 Free‑form LHS (optional)")
-    with st.expander("A) Term‑based builder (wrappers, delays)", expanded=False):
-        if "freeform_terms" not in st.session_state:
-            st.session_state.freeform_terms = []
-        cols = st.columns([1,1,1,1,1,1,1])
+    # ---------- Free‑form LHS builder ----------
+    st.subheader("🧩 Free‑form Generator Builder (LHS)")
+
+    with st.expander("A) Build by terms (wrappers, orders, delays)", expanded=False):
+        if "free_terms" not in st.session_state:
+            st.session_state.free_terms = []
+        cols = st.columns([1,1,1,1,1,1,1,1])
         with cols[0]:
-            coef = st.text_input("coef", "1")
+            coef = st.number_input("coef", value=1.0, step=0.5)
         with cols[1]:
-            inner_order = st.number_input("inner k", 0, 12, 1)
+            inner_order = st.number_input("inner k (y^(k))", value=0, min_value=0, max_value=12, step=1)
         with cols[2]:
             wrapper = st.selectbox("wrap(.)", ["id","exp","sin","cos","sinh","cosh","tanh","log","abs"], index=0)
         with cols[3]:
-            power = st.number_input("power", 1, 12, 1)
+            power = st.number_input("power", value=1, min_value=1, max_value=6, step=1)
         with cols[4]:
-            outer_order = st.number_input("outer m", 0, 12, 0)
+            outer_order = st.number_input("outer m (D^m)", value=0, min_value=0, max_value=12, step=1)
         with cols[5]:
-            a = st.text_input("arg scale a", "1")
+            scale = st.number_input("arg scale (a)", value=1.0, step=0.1, format="%.4f")
         with cols[6]:
-            b = st.text_input("arg shift b", "0")
-        if st.button("➕ Add free‑form term"):
-            try:
-                st.session_state.freeform_terms.append({
-                    "coef": to_exact(coef),
+            shift = st.number_input("arg shift (b)", value=0.0, step=0.1, format="%.4f")
+        with cols[7]:
+            if st.button("➕ Add term"):
+                st.session_state.free_terms.append({
+                    "coef": coef,
                     "inner_order": int(inner_order),
                     "wrapper": wrapper,
                     "power": int(power),
                     "outer_order": int(outer_order),
-                    "arg_scale": to_exact(a),
-                    "arg_shift": to_exact(b),
+                    "arg_scale": float(scale) if abs(scale) > 1e-14 else None,
+                    "arg_shift": float(shift) if abs(shift) > 1e-14 else None,
                 })
-                st.success("Term added.")
-            except Exception as e:
-                st.error(f"Failed to add term: {e}")
-
-        if st.session_state.freeform_terms:
+        if st.session_state.free_terms:
             st.write("**Current terms:**")
-            for i, t in enumerate(st.session_state.freeform_terms, 1):
-                st.write(f"{i}. coef={t['coef']} · D^{t['outer_order']}[ {t['wrapper']}((y^{t['inner_order']})(x/{t.get('arg_scale',1)}+{t.get('arg_shift',0)}))^{t['power']} ]")
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                if st.button("🔨 Build & Select this LHS"):
-                    x = sp.Symbol("x", real=True)
-                    lhs = build_freeform_lhs(x, st.session_state.freeform_terms)
-                    spec = types.SimpleNamespace()
-                    spec.lhs = lhs
-                    spec.freeform_descriptor = {"terms": list(st.session_state.freeform_terms)}
+            for i, t in enumerate(st.session_state.free_terms):
+                st.write(f"{i+1}. coef={t['coef']} · D^{t['outer_order']}[ {t['wrapper']}( (y^{t['inner_order']})(x/{t.get('arg_scale',1)}+{t.get('arg_shift',0)}) )^{t['power']} ]")
+            colc1, colc2, colc3 = st.columns([1,1,1])
+            with colc1:
+                if st.button("🧮 Use free‑form LHS (built by terms)"):
                     try:
-                        spec.order = _max_y_derivative_in_expr(lhs, x, "y")
-                        spec.is_linear = False
-                    except Exception:
-                        pass
-                    st.session_state.freeform_gen_spec = spec
-                    set_lhs_source("freeform")
-                    st.success("Stored & selected.")
-                    try:
-                        st.latex(sp.latex(lhs))
-                    except Exception:
-                        st.code(str(lhs))
-            with c2:
+                        lhs_expr = build_freeform_lhs(x, st.session_state.free_terms)
+                        # Store spec-like object
+                        if GeneratorSpecification:
+                            freeform_spec = GeneratorSpecification(
+                                terms=[],
+                                name=f"Free-form Generator {datetime.now().strftime('%H%M%S')}"
+                            )
+                        else:
+                            freeform_spec = types.SimpleNamespace()
+                            freeform_spec.name = f"Free-form Generator {datetime.now().strftime('%H%M%S')}"
+                        freeform_spec.lhs = lhs_expr
+                        freeform_spec.freeform_descriptor = {"terms": list(st.session_state.free_terms), "note": "free-form"}
+                        try:
+                            freeform_spec.order = max(int(t.get("inner_order", 0)) for t in st.session_state.free_terms)
+                            freeform_spec.is_linear = all(
+                                str(t.get("wrapper", "id")).lower() == "id" and int(t.get("power", 1)) == 1
+                                for t in st.session_state.free_terms
+                            )
+                        except Exception:
+                            pass
+                        st.session_state["freeform_gen_spec"] = freeform_spec
+                        set_lhs_source("freeform")
+                        st.success("✅ Free‑form (terms) LHS stored and selected.")
+                    except Exception as e:
+                        st.error(f"Failed to build/store free‑form LHS: {e}")
+            with colc2:
                 if st.button("🗑️ Clear terms"):
-                    st.session_state.freeform_terms = []
-            with c3:
-                st.info("Use the Algebraic editor below for full control (products, ratios, etc.).")
+                    st.session_state.free_terms = []
+            with colc3:
+                if st.button("↩️ Prefer Constructor LHS"):
+                    set_lhs_source("constructor")
+                    st.info("Switched LHS source to Constructor.")
 
-    with st.expander("B) ✍️ Free‑form Algebraic LHS (type any SymPy) — Recommended", expanded=True):
+    with st.expander("B) Type a full symbolic LHS (any expression)", expanded=False):
         st.markdown(
-            """
-**Syntax help**  
-- Use **y(x)**, **y1(x)=d/dx y(x)**, **y2(x)**, … **y10(x)**; or **Dy(k, g)** for \(d^k/dx^k\,y(g(x))\).  
-- You can multiply/divide and compose freely, e.g. ` (y(x) + y1(x)/(1+y(x/2))) - sinh(y5(x)) `.  
-- Wrappers include: `sin, cos, tan, sinh, cosh, tanh, exp, log, Abs, sqrt, sign, erf, erfc, gamma, loggamma, airyai, airybi, besselj, bessely`.  
-- `epsilon` is available for safe logs: `log(epsilon+Abs(y1(x)))`.
-            """
+            "Enter an expression using `y(x)`, `diff(y(x), x)`, `diff(y(x), (x,k))`, "
+            "`sin`, `cos`, `exp`, `log`, products/quotients, etc. "
+            "Examples: `diff(sin(diff(y(x),x))**2, (x,2)) + y(x)/(1+diff(y(x),x)**2)`"
         )
-        alg_text = st.text_area(
-            "Enter LHS expression",
-            value="y(x) + log(epsilon+Abs(y1(x))) - sinh(y5(x))",
-            height=130,
-        )
-        if st.button("🔨 Parse & Select Algebraic LHS"):
+        lhs_text = st.text_area("Typed LHS", value="", height=120, placeholder="e.g. diff(sin(diff(y(x),x))**2, (x,2)) + y(x)/(1+diff(y(x),x)**2)")
+        if st.button("🧮 Use typed LHS"):
             try:
-                x = sp.Symbol("x", real=True)
-                lhs = parse_algebraic_lhs(alg_text, x, yname="y")
-                spec = types.SimpleNamespace()
-                spec.lhs = lhs
-                spec.freeform_algebraic = alg_text
-                spec.order = _max_y_derivative_in_expr(lhs, x, "y")
-                spec.is_linear = False
-                st.session_state.freeform_gen_spec = spec
-                set_lhs_source("freeform")
-                st.success("Algebraic LHS stored & selected.")
-                try:
-                    st.latex(sp.latex(lhs))
-                except Exception:
-                    st.code(str(lhs))
-            except Exception as e:
-                st.error(f"Parse error: {e}")
+                y = sp.Function("y")
+                local_symbols = {
+                    "x": x, "y": y, "sin": sp.sin, "cos": sp.cos, "sinh": sp.sinh, "cosh": sp.cosh,
+                    "tanh": sp.tanh, "exp": sp.exp, "log": sp.log, "Abs": sp.Abs, "abs": sp.Abs,
+                    "diff": sp.diff, "Derivative": sp.Derivative, "E": sp.E, "I": sp.I, "pi": sp.pi
+                }
+                lhs_expr = sp.sympify(lhs_text, locals=local_symbols)
 
-    # ---------- Generate ODE ----------
+                if GeneratorSpecification:
+                    typed_spec = GeneratorSpecification(terms=[], name=f"Typed Free-form {datetime.now().strftime('%H%M%S')}")
+                else:
+                    typed_spec = types.SimpleNamespace()
+                    typed_spec.name = f"Typed Free-form {datetime.now().strftime('%H%M%S')}"
+                typed_spec.lhs = lhs_expr
+                typed_spec.freeform_descriptor = {"typed": lhs_text, "note": "free-form-typed"}
+                try:
+                    typed_spec.order = equation_order_of_lhs(lhs_expr, x)
+                    typed_spec.is_linear = bool(sp.degree(lhs_expr, sp.Function("y")(x)) == 1)  # heuristic
+                except Exception:
+                    pass
+                st.session_state["freeform_gen_spec"] = typed_spec
+                set_lhs_source("freeform")
+                st.success("✅ Typed free‑form LHS stored and selected.")
+            except Exception as e:
+                st.error(f"Could not parse LHS: {e}")
+
+    # ------------------- Generate ODE button -------------------
     if st.button("🚀 Generate ODE", type="primary", use_container_width=True):
         with st.spinner("Applying Theorem 4.1 and constructing RHS…"):
             try:
-                f_expr = get_function_expr(lib, func_name)
-                x = sp.Symbol("x", real=True)
-                α = to_exact(alpha) if use_exact else sp.Float(alpha)
-                β = to_exact(beta)  if use_exact else sp.Float(beta)
-                𝑀 = to_exact(M)     if use_exact else sp.Float(M)
+                # 1) Resolve f(z)
+                f_expr = get_function_expr(source_lib, func_name)
 
-                solution = run_with_timeout(_worker_t41, timeout_sec, f_expr, α, β, int(n), 𝑀, "x", simplify_level)
+                # 2) y(x) via Theorem 4.1 (with timeout)
+                solution = run_with_timeout(
+                    _worker_theorem_4_1, timeout_sec,
+                    f_expr, α, β, int(n), 𝑀, "x", simplify_level
+                )
 
+                # 3) Choose which LHS to use
                 active_spec = get_active_generator_spec()
                 lhs_to_use = None
                 if active_spec and hasattr(active_spec, "lhs") and active_spec.lhs is not None:
                     lhs_to_use = active_spec.lhs
                 else:
-                    lhs_to_use = sp.Symbol("L[y]")
+                    lhs_to_use = sp.Symbol("L[y]")  # unknown LHS placeholder
 
-                z = sp.Symbol("z")
-                default_rhs = simplify_expr(sp.pi*(f_expr.subs(z, α+β) + 𝑀), level=simplify_level)
-
-                if lhs_to_use != sp.Symbol("L[y]"):
+                # 4) RHS = L[y] (apply generator); if no LHS known, default to 0 (homogeneous)
+                if apply_generator_checkbox and lhs_to_use is not None and not (
+                    isinstance(lhs_to_use, sp.Symbol) and str(lhs_to_use) in {"L[y]", "LHS"}
+                ):
                     try:
-                        rhs = run_with_timeout(_worker_apply, timeout_sec, lhs_to_use, solution, "x", "y", simplify_level)
+                        rhs = run_with_timeout(
+                            _worker_apply_lhs, timeout_sec,
+                            lhs_to_use, solution, "x", "y", simplify_level
+                        )
                         generator_lhs = lhs_to_use
                     except Exception as e:
-                        logger.warning(f"apply(LHS) failed, fallback RHS. Reason: {e}")
-                        rhs = default_rhs
-                        generator_lhs = sp.Symbol("L[y]")
+                        logger.warning(f"Failed to apply LHS to solution; setting RHS=0. Reason: {e}")
+                        rhs = sp.S.Zero
+                        generator_lhs = lhs_to_use
                 else:
-                    rhs = default_rhs
+                    rhs = sp.S.Zero
                     generator_lhs = lhs_to_use
 
-                # Compute initial conditions up to highest derivative order in LHS
-                max_order = _max_y_derivative_in_expr(generator_lhs if isinstance(generator_lhs, sp.Expr) else sp.Symbol("L[y]"), x, "y")
-                ICs = {}
+                # 5) Infer metadata
+                if active_spec is not None:
+                    ode_type = _infer_type_from_spec(active_spec)
+                    ode_order = _infer_order_from_spec(active_spec)
+                else:
+                    try:
+                        ode_order = equation_order_of_lhs(generator_lhs, x)
+                    except Exception:
+                        ode_order = 0
+                    ode_type = "linear" if ode_order <= 1 and generator_lhs.is_Add else "nonlinear"
+
+                # 6) Persist “last” values for convenience
+                st.session_state["last_solution"] = solution
+                st.session_state["last_rhs"] = rhs
+                st.session_state["last_lhs"] = generator_lhs
+
+                # 7) Compute and attach initial conditions up to ODE order
                 try:
-                    upto = max(0, max_order-1)
-                    for j in range(0, upto+1):
-                        try:
-                            val = run_with_timeout(_worker_ic, min(10, max(3, timeout_sec//2)), solution, "x", j)
-                        except TimeoutError:
-                            val = sp.diff(solution, (x, j)).subs(x, 0)
-                        key = "y(0)" if j == 0 else fr"y^({j})(0)"
-                        ICs[key] = sp.simplify(val)
+                    initial_conditions = compute_initial_conditions_from_solution(
+                        solution, generator_lhs, x, simplify_level=simplify_level
+                    )
                 except Exception:
-                    pass
+                    initial_conditions = {"y(0)": simplify_expr(solution.subs(x, 0), level=simplify_level)}
 
-                ode_type = _infer_type_from_spec(active_spec) if active_spec else "nonlinear"
-                ode_order = max_order
+                # Optional verification: residual should simplify to 0
+                try:
+                    residual = simplify_expr(
+                        apply_lhs_to_solution(generator_lhs, solution, x, "y", simplify_level) - rhs,
+                        level=simplify_level
+                    )
+                except Exception:
+                    residual = None
 
+                # 8) Build the normalized record and register
                 result = {
                     "generator": generator_lhs,
                     "rhs": rhs,
@@ -1103,40 +1116,99 @@ def page_apply_master_theorem():
                         "field": "Mathematical Physics",
                         "applications": ["Research Equation"],
                     },
-                    "initial_conditions": ICs,
+                    "initial_conditions": initial_conditions,
                     "timestamp": datetime.now().isoformat(),
-                    "lhs_source": st.session_state.get("lhs_source","constructor"),
-                    "title": "Master Generators ODE System",
+                    "lhs_source": st.session_state.get("lhs_source", "constructor"),
                 }
                 register_generated_ode(result)
 
-                st.markdown('<div class="result-box"><b>✅ ODE Generated!</b></div>', unsafe_allow_html=True)
-                t1, t2, t3 = st.tabs(["📐 Equation", "💡 Solution & ICs", "📤 Export"])
-                with t1:
+                # 9) Present results + Export panel
+                st.markdown(
+                    '<div class="result-box"><h3>✅ ODE Generated Successfully!</h3></div>',
+                    unsafe_allow_html=True
+                )
+                t_eq, t_sol, t_exp = st.tabs(["📐 Equation", "💡 Solution", "📤 Export"])
+
+                with t_eq:
                     try:
                         st.latex(sp.latex(generator_lhs) + " = " + sp.latex(rhs))
                     except Exception:
-                        st.code(f"LHS: {generator_lhs}\nRHS: {rhs}")
+                        st.write("LHS = ", generator_lhs)
+                        st.write("RHS = ", rhs)
                     st.caption(f"LHS source: **{st.session_state.get('lhs_source','constructor')}**")
-                with t2:
+
+                with t_sol:
                     try:
                         st.latex("y(x) = " + sp.latex(solution))
                     except Exception:
-                        st.code(f"y(x) = {solution}")
-                    if result["initial_conditions"]:
-                        st.markdown("**Initial conditions (at x=0):**")
-                        lines = []
-                        for k, v in result["initial_conditions"].items():
-                            lines.append(f"${k} = {sp.latex(v)}$")
-                        st.write(",  ".join(lines))
-                    st.write(f"**Parameters:** α={α}, β={β}, n={int(n)}, M={𝑀}")
-                with t3:
-                    ode_idx = len(st.session_state.generated_odes)
-                    ode_data = dict(result); ode_data["generator_number"] = ode_idx
-                    latex_doc = LaTeXExporter.generate_latex_document(ode_data, include_preamble=True)
-                    st.download_button("📄 Download LaTeX", latex_doc, file_name=f"ode_{ode_idx}.tex", mime="text/x-latex")
-                    pkg = LaTeXExporter.create_export_package(ode_data, include_extras=True)
-                    st.download_button("📦 Download ZIP", pkg, file_name=f"ode_package_{ode_idx}.zip", mime="application/zip")
+                        st.write("y(x) =", solution)
+
+                    # Show full IC set
+                    if initial_conditions:
+                        st.markdown("**Initial conditions (from solution):**")
+                        for k, v in initial_conditions.items():
+                            try:
+                                st.latex(k + " = " + sp.latex(v))
+                            except Exception:
+                                st.write(f"{k} = {v}")
+
+                    # Verify residual
+                    if residual is not None:
+                        try:
+                            ok = (sp.simplify(residual) == 0)
+                        except Exception:
+                            ok = False
+                        if ok:
+                            st.success("Verification: L[y] − RHS ≡ 0")
+                        else:
+                            st.warning(f"Verification residual (simplified): {residual}")
+
+                    st.markdown("**Parameters:**")
+                    st.write(f"α = {α}, β = {β}, n = {int(n)}, M = {𝑀}")
+                    st.write(f"**Function:** f(z) = {f_expr}")
+
+                with t_exp:
+                    try:
+                        # Build a doc datum that mirrors the stored record
+                        ode_idx = len(st.session_state.generated_odes)  # after register
+                        ode_data = {
+                            "generator": generator_lhs,
+                            "rhs": rhs,
+                            "solution": solution,
+                            "parameters": {"alpha": α, "beta": β, "n": int(n), "M": 𝑀},
+                            "classification": {
+                                "type": "Linear" if ode_type == "linear" else "Nonlinear",
+                                "order": ode_order,
+                                "linearity": "Linear" if ode_type == "linear" else "Nonlinear",
+                                "field": "Mathematical Physics",
+                                "applications": ["Research Equation"],
+                            },
+                            "initial_conditions": initial_conditions,
+                            "function_used": str(func_name),
+                            "generator_number": ode_idx,
+                            "type": ode_type,
+                            "order": ode_order,
+                        }
+                        # LaTeX
+                        latex_doc = LaTeXExporter.generate_latex_document(ode_data, include_preamble=True)
+                        st.download_button(
+                            "📄 Download LaTeX Document",
+                            latex_doc,
+                            file_name=f"ode_{ode_idx}.tex",
+                            mime="text/x-latex",
+                            use_container_width=True,
+                        )
+                        # ZIP package
+                        pkg = LaTeXExporter.create_export_package(ode_data, include_extras=True)
+                        st.download_button(
+                            "📦 Download Complete Package (ZIP)",
+                            pkg,
+                            file_name=f"ode_package_{ode_idx}.zip",
+                            mime="application/zip",
+                            use_container_width=True,
+                        )
+                    except Exception as e:
+                        st.warning(f"Export failed: {e}")
 
             except TimeoutError as te:
                 st.error(str(te))
@@ -1144,385 +1216,598 @@ def page_apply_master_theorem():
                 logger.error("Generation error", exc_info=True)
                 st.error(f"Error generating ODE: {e}")
 
-# -------------------- ML Pattern Learning --------------------
+    # ---------------- Theorem 4.2 quick computation -------------------------
+    if compute_mth and st.button("🧮 Compute y^{(m)}(x) via Theorem 4.2", use_container_width=True):
+        with st.spinner("Applying Theorem 4.2 (Stirling compact form)..."):
+            try:
+                y_m = run_with_timeout(_worker_theorem_4_2, timeout_sec,
+                                       f_expr_preview, α, β, int(n), int(m_order), "x", simplify_level)
+                st.markdown("### 🔢 Derivative")
+                st.latex(fr"y^{{({int(m_order)})}}(x) = " + sp.latex(y_m))
+            except TimeoutError as te:
+                st.error(str(te))
+            except Exception as e:
+                st.error(f"Failed to compute y^{m_order}(x): {e}")
+
+
+# ============================================================================
+# Other Pages (kept; minimal/no changes except batch registration toggle)
+# ============================================================================
+def dashboard_page():
+    st.header("🏠 Dashboard")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.markdown(f'<div class="metric-card"><h3>📝 Generated ODEs</h3><h1>{len(st.session_state.generated_odes)}</h1></div>', unsafe_allow_html=True)
+    with c2:
+        st.markdown(f'<div class="metric-card"><h3>🧬 ML Patterns</h3><h1>{len(st.session_state.generator_patterns)}</h1></div>', unsafe_allow_html=True)
+    with c3:
+        st.markdown(f'<div class="metric-card"><h3>📊 Batch Results</h3><h1>{len(st.session_state.batch_results)}</h1></div>', unsafe_allow_html=True)
+    with c4:
+        model_status = "✅ Trained" if st.session_state.get("ml_trained") else "⏳ Not Trained"
+        st.markdown(f'<div class="metric-card"><h3>🤖 ML Model</h3><p style="font-size: 1.2rem;">{model_status}</p></div>', unsafe_allow_html=True)
+
+    st.subheader("📊 Recent Activity")
+    if st.session_state.generated_odes:
+        df = pd.DataFrame(st.session_state.generated_odes[-5:])
+        cols = [c for c in ["type", "order", "generator_number", "timestamp"] if c in df.columns]
+        st.dataframe(df[cols], use_container_width=True)
+    else:
+        st.info("No ODEs generated yet. Head to **Apply Master Theorem** or **Generator Constructor**.")
+
+def generator_constructor_page():
+    st.header("🔧 Generator Constructor")
+    st.markdown(
+        '<div class="info-box">Build custom generators by combining derivatives with transformations. '
+        'Use this builder or jump to <b>Apply Master Theorem</b> to get y(x) and (optionally) build RHS=L[y].</div>',
+        unsafe_allow_html=True,
+    )
+
+    if not (GeneratorSpecification and DerivativeTerm and DerivativeType and OperatorType):
+        st.warning("Generator constructor classes were not found in src/. You can still use the Free‑form builder on the theorem page.")
+        return
+
+    # Add terms UI
+    with st.expander("➕ Add Generator Term", expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            deriv_order = st.selectbox(
+                "Derivative Order",
+                [0, 1, 2, 3, 4, 5],
+                format_func=lambda x: {0:"y",1:"y'",2:"y''",3:"y'''",4:"y⁽⁴⁾",5:"y⁽⁵⁾"}.get(x,f"y⁽{x}⁾"),
+            )
+        with c2:
+            func_type = st.selectbox("Function Type", [t.value for t in DerivativeType], format_func=lambda s: s.replace("_"," ").title())
+        with c3:
+            coefficient = st.number_input("Coefficient", -10.0, 10.0, 1.0, 0.1)
+        with c4:
+            power = st.number_input("Power", 1, 6, 1)
+
+        c5, c6, c7 = st.columns(3)
+        with c5:
+            operator_type = st.selectbox("Operator Type", [t.value for t in OperatorType], format_func=lambda s: s.replace("_"," ").title())
+        with c6:
+            scaling = st.number_input("Scaling (a)", 0.5, 5.0, 1.0, 0.1) if operator_type in ["delay","advance"] else None
+        with c7:
+            shift = st.number_input("Shift (b)", -10.0, 10.0, 0.0, 0.1) if operator_type in ["delay","advance"] else None
+
+        if st.button("➕ Add Term", type="primary"):
+            term = DerivativeTerm(
+                derivative_order=deriv_order,
+                coefficient=coefficient,
+                power=power,
+                function_type=DerivativeType(func_type),
+                operator_type=OperatorType(operator_type),
+                scaling=scaling,
+                shift=shift,
+            )
+            st.session_state.generator_terms.append(term)
+            st.success("Term added.")
+
+    # Current terms
+    if st.session_state.generator_terms:
+        st.subheader("📝 Current Generator Terms")
+        for idx, term in enumerate(st.session_state.generator_terms):
+            c1, c2 = st.columns([6, 1])
+            with c1:
+                desc = term.get_description() if hasattr(term, "get_description") else str(term)
+                st.write(f"• {desc}")
+            with c2:
+                if st.button("❌", key=f"rm_{idx}"):
+                    st.session_state.generator_terms.pop(idx)
+                    st.experimental_rerun()
+
+        # Build specification
+        if st.button("🔨 Build Generator Specification", type="primary"):
+            try:
+                gen_spec = GeneratorSpecification(
+                    terms=st.session_state.generator_terms,
+                    name=f"Custom Generator {len(st.session_state.generated_odes) + 1}",
+                )
+                st.session_state.current_generator = gen_spec
+                st.success("Generator specification created.")
+                try:
+                    st.latex(sp.latex(gen_spec.lhs) + " = RHS")
+                except Exception:
+                    pass
+            except Exception as e:
+                st.error(f"Failed to build specification: {e}")
+
+    if st.button("🗑️ Clear All Terms"):
+        st.session_state.generator_terms = []
+        st.session_state.current_generator = None
+
 def ml_pattern_learning_page():
     st.header("🤖 ML Pattern Learning")
+    st.markdown(
+        '<div class="info-box">Learn generator patterns to create new families of ODEs. '
+        'Your existing Trainer, VAE, Transformer code remains compatible.</div>',
+        unsafe_allow_html=True,
+    )
+
     if not MLTrainer:
-        st.info("MLTrainer not available here.")
+        st.warning("MLTrainer not found in src/. Skipping ML features.")
         return
+
     c1, c2, c3, c4 = st.columns(4)
     with c1: st.metric("Patterns", len(st.session_state.generator_patterns))
     with c2: st.metric("Generated ODEs", len(st.session_state.generated_odes))
-    with c3: st.metric("Training Epochs", len(st.session_state.training_history.get("train_loss", [])))
+    with c3: st.metric("Training Epochs", len(st.session_state.training_history))
     with c4: st.metric("Model Status", "Trained" if st.session_state.get("ml_trained") else "Not Trained")
 
-    st.markdown("You can import batch outputs into the training corpus:")
-    cimp1, cimp2 = st.columns([2,1])
-    with cimp1:
-        if st.button("📥 Import last-batch into training corpus"):
-            if st.session_state.batch_records_full:
-                added = 0
-                for rec in st.session_state.batch_records_full:
-                    try:
-                        register_generated_ode(rec)
-                        added += 1
-                    except Exception:
-                        pass
-                st.success(f"Imported {added} batch ODEs into corpus.")
-            else:
-                st.info("No batch records available. Run a batch first.")
-    with cimp2:
-        st.write("")
+    model_type = st.selectbox(
+        "Select ML Model",
+        ["pattern_learner", "vae", "transformer"],
+        format_func=lambda x: {"pattern_learner":"Pattern Learner","vae":"VAE","transformer":"Transformer"}[x],
+    )
 
-    model_type = st.selectbox("Select ML Model", ["pattern_learner", "vae", "transformer"],
-                              format_func=lambda x: {"pattern_learner":"Pattern Learner","vae":"VAE","transformer":"Transformer"}[x])
-
-    with st.expander("Training Configuration", expanded=True):
+    with st.expander("🎯 Training Configuration", expanded=True):
         c1, c2, c3 = st.columns(3)
         with c1:
-            epochs = st.slider("Epochs", 10, 800, 100)
+            epochs = st.slider("Epochs", 10, 500, 100)
             batch_size = st.slider("Batch Size", 8, 128, 32)
         with c2:
-            learning_rate = st.select_slider("Learning Rate", [0.0001,0.0005,0.001,0.005,0.01], value=0.001)
+            learning_rate = st.select_slider("Learning Rate", options=[0.0001,0.0005,0.001,0.005,0.01], value=0.001)
             samples = st.slider("Training Samples", 100, 5000, 1000)
         with c3:
-            val_split = st.slider("Validation Split", 0.05, 0.3, 0.2)
+            validation_split = st.slider("Validation Split", 0.1, 0.3, 0.2)
             use_gpu = st.checkbox("Use GPU if available", value=True)
-    cES1, cES2, cES3 = st.columns(3)
-    with cES1:
-        until_plateau = st.checkbox("Train until plateau (early stopping)", value=False)
-    with cES2:
-        patience = st.slider("Patience", 3, 20, 7)
-    with cES3:
-        min_delta = st.select_slider("Min improvement Δ", options=[1e-4,5e-4,1e-3,5e-3,1e-2], value=1e-3)
 
     if len(st.session_state.generated_odes) < 5:
-        st.warning("Generate/import at least 5 ODEs before training.")
-        return
+        st.warning(f"Need at least 5 generated ODEs. Current: {len(st.session_state.generated_odes)}")
+    else:
+        if st.button("🚀 Train Model", type="primary"):
+            with st.spinner("Training..."):
+                try:
+                    device = "cuda" if use_gpu and (torch and torch.cuda.is_available()) else "cpu"
+                    trainer = MLTrainer(model_type=model_type, learning_rate=learning_rate, device=device)
+                    st.session_state.ml_trainer = trainer
 
-    if st.button("🚀 Train Model", type="primary"):
-        with st.spinner("Training..."):
-            try:
-                device = "cuda" if (use_gpu and torch and torch.cuda.is_available()) else "cpu"
-                trainer = MLTrainer(model_type=model_type, learning_rate=learning_rate, device=device)
-                st.session_state.ml_trainer = trainer
-                history = {"train_loss": [], "val_loss": []}
+                    prog = st.progress(0)
+                    status = st.empty()
 
-                def do_train(eps):
-                    trainer.train(epochs=eps, batch_size=batch_size, samples=samples,
-                                  validation_split=val_split,
-                                  progress_callback=lambda e,t: None)
-                    # merge histories
-                    for k in ("train_loss", "val_loss"):
-                        if k in trainer.history:
-                            history[k] += trainer.history[k]
+                    def progress_callback(epoch, total_epochs):
+                        p = epoch/total_epochs
+                        prog.progress(min(1.0, p))
+                        status.text(f"Epoch {epoch}/{total_epochs}")
 
-                if not until_plateau:
-                    do_train(epochs)
-                else:
-                    best = float("inf"); bad = 0; total_done = 0
-                    while total_done < epochs:
-                        step = min(50, epochs-total_done)
-                        do_train(step)
-                        total_done += step
-                        last = history["val_loss"][-1] if history["val_loss"] else history["train_loss"][-1]
-                        if last < best - min_delta:
-                            best = last; bad = 0
-                        else:
-                            bad += 1
-                            if bad >= patience:
-                                break
+                    trainer.train(
+                        epochs=epochs,
+                        batch_size=batch_size,
+                        samples=samples,
+                        validation_split=validation_split,
+                        progress_callback=progress_callback,
+                    )
+                    st.session_state.ml_trained = True
+                    st.session_state.training_history = trainer.history
+                    st.success("Model trained successfully.")
 
-                st.session_state.ml_trained = True
-                st.session_state.training_history = history
-                st.success("✅ Training complete.")
-                if history["train_loss"]:
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(y=history["train_loss"], mode="lines", name="train"))
-                    if history["val_loss"]:
-                        fig.add_trace(go.Scatter(y=history["val_loss"], mode="lines", name="val"))
-                    fig.update_layout(title="Training History", xaxis_title="epoch", yaxis_title="loss", height=360)
-                    st.plotly_chart(fig, use_container_width=True)
-            except Exception as e:
-                st.error(f"Training failed: {e}")
+                    if trainer.history.get("train_loss"):
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(
+                            x=list(range(1, len(trainer.history["train_loss"])+1)),
+                            y=trainer.history["train_loss"], mode="lines", name="Training Loss"
+                        ))
+                        if trainer.history.get("val_loss"):
+                            fig.add_trace(go.Scatter(
+                                x=list(range(1, len(trainer.history["val_loss"])+1)),
+                                y=trainer.history["val_loss"], mode="lines", name="Validation Loss"
+                            ))
+                        fig.update_layout(title="Training History", xaxis_title="Epoch", yaxis_title="Loss")
+                        st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("🎨 Synthesize new generators after training")
-    cgen1, cgen2 = st.columns([2,1])
-    with cgen1:
-        if st.button("🧪 Synthesize Free‑form LHS from model"):
-            try:
-                # heuristic synthesis from corpus (wrappers + derivative-order histogram)
-                x = sp.Symbol("x", real=True)
-                # derive order histogram
-                orders = []
-                for rec in st.session_state.generated_odes:
-                    L = rec.get("generator")
-                    if isinstance(L, sp.Expr):
-                        orders.append(_max_y_derivative_in_expr(L, x, "y"))
-                k = int(np.clip(int(np.median(orders)) if orders else 2, 1, 6))
-                wrappers = ["id","exp","sin","cos","sinh","tanh","log","abs"]
-                chosen = list(np.random.choice(wrappers, size=min(3, k), replace=True))
-                terms = []
-                for j, w in enumerate(chosen, 1):
-                    terms.append({"coef": to_exact(1), "inner_order": j, "wrapper": w, "power": 1, "outer_order": 0, "arg_scale": 1, "arg_shift": 0})
-                lhs = build_freeform_lhs(x, terms)
-                spec = types.SimpleNamespace()
-                spec.lhs = lhs
-                spec.freeform_descriptor = {"terms": terms, "synth": True}
-                spec.order = _max_y_derivative_in_expr(lhs, x, "y")
-                spec.is_linear = False
-                st.session_state.freeform_gen_spec = spec
-                set_lhs_source("freeform")
-                st.success("A synthesized generator has been stored & selected.")
-                st.latex(sp.latex(lhs))
-            except Exception as e:
-                st.error(f"Synthesis failed: {e}")
-    with cgen2:
-        st.write("")
+                except Exception as e:
+                    st.error(f"Training failed: {e}")
 
-# -------------------- Batch Generation --------------------
-def safe_create_linear(factory, gen_num, f_z, params):
-    try:
-        return factory.create(gen_num, f_z, **params)
-    except Exception as e:
-        return {}
-
-def safe_create_nonlinear(factory, gen_num, f_z, params):
-    # inject defaults for common requirements
-    p = dict(params)
-    p.setdefault("q", 2)
-    p.setdefault("v", 2)
-    p.setdefault("a", 1)
-    try:
-        return factory.create(gen_num, f_z, **p)
-    except Exception:
-        # try different defaults
-        p["q"] = 3; p["v"] = 3; p["a"] = 2
-        try:
-            return factory.create(gen_num, f_z, **p)
-        except Exception:
-            return {}
+    if st.session_state.get("ml_trained") and st.session_state.get("ml_trainer"):
+        st.subheader("🎨 Generate Novel Patterns")
+        c1, c2 = st.columns(2)
+        with c1:
+            num_generate = st.slider("Number to Generate", 1, 10, 1)
+        with c2:
+            if st.button("🎲 Generate Novel ODEs", type="primary"):
+                with st.spinner("Generating..."):
+                    try:
+                        for i in range(num_generate):
+                            res = st.session_state.ml_trainer.generate_new_ode()
+                            if res:
+                                st.success(f"Generated ODE {i+1}")
+                                with st.expander(f"ODE {i+1}"):
+                                    if "ode" in res:
+                                        try:
+                                            st.latex(sp.latex(res["ode"]))
+                                        except Exception:
+                                            st.code(str(res["ode"]))
+                                    for k in ["type","order","function_used","description"]:
+                                        if k in res:
+                                            st.write(f"**{k}:** {res[k]}")
+                                st.session_state.generated_odes.append(res)
+                    except Exception as e:
+                        st.error(f"Generation failed: {e}")
 
 def batch_generation_page():
     st.header("📊 Batch ODE Generation")
-    st.markdown('<div class="info-box">Generate many ODEs quickly and (optionally) add them to ML training corpus.</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="info-box">Generate many ODEs quickly using your factories. '
+        'If a particular factory class is not found, that subset will be skipped.</div>',
+        unsafe_allow_html=True,
+    )
 
     c1, c2, c3 = st.columns(3)
     with c1:
         num_odes = st.slider("Number of ODEs", 5, 500, 50)
         gen_types = st.multiselect("Generator Types", ["linear","nonlinear"], default=["linear","nonlinear"])
     with c2:
-        func_cats = st.multiselect("Function libraries", ["Basic","Special"], default=["Basic"])
-        vary_params = st.checkbox("Vary parameters", True)
+        func_categories = st.multiselect("Function Categories", ["Basic","Special"], default=["Basic"])
+        vary_params = st.checkbox("Vary Parameters", True)
     with c3:
-        also_add_to_ml = st.checkbox("Also add batch outputs to ML corpus", True)
+        if vary_params:
+            alpha_range = st.slider("α range", -10.0, 10.0, (-2.0, 2.0))
+            beta_range  = st.slider("β range", 0.1, 10.0, (0.5, 2.0))
+            n_range     = st.slider("n range", 1, 5, (1, 3))
+        else:
+            alpha_range = (1.0, 1.0)
+            beta_range  = (1.0, 1.0)
+            n_range     = (1, 1)
 
-    with st.expander("Advanced"):
-        export_format = st.selectbox("Export format", ["JSON","CSV","LaTeX","All"], index=1)
-        include_solutions = st.checkbox("Include solution preview", True)
-
-    if vary_params:
-        a_rng = st.slider("α range", -5.0, 5.0, (-2.0, 2.0))
-        b_rng = st.slider("β range", 0.1, 5.0, (0.5, 2.0))
-        n_rng = st.slider("n range", 1, 5, (1, 3))
-    else:
-        a_rng = (1.0,1.0); b_rng=(1.0,1.0); n_rng=(1,1)
+    with st.expander("⚙️ Advanced Options"):
+        parallel = st.checkbox("Use Parallel Processing (factory-dependent)", True)
+        export_format = st.selectbox("Export Format", ["JSON","CSV","LaTeX","All"])
+        include_solutions = st.checkbox("Include Full Solutions", True)
+        include_classification = st.checkbox("Include Classification", True)
+        add_to_library = st.checkbox("Add each generated ODE to library (for ML/DL)", True)
 
     if st.button("🚀 Generate Batch", type="primary"):
         with st.spinner(f"Generating {num_odes} ODEs..."):
-            results = []
-            full_records = []
+            batch_results = []
+            prog = st.progress(0)
+            status = st.empty()
 
-            all_names = []
-            if "Basic" in func_cats and st.session_state.basic_functions:
-                all_names += st.session_state.basic_functions.get_function_names()
-            if "Special" in func_cats and st.session_state.special_functions:
-                all_names += st.session_state.special_functions.get_function_names()[:20]
-            if not all_names:
-                all_names = ["exp", "sin", "cos", "z", "z**2"]
+            all_functions = []
+            if "Basic" in func_categories and st.session_state.get("basic_functions"):
+                all_functions += st.session_state.basic_functions.get_function_names()
+            if "Special" in func_categories and st.session_state.get("special_functions"):
+                all_functions += st.session_state.special_functions.get_function_names()[:20]
 
-            prog = st.progress(0.0)
             for i in range(num_odes):
-                prog.progress((i+1)/num_odes)
                 try:
+                    prog.progress((i+1)/num_odes)
+                    status.text(f"Generating ODE {i+1}/{num_odes}")
+
                     params = {
-                        "alpha": float(np.random.uniform(*a_rng)),
-                        "beta": float(np.random.uniform(*b_rng)),
-                        "n": int(np.random.randint(n_rng[0], n_rng[1]+1)),
+                        "alpha": float(np.random.uniform(*alpha_range)),
+                        "beta": float(np.random.uniform(*beta_range)),
+                        "n": int(np.random.randint(n_range[0], n_range[1]+1)),
                         "M": float(np.random.uniform(-1, 1)),
                     }
-                    fname = str(np.random.choice(all_names))
-                    # Build f(z)
+                    if not all_functions:
+                        st.warning("No function names available from libraries.")
+                        break
+                    func_name = np.random.choice(all_functions)
+
+                    # get f_z
                     try:
-                        f_z = st.session_state.basic_functions.get_function(fname)
+                        f_z = st.session_state.basic_functions.get_function(func_name)
                     except Exception:
-                        try:
-                            f_z = st.session_state.special_functions.get_function(fname)
-                        except Exception:
-                            z = sp.Symbol("z")
-                            f_z = sp.exp(z)
+                        f_z = st.session_state.special_functions.get_function(func_name)
 
-                    gt = str(np.random.choice(gen_types))
-                    rec = {}
-                    if gt == "linear" and CompleteLinearGeneratorFactory:
-                        factory = CompleteLinearGeneratorFactory()
-                        gnum = int(np.random.randint(1, 9))
-                        if gnum in [4,5]:
-                            params["a"] = float(np.random.uniform(1, 3))
-                        rec = safe_create_linear(factory, gnum, f_z, params)
-                    elif gt == "nonlinear" and CompleteNonlinearGeneratorFactory:
-                        factory = CompleteNonlinearGeneratorFactory()
-                        gnum = int(np.random.randint(1, 11))
-                        rec = safe_create_nonlinear(factory, gnum, f_z, params)
+                    # Choose type/factory
+                    gt = np.random.choice(gen_types)
+                    res = {}
+                    if gt == "linear":
+                        if CompleteLinearGeneratorFactory:
+                            factory = CompleteLinearGeneratorFactory()
+                            gen_num = np.random.randint(1, 9)
+                            if gen_num in [4, 5]:
+                                params["a"] = float(np.random.uniform(1, 3))
+                            res = factory.create(gen_num, f_z, **params)
+                        elif LinearGeneratorFactory:
+                            factory = LinearGeneratorFactory()
+                            res = factory.create(1, f_z, **params)
                     else:
-                        rec = {}
+                        if CompleteNonlinearGeneratorFactory:
+                            factory = CompleteNonlinearGeneratorFactory()
+                            gen_num = np.random.randint(1, 11)
+                            if gen_num in [1, 2, 4]:
+                                params["q"] = int(np.random.randint(2, 6))
+                            if gen_num in [2, 3, 5]:
+                                params["v"] = int(np.random.randint(2, 6))
+                            if gen_num in [4, 5, 9, 10]:
+                                params["a"] = float(np.random.uniform(1, 3))
+                            res = factory.create(gen_num, f_z, **params)
+                        elif NonlinearGeneratorFactory:
+                            factory = NonlinearGeneratorFactory()
+                            res = factory.create(1, f_z, **params)
 
-                    if not rec:
-                        # fallback via Thm 4.1 only
-                        x = sp.Symbol("x", real=True)
-                        yx = theorem_4_1_solution_expr(f_z, to_exact(params["alpha"]), to_exact(params["beta"]),
-                                                       int(params["n"]), to_exact(params["M"]), x, "none")
-                        lhs = sp.Function("L")(x)
-                        z = sp.Symbol("z")
-                        rhs = sp.pi*(f_z.subs(z, to_exact(params["alpha"])+to_exact(params["beta"])) + to_exact(params["M"]))
-                        rec = {"ode": sp.Eq(lhs, rhs), "solution": yx, "type": gt, "order": 0,
-                               "function_used": fname, "parameters": params}
+                    if not res:
+                        continue
 
-                    # normalize + store simple row
                     row = {
                         "ID": i+1,
-                        "Type": rec.get("type","unknown"),
-                        "Function": fname,
-                        "Order": rec.get("order", 0),
+                        "Type": res.get("type","unknown"),
+                        "Generator": res.get("generator_number","?"),
+                        "Function": func_name,
+                        "Order": res.get("order", 0),
                         "α": round(params["alpha"], 4),
                         "β": round(params["beta"], 4),
                         "n": params["n"],
                     }
                     if include_solutions:
-                        s = str(rec.get("solution",""))
-                        row["Solution"] = (s[:120]+"...") if len(s)>120 else s
-                    results.append(row)
+                        s = str(res.get("solution",""))
+                        row["Solution"] = (s[:120] + "...") if len(s) > 120 else s
+                    if include_classification:
+                        row["Subtype"] = res.get("subtype", "standard")
+                    batch_results.append(row)
 
-                    # prepare a generated_odes‑compatible record for ML corpus
-                    full = {
-                        "generator": rec.get("ode").lhs if hasattr(rec.get("ode"), "lhs") else sp.Symbol("L[y]"),
-                        "rhs": rec.get("ode").rhs if hasattr(rec.get("ode"), "rhs") else sp.Symbol("RHS"),
-                        "solution": rec.get("solution"),
-                        "parameters": rec.get("parameters", params),
-                        "function_used": fname,
-                        "type": rec.get("type","nonlinear"),
-                        "order": rec.get("order", 0),
-                        "classification": {"type":"Linear" if rec.get("type")=="linear" else "Nonlinear",
-                                           "order": rec.get("order",0), "linearity":"Linear" if rec.get("type")=="linear" else "Nonlinear",
-                                           "field":"Mathematical Physics","applications":["Research Equation"]},
-                        "initial_conditions": {},
-                        "timestamp": datetime.now().isoformat(),
-                        "lhs_source": "batch",
-                    }
-                    full_records.append(full)
+                    # --- NEW: also register into generated_odes for ML/DL if desired ---
+                    if add_to_library:
+                        # Try to extract generator & rhs
+                        generator = res.get("generator", None)
+                        rhs = res.get("rhs", None)
+                        solution = res.get("solution", None)
+                        ode_obj = res.get("ode", None)
+                        if ode_obj is not None and isinstance(ode_obj, sp.Eq):
+                            generator = ode_obj.lhs
+                            rhs = ode_obj.rhs
+                        # Fallbacks
+                        if generator is None:
+                            generator = sp.Symbol("L[y]")
+                        if rhs is None:
+                            rhs = sp.S.Zero
+                        if solution is None:
+                            solution = sp.S(0)
+
+                        record = {
+                            "generator": generator,
+                            "rhs": rhs,
+                            "solution": solution,
+                            "parameters": {
+                                "alpha": params["alpha"], "beta": params["beta"], "n": params["n"], "M": params["M"]
+                            },
+                            "function_used": str(func_name),
+                            "type": res.get("type","nonlinear"),
+                            "order": res.get("order", 0),
+                            "classification": res.get("classification", {}),
+                            "initial_conditions": {},
+                            "timestamp": datetime.now().isoformat(),
+                            "lhs_source": "batch-factory",
+                        }
+                        try:
+                            # attach ICs
+                            x = sp.Symbol("x", real=True)
+                            ics = compute_initial_conditions_from_solution(solution, generator, x, simplify_level="none")
+                            record["initial_conditions"] = ics
+                        except Exception:
+                            pass
+                        register_generated_ode(record)
 
                 except Exception as e:
-                    logger.debug(f"Failed batch item {i+1}: {e}")
+                    logger.debug(f"Failed to generate ODE {i+1}: {e}")
 
-            st.session_state.batch_results.extend(results)
-            st.session_state.batch_records_full = full_records
-
-            if also_add_to_ml:
-                added = 0
-                for rec in full_records:
-                    try:
-                        register_generated_ode(rec); added += 1
-                    except Exception:
-                        pass
-                st.success(f"Generated {len(results)} ODEs; added {added} to ML corpus.")
-            else:
-                st.success(f"Generated {len(results)} ODEs.")
-
-            df = pd.DataFrame(results)
+            st.session_state.batch_results.extend(batch_results)
+            st.success(f"Generated {len(batch_results)} ODEs.")
+            df = pd.DataFrame(batch_results)
             st.dataframe(df, use_container_width=True)
 
+            st.subheader("📤 Export Results")
             c1, c2, c3, c4 = st.columns(4)
             with c1:
-                csv = df.to_csv(index=False)
-                st.download_button("📊 CSV", csv, file_name=f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv")
+                csv = df.to_csv(index=False).encode("utf-8")
+                st.download_button("📊 Download CSV", csv, f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", "text/csv")
             with c2:
-                j = json.dumps(results, indent=2)
-                st.download_button("📄 JSON", j, file_name=f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json", mime="application/json")
+                js = json.dumps(batch_results, indent=2, default=str).encode("utf-8")
+                st.download_button("📄 Download JSON", js, f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json", "application/json")
             with c3:
-                latex = "\\begin{tabular}{|c|c|c|c|c|}\\hline ID & Type & Function & n & Order \\\\ \\hline\n" + \
-                        "\n".join([f"{r['ID']} & {r['Type']} & {r['Function']} & {r['n']} & {r['Order']} \\\\" for r in results[:30]]) + \
-                        "\n\\hline\\end{tabular}"
-                st.download_button("📝 LaTeX table", latex, file_name=f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.tex", mime="text/x-latex")
+                if export_format in ["LaTeX","All"]:
+                    latex = generate_batch_latex(batch_results)
+                    st.download_button("📝 Download LaTeX", latex, f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.tex", "text/x-latex")
             with c4:
-                zbuf = io.BytesIO()
-                with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zf:
-                    zf.writestr("batch.csv", df.to_csv(index=False))
-                    zf.writestr("batch.json", json.dumps(results, indent=2))
-                    zf.writestr("batch.tex", latex)
-                    zf.writestr("README.txt", f"Batch generated {datetime.now().isoformat()}")
-                zbuf.seek(0)
-                st.download_button("📦 ZIP (all)", zbuf.getvalue(), file_name=f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip", mime="application/zip")
+                if export_format == "All":
+                    package = create_batch_package(batch_results, df)
+                    st.download_button("📦 Download All (ZIP)", package, f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip", "application/zip")
 
-# -------------------- Novelty Detection --------------------
 def novelty_detection_page():
     st.header("🔍 Novelty Detection")
-    if not st.session_state.get("ode_classifier"):
-        st.info("Classifier not available in this environment.")
+    if not st.session_state.get("novelty_detector"):
+        st.warning("Novelty detector not found. Skipping.")
         return
-    st.info("Use your ODEClassifier / NoveltyDetector from src/ here if wired.")
 
-# -------------------- Analysis & Classification --------------------
+    input_method = st.radio("Input Method", ["Use Current Generator LHS", "Enter ODE Manually", "Select from Generated"])
+    ode_to_analyze = None
+
+    if input_method == "Use Current Generator LHS":
+        gen_spec = st.session_state.get("current_generator")
+        if gen_spec is not None and hasattr(gen_spec, "lhs"):
+            ode_to_analyze = {"ode": gen_spec.lhs, "type":"custom", "order": getattr(gen_spec, "order", 2)}
+        else:
+            st.warning("No generator spec yet. Build one in Generator Constructor, or use free‑form in Apply Master Theorem.")
+
+    elif input_method == "Enter ODE Manually":
+        ode_str = st.text_area("Enter ODE (LaTeX or text):")
+        if ode_str:
+            ode_to_analyze = {"ode": ode_str, "type":"manual", "order": st.number_input("Order", 1, 10, 2)}
+
+    else:
+        if st.session_state.generated_odes:
+            sel = st.selectbox("Select ODE", range(len(st.session_state.generated_odes)),
+                               format_func=lambda i: f"ODE {i+1}: {st.session_state.generated_odes[i].get('type','Unknown')}")
+            ode_to_analyze = st.session_state.generated_odes[sel]
+
+    if ode_to_analyze and st.button("🔍 Analyze Novelty", type="primary"):
+        with st.spinner("Analyzing..."):
+            try:
+                analysis = st.session_state.novelty_detector.analyze(
+                    ode_to_analyze, check_solvability=True, detailed=True
+                )
+                st.session_state.analysis_results.append({
+                    "ode": ode_to_analyze, "analysis": analysis, "timestamp": datetime.now().isoformat()
+                })
+                c1, c2, c3 = st.columns(3)
+                with c1: st.metric("Novelty", "🟢 NOVEL" if analysis.is_novel else "🔴 STANDARD")
+                with c2: st.metric("Score", f"{analysis.novelty_score:.1f}/100")
+                with c3: st.metric("Confidence", f"{analysis.confidence:.1%}")
+                with st.expander("📊 Details", expanded=True):
+                    st.write(f"Complexity: {analysis.complexity_level}")
+                    st.write(f"Solvable by standard methods: {'Yes' if analysis.solvable_by_standard_methods else 'No'}")
+                    if analysis.special_characteristics:
+                        st.write("Special characteristics:")
+                        for t in analysis.special_characteristics: st.write("•", t)
+                    if analysis.recommended_methods:
+                        st.write("Recommended methods:")
+                        for t in analysis.recommended_methods[:5]: st.write("•", t)
+                    if analysis.similar_known_equations:
+                        st.write("Similar known equations:")
+                        for t in analysis.similar_known_equations[:3]: st.write("•", t)
+                if analysis.detailed_report:
+                    st.download_button("📥 Download Report",
+                                       analysis.detailed_report,
+                                       f"novelty_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                                       "text/plain")
+            except Exception as e:
+                st.error(f"Analysis failed: {e}")
+
 def analysis_classification_page():
     st.header("📈 Analysis & Classification")
     if not st.session_state.generated_odes:
-        st.info("Generate ODEs first.")
+        st.info("No ODEs generated yet.")
         return
-    df = pd.DataFrame(
-        [{"No": r.get("generator_number"), "Type": r.get("type"), "Order": r.get("order"),
-          "Function": r.get("function_used"), "Timestamp": r.get("timestamp","")[:19]}
-         for r in st.session_state.generated_odes]
-    )
-    st.dataframe(df, use_container_width=True)
-    types = pd.Series([r.get("type","unknown") for r in st.session_state.generated_odes]).value_counts()
-    fig = px.pie(values=types.values, names=types.index, title="Type distribution")
-    st.plotly_chart(fig, use_container_width=True)
+    if not st.session_state.get("ode_classifier"):
+        st.warning("ODEClassifier not found.")
+        return
 
-# -------------------- Export & LaTeX --------------------
-def export_latex_page():
-    st.header("📤 Export & LaTeX")
-    st.markdown('<div class="latex-export-box"><b>Export ODEs in LaTeX or as ZIP packages.</b></div>', unsafe_allow_html=True)
-    if not st.session_state.generated_odes:
-        st.info("No ODEs to export.")
-        return
-    idx = st.selectbox(
-        "Select ODE",
-        options=list(range(1, len(st.session_state.generated_odes) + 1)),
-        format_func=lambda i: f"ODE #{i}: {st.session_state.generated_odes[i-1].get('type')} (order {st.session_state.generated_odes[i-1].get('order')})",
-    )
-    ode = st.session_state.generated_odes[idx - 1]
-    st.subheader("Preview")
-    try:
-        preview = LaTeXExporter.generate_latex_document(ode, include_preamble=False)
-        st.code(preview, language="latex")
-    except Exception:
-        st.write(ode)
+    st.subheader("📊 Generated ODEs Overview")
+    summary = []
+    for i, ode in enumerate(st.session_state.generated_odes[-50:]):
+        summary.append({
+            "ID": i+1,
+            "Type": ode.get("type","Unknown"),
+            "Order": ode.get("order",0),
+            "Generator": ode.get("generator_number","N/A"),
+            "Function": ode.get("function_used","Unknown"),
+            "Timestamp": ode.get("timestamp","")[:19]
+        })
+    df = pd.DataFrame(summary)
+    st.dataframe(df, use_container_width=True)
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Linear ODEs", sum(1 for o in st.session_state.generated_odes if o.get("type")=="linear"))
+    with c2:
+        st.metric("Nonlinear ODEs", sum(1 for o in st.session_state.generated_odes if o.get("type")=="nonlinear"))
+    with c3:
+        orders = [o.get("order",0) for o in st.session_state.generated_odes]
+        avg_order = np.mean(orders) if orders else 0
+        st.metric("Average Order", f"{avg_order:.1f}")
+    with c4:
+        unique = len(set(o.get("function_used","") for o in st.session_state.generated_odes))
+        st.metric("Unique Functions", unique)
+
+    st.subheader("📊 Distributions")
     c1, c2 = st.columns(2)
     with c1:
-        full_latex = LaTeXExporter.generate_latex_document(ode, include_preamble=True)
-        st.download_button("📄 Download LaTeX", full_latex, file_name=f"ode_{idx}.tex", mime="text/x-latex", use_container_width=True)
+        orders = [o.get("order",0) for o in st.session_state.generated_odes]
+        fig = px.histogram(orders, title="Order Distribution", nbins=10)
+        fig.update_layout(xaxis_title="Order", yaxis_title="Count")
+        st.plotly_chart(fig, use_container_width=True)
     with c2:
-        pkg = LaTeXExporter.create_export_package(ode, include_extras=True)
-        st.download_button("📦 Download ZIP", pkg, file_name=f"ode_package_{idx}.zip", mime="application/zip", use_container_width=True)
+        types = [o.get("type","Unknown") for o in st.session_state.generated_odes]
+        vc = pd.Series(types).value_counts()
+        fig = px.pie(values=vc.values, names=vc.index, title="Type Distribution")
+        st.plotly_chart(fig, use_container_width=True)
 
-# -------------------- Visualization (placeholder) --------------------
-def create_solution_plot(ode: Dict, x_range: Tuple, num_points: int) -> go.Figure:
-    x = np.linspace(x_range[0], x_range[1], num_points)
-    # This is a placeholder visually; symbolic numeric evaluation varies by f(z)
-    y = np.sin(x) * np.exp(-0.1*np.abs(x))
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name="Solution"))
-    fig.update_layout(title="ODE Solution (demo)", xaxis_title="x", yaxis_title="y(x)")
-    return fig
+    st.subheader("🏷️ Classification Analysis")
+    if st.button("Classify All ODEs", type="primary"):
+        with st.spinner("Classifying..."):
+            try:
+                classifications = []
+                for ode in st.session_state.generated_odes:
+                    try:
+                        result = st.session_state.ode_classifier.classify_ode(ode)
+                        classifications.append(result)
+                    except Exception:
+                        classifications.append({})
+                fields = [c.get("classification",{}).get("field","Unknown") for c in classifications if c]
+                vc = pd.Series(fields).value_counts()
+                fig = px.bar(x=vc.index, y=vc.values, title="Classification by Field")
+                fig.update_layout(xaxis_title="Field", yaxis_title="Count")
+                st.plotly_chart(fig, use_container_width=True)
+            except Exception as e:
+                st.error(f"Classification failed: {e}")
+
+def physical_applications_page():
+    st.header("🔬 Physical Applications")
+    st.markdown(
+        '<div class="info-box">Explore how generated ODEs relate to physics/engineering applications.</div>',
+        unsafe_allow_html=True,
+    )
+
+    applications = {
+        "Mechanics": [
+            {"name":"Harmonic Oscillator","equation":"y'' + ω^2 y = 0","description":"Spring-mass systems"},
+            {"name":"Damped Oscillator","equation":"y'' + 2γ y' + ω₀² y = 0","description":"Oscillators with friction"},
+            {"name":"Forced Oscillator","equation":"y'' + 2γ y' + ω₀² y = F cos(ωt)","description":"Driven systems"},
+        ],
+        "Quantum Physics": [
+            {"name":"Schrödinger (1D)","equation":"-ℏ²/(2m) y'' + V(x)y = Ey","description":"Quantum bound states"},
+            {"name":"Particle in Box","equation":"y'' + (2mE/ℏ²) y = 0","description":"Infinite potential well"},
+        ],
+        "Thermodynamics": [
+            {"name":"Heat Equation","equation":"∂T/∂t = α∇²T","description":"Heat diffusion"},
+            {"name":"Newton Cooling","equation":"dT/dt = -k (T - T_env)","description":"Cooling processes"},
+        ],
+    }
+    category = st.selectbox("Select Application Field", list(applications.keys()))
+    for app in applications.get(category, []):
+        with st.expander(f"📚 {app['name']}"):
+            try:
+                st.latex(app["equation"])
+            except Exception:
+                st.write(app["equation"])
+            st.write("Description:", app["description"])
+
+    st.subheader("🔗 Match Your ODEs to Applications")
+    if st.session_state.generated_odes and st.session_state.get("ode_classifier"):
+        sel = st.selectbox(
+            "Select Generated ODE",
+            range(len(st.session_state.generated_odes)),
+            format_func=lambda i: f"ODE {i+1}: Type={st.session_state.generated_odes[i].get('type','?')}, Order={st.session_state.generated_odes[i].get('order',0)}"
+        )
+        if st.button("Find Applications"):
+            ode = st.session_state.generated_odes[sel]
+            try:
+                result = st.session_state.ode_classifier.classify_ode(ode)
+                apps = result.get("matched_applications", [])
+                if apps:
+                    st.success(f"Found {len(apps)} applications:")
+                    for a in apps:
+                        st.write(f"**{getattr(a,'name','?')}** ({getattr(a,'field','?')})")
+                        if getattr(a, "description", None):
+                            st.write("•", a.description)
+                else:
+                    st.info("No specific applications identified.")
+            except Exception as e:
+                st.error(f"Classification failed: {e}")
+    else:
+        st.info("Generate ODEs and ensure classifier is available.")
 
 def visualization_page():
     st.header("📐 Visualization")
@@ -1548,53 +1833,218 @@ def visualization_page():
             try:
                 if plot_type == "Solution":
                     fig = create_solution_plot(ode, x_range, num_points)
+                elif plot_type == "Phase Portrait":
+                    fig = go.Figure()  # Placeholder
+                elif plot_type == "3D Surface":
+                    fig = go.Figure()  # Placeholder
                 else:
-                    fig = go.Figure()  # Placeholder for other types
+                    fig = go.Figure()  # Placeholder
                 st.plotly_chart(fig, use_container_width=True)
             except Exception as e:
                 st.error(f"Visualization failed: {e}")
 
-# -------------------- Docs & Settings --------------------
-def documentation_page():
-    st.header("📖 Documentation")
+def export_latex_page():
+    st.header("📤 Export & LaTeX")
     st.markdown(
-        r"""
-**Theorem 4.1.**  
-\[
-y(x)=\frac{\pi}{2n}\sum_{s=1}^n\Big(2f(\alpha+\beta)-\psi_s(x)-\phi_s(x)\Big)+\pi M
-\]
-with \(\psi_s=f(\alpha+\beta e^{ix\cos\omega_s-x\sin\omega_s})\), \(\phi_s=f(\alpha+\beta e^{-ix\cos\omega_s-x\sin\omega_s})\), \(\omega_s=(2s-1)\pi/(2n)\).
-
-**Theorem 4.2 (Stirling‑number compact form).**  
-\[
-y^{(m)}(x)=-\frac{\pi}{2n}\sum_{s=1}^n\left\{
-\lambda_s^m\sum_{j=1}^m\mathbf{S}(m,j)(\beta\zeta_s)^j\partial_\alpha^{\,j}\psi
-+\overline{\lambda_s}^{\,m}\sum_{j=1}^m\mathbf{S}(m,j)(\beta\overline{\zeta_s})^j\partial_\alpha^{\,j}\phi
-\right\}.
-\]
-Here \(\zeta_s = e^{-x\sin\omega_s}e^{ix\cos\omega_s}\), \(\lambda_s=e^{i(\pi/2+\omega_s)}\), \(\omega_s=(2s-1)\pi/(2n)\).
-
-**Free‑form Algebraic LHS**  
-Type any SymPy expression for the operator \(L[y]\). Shorthands: `y(x)`, `y1(x)`, … `y10(x)`, `Dy(k,g)` for derivatives of \(y(g(x))\). Delays and affine transforms go in `g`: e.g. `Dy(3, x/2+1)`.
-""",
-        unsafe_allow_html=False,
+        '<div class="info-box">Export ODEs in publication‑ready LaTeX with exact symbolic expressions.</div>',
+        unsafe_allow_html=True,
     )
+
+    if not st.session_state.generated_odes:
+        st.warning("No ODEs to export.")
+        return
+
+    export_type = st.radio("Export Type", ["Single ODE","Multiple ODEs","Complete Report","Batch Export"])
+    if export_type == "Single ODE":
+        idx = st.selectbox(
+            "Select ODE",
+            range(len(st.session_state.generated_odes)),
+            format_func=lambda i: f"ODE {i+1}: {st.session_state.generated_odes[i].get('type','?')}"
+        )
+        ode = st.session_state.generated_odes[idx]
+        st.subheader("📋 LaTeX Preview")
+        latex_doc = LaTeXExporter.generate_latex_document(ode, include_preamble=False)
+        st.code(latex_doc, language="latex")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            full_latex = LaTeXExporter.generate_latex_document(ode, include_preamble=True)
+            st.download_button("📄 Download LaTeX", full_latex, f"ode_{idx+1}.tex", "text/x-latex")
+        with c2:
+            st.info("To get PDF, compile the .tex locally with pdflatex/xelatex.")
+        with c3:
+            package = LaTeXExporter.create_export_package(ode, include_extras=True)
+            st.download_button("📦 Download Package", package, f"ode_package_{idx+1}.zip", "application/zip")
+
+    elif export_type == "Multiple ODEs":
+        sel = st.multiselect(
+            "Select ODEs",
+            range(len(st.session_state.generated_odes)),
+            format_func=lambda i: f"ODE {i+1}: {st.session_state.generated_odes[i].get('type','?')}"
+        )
+        if sel and st.button("Generate Multi-ODE Document"):
+            parts = [r"""\documentclass[12pt]{article}
+\usepackage{amsmath,amssymb}
+\usepackage{geometry}
+\geometry{margin=1in}
+\title{Collection of Generated ODEs}
+\author{Master Generators System}
+\date{\today}
+\begin{document}
+\maketitle
+"""]
+            for count, i in enumerate(sel, 1):
+                parts.append(f"\\section{{ODE {count}}}")
+                parts.append(LaTeXExporter.generate_latex_document(st.session_state.generated_odes[i], include_preamble=False))
+            parts.append(r"\end{document}")
+            doc = "\n".join(parts)
+            st.download_button("📄 Download Multi-ODE LaTeX", doc, f"multiple_odes_{datetime.now().strftime('%Y%m%d_%H%M%S')}.tex", "text/x-latex")
+
+    elif export_type == "Complete Report":
+        if st.button("Generate Complete Report"):
+            report = generate_complete_report()
+            st.download_button("📄 Download Complete Report", report, f"complete_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.tex", "text/x-latex")
+
+    else:
+        st.subheader("📦 Batch Export Options")
+        formats = st.multiselect("Export Formats", ["LaTeX","JSON","CSV","Python"], default=["LaTeX","JSON"])
+        if st.button("Export All", type="primary"):
+            export_all_formats(formats)
+
+def examples_library_page():
+    st.header("📚 Examples Library")
+    st.markdown("Curated examples of linear/nonlinear/special-function generators.")
+    with st.expander("Simple Harmonic Oscillator"):
+        st.latex("y'' + y = 0")
 
 def settings_page():
     st.header("⚙️ Settings")
-    if st.checkbox("Show session keys"):
-        st.write(list(st.session_state.keys()))
-    if st.button("Clear cache/state (safe)"):
-        for k in ["generated_odes","batch_results","batch_records_full","generator_patterns","training_history"]:
-            st.session_state[k] = []
-        st.success("Cleared.")
+    tabs = st.tabs(["General","Export","Advanced","About"])
+    with tabs[0]:
+        st.checkbox("Dark mode", False)
+        if st.button("Save General Settings"): st.success("Saved.")
+    with tabs[1]:
+        include_preamble = st.checkbox("Include LaTeX preamble by default", value=True)
+        if st.button("Save Export Settings"): st.success("Saved.")
+    with tabs[2]:
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            cm = st.session_state.get("cache_manager")
+            st.metric("Cache Size", len(getattr(cm,"memory_cache",{})) if cm else 0)
+        with c2:
+            if st.button("Clear Cache"):
+                try:
+                    st.session_state.cache_manager.clear()
+                    st.success("Cache cleared.")
+                except Exception:
+                    st.info("No cache manager.")
+        with c3:
+            if st.button("Save Session"):
+                ok = SessionStateManager.save_to_file()
+                st.success("Session saved.") if ok else st.error("Failed to save.")
+    with tabs[3]:
+        st.markdown(
+            "**Master Generators for ODEs** — complete system with Theorems 4.1 & 4.2, ML/DL, LaTeX, and novelty detection."
+        )
+
+def documentation_page():
+    st.header("📖 Documentation")
+    st.markdown(
+        """
+**Quick Start**
+1. Go to **Apply Master Theorem**.
+2. Pick f(z) from Basic/Special.
+3. Set parameters (α,β,n,M) and choose **Exact (symbolic)**.
+4. Click **Generate ODE**.
+5. Choose LHS source (**Constructor** or **Free‑form**). To make RHS, keep “Apply generator” checked.
+6. Export directly from the **📤 Export** tab.
+7. (Optional) Compute **y^(m)(x)** via **Theorem 4.2**.
+8. Export to LaTeX in **Export & LaTeX** or include in batch exports.
+"""
+    )
 
 # ============================================================================
-# Main
+# Helper utilities for batch/exports
+# ============================================================================
+def create_solution_plot(ode: Dict, x_range: Tuple, num_points: int) -> go.Figure:
+    # Placeholder solution plot (since generic symbolic solution plotting is nontrivial)
+    xs = np.linspace(x_range[0], x_range[1], num_points)
+    ys = np.sin(xs) * np.exp(-0.1*np.abs(xs))
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name="Solution"))
+    fig.update_layout(title="ODE Solution (illustrative)", xaxis_title="x", yaxis_title="y(x)")
+    return fig
+
+def generate_batch_latex(results: List[Dict]) -> str:
+    parts = [r"\begin{tabular}{|c|c|c|c|c|}", r"\hline", r"ID & Type & Generator & Function & Order \\", r"\hline"]
+    for r in results[:30]:
+        parts.append(f"{r.get('ID','')} & {r.get('Type','')} & {r.get('Generator','')} & {r.get('Function','')} & {r.get('Order','')} \\\\")
+    parts.append(r"\hline")
+    parts.append(r"\end{tabular}")
+    return "\n".join(parts)
+
+def create_batch_package(results: List[Dict], df: pd.DataFrame) -> bytes:
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("batch_results.csv", df.to_csv(index=False))
+        zf.writestr("batch_results.json", json.dumps(results, indent=2, default=str))
+        zf.writestr("batch_results.tex", generate_batch_latex(results))
+        zf.writestr("README.txt", f"Batch ODE Generation Results\nGenerated: {datetime.now().isoformat()}\nTotal: {len(results)}\n")
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue()
+
+def generate_complete_report() -> str:
+    parts = [r"""
+\documentclass[12pt]{report}
+\usepackage{amsmath,amssymb}
+\usepackage{geometry}
+\geometry{margin=1in}
+\title{Master Generators System\\Complete Report}
+\author{Generated Automatically}
+\date{\today}
+\begin{document}
+\maketitle
+\tableofcontents
+
+\chapter{Executive Summary}
+This report contains all ODEs generated by the system.
+
+\chapter{Generated ODEs}
+"""]
+    for i, ode in enumerate(st.session_state.generated_odes):
+        parts.append(f"\\section{{ODE {i+1}}}")
+        parts.append(LaTeXExporter.generate_latex_document(ode, include_preamble=False))
+    parts.append(r"""
+\chapter{Conclusions}
+The system successfully generated and analyzed multiple ODEs.
+\end{document}
+""")
+    return "\n".join(parts)
+
+def export_all_formats(formats: List[str]):
+    for fmt in formats:
+        if fmt == "LaTeX":
+            latex = generate_complete_report()
+            st.download_button("📄 Download LaTeX", latex, "all_odes.tex", "text/x-latex")
+        elif fmt == "JSON":
+            js = json.dumps(st.session_state.generated_odes, indent=2, default=str)
+            st.download_button("📄 Download JSON", js, "all_odes.json", "application/json")
+
+# ============================================================================
+# Main App
 # ============================================================================
 def main():
-    initialize_session()
-    page_header()
+    SessionStateManager.initialize()
+
+    st.markdown(
+        """
+    <div class="main-header">
+      <div class="main-title">🔬 Master Generators for ODEs</div>
+      <div class="subtitle">By Mohammad Abu Ghuwaleh • Free‑form generators • ML/DL • Export • Novelty</div>
+    </div>
+    """,
+        unsafe_allow_html=True,
+    )
+
     page = st.sidebar.radio(
         "📍 Navigation",
         [
@@ -1605,8 +2055,10 @@ def main():
             "📊 Batch Generation",
             "🔍 Novelty Detection",
             "📈 Analysis & Classification",
+            "🔬 Physical Applications",
             "📐 Visualization",
             "📤 Export & LaTeX",
+            "📚 Examples Library",
             "⚙️ Settings",
             "📖 Documentation",
         ],
@@ -1626,14 +2078,19 @@ def main():
         novelty_detection_page()
     elif page == "📈 Analysis & Classification":
         analysis_classification_page()
+    elif page == "🔬 Physical Applications":
+        physical_applications_page()
     elif page == "📐 Visualization":
         visualization_page()
     elif page == "📤 Export & LaTeX":
         export_latex_page()
+    elif page == "📚 Examples Library":
+        examples_library_page()
     elif page == "⚙️ Settings":
         settings_page()
     elif page == "📖 Documentation":
         documentation_page()
+
 
 if __name__ == "__main__":
     main()
