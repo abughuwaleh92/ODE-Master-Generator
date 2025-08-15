@@ -1909,7 +1909,7 @@ def main():
         """
     <div class="main-header">
       <div class="main-title">🔬 Master Generators for ODEs</div>
-      <div class="subtitle">By Mohammad Abu Ghuwaleh• Free‑form generators • ML/DL • Export • Novelty</div>
+      <div class="subtitle">By Mohammad Abu Ghuwaleh • Free‑form generators • ML/DL • Export • Novelty</div>
     </div>
     """,
         unsafe_allow_html=True,
