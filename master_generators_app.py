@@ -162,6 +162,96 @@ try:
 except Exception as e:
     logger.warning(f"Some imports from src/ failed or are missing: {e}")
     HAVE_SRC = False
+# ---------- Generator source + result utilities ----------
+def _ensure_ss_key(name, default):
+    if name not in st.session_state:
+        st.session_state[name] = default
+
+def set_lhs_source(source: str):
+    """
+    source ∈ {"freeform", "constructor"}; controls which LHS we use at generation time.
+    """
+    assert source in {"freeform", "constructor"}
+    st.session_state["lhs_source"] = source
+
+def get_active_generator_spec():
+    """
+    Return the active GeneratorSpecification to use for L[y] (or None).
+    Precedence: free-form -> constructor.
+    """
+    spec = None
+    _ensure_ss_key("lhs_source", "constructor")
+    if st.session_state["lhs_source"] == "freeform":
+        spec = st.session_state.get("freeform_gen_spec")
+        if spec is not None:
+            return spec
+    # Fall back to constructor spec
+    return st.session_state.get("current_generator")
+
+def _infer_type_from_spec(spec) -> str:
+    """
+    If spec has .is_linear use it; otherwise infers "nonlinear" if any wrapper/power != 1.
+    """
+    try:
+        return "linear" if bool(spec.is_linear) else "nonlinear"
+    except Exception:
+        pass
+    # Fallback: look for descriptors we stored in free-form
+    desc = getattr(spec, "freeform_descriptor", None)
+    if isinstance(desc, dict) and "terms" in desc:
+        for t in desc["terms"]:
+            if str(t.get("wrap", "id")).lower() != "id":
+                return "nonlinear"
+            if int(t.get("power", 1)) != 1:
+                return "nonlinear"
+        return "linear"
+    # If unknown, be conservative:
+    return "nonlinear"
+
+def _infer_order_from_spec(spec) -> int:
+    try:
+        if hasattr(spec, "order"):
+            return int(spec.order)
+    except Exception:
+        pass
+    # Free-form fallback
+    desc = getattr(spec, "freeform_descriptor", None)
+    if isinstance(desc, dict) and "terms" in desc:
+        try:
+            return max(int(t.get("inner_order", 0)) for t in desc["terms"])
+        except Exception:
+            return 0
+    return 0
+
+def register_generated_ode(result: dict):
+    """
+    Normalize and append a new ODE record so ML/DL sees it.
+    Ensures fields exist and 'generator_number' is sequential.
+    """
+    _ensure_ss_key("generated_odes", [])
+    result = dict(result)  # shallow copy
+
+    # Ensure required fields exist
+    result.setdefault("type", "nonlinear")
+    result.setdefault("order", 0)
+    result.setdefault("function_used", "unknown")
+    result.setdefault("parameters", {})
+    result.setdefault("classification", {})
+    result.setdefault("timestamp", datetime.now().isoformat())
+
+    # Generator index
+    result["generator_number"] = len(st.session_state.generated_odes) + 1
+
+    # Human-friendly classification defaults
+    cl = result["classification"]
+    cl.setdefault("type", result["type"])
+    cl.setdefault("order", result["order"])
+    cl.setdefault("field", cl.get("field", "Mathematical Physics"))
+    cl.setdefault("applications", cl.get("applications", ["Research Equation"]))
+    cl.setdefault("linearity", "Linear" if result["type"] == "linear" else "Nonlinear")
+    result["classification"] = cl
+
+    st.session_state.generated_odes.append(result)
 
 # ============================================================================
 # Streamlit Page Config
@@ -473,10 +563,10 @@ class SessionStateManager:
 # -------------------- PATCH: Apply Master Theorem subsystem -----------------
 # (exact params, T4.1 + T4.2 (Stirling), free-form LHS, fast RHS, timeouts)
 # ============================================================================
+
 from functools import lru_cache
 import concurrent.futures as _futures
-from sympy import Derivative, Function, Symbol
-from sympy.core.function import AppliedUndef
+from sympy import Derivative, Function, Symbol, AppliedUndef
 
 def simplify_expr(expr: sp.Expr, level: str = "light") -> sp.Expr:
     if level == "none":
@@ -841,8 +931,27 @@ def page_apply_master_theorem():
                         st.error(f"Failed to build free‑form LHS: {e}")
             with colc2:
                 if st.button("🗑️ Clear terms"):
-                    st.session_state.free_terms = []
-
+                    st.session_state.free_terms = [] 
+                    # Suppose you already built 'lhs_expr' (SymPy) and 'terms_descriptor' (list of your free-form terms)
+                    # Wrap in a GeneratorSpecification so the rest of the app can consume it uniformly:
+                    try:
+                    freeform_spec = GeneratorSpecification(
+                    terms=[],  # terms list is optional; we mainly need 'lhs'
+                    name=f"Free-form Generator {datetime.now().strftime('%H%M%S')}"
+                    )
+                    # Stash the real LHS (SymPy) and a descriptor so we can infer linearity/order later
+                    freeform_spec.lhs = lhs_expr
+                    freeform_spec.freeform_descriptor = {
+                    "terms": terms_descriptor,  # e.g. [{"coef":1.0, "inner_order":2, "wrap":"log", "power":1, "arg":"x"}]
+                    "note": "free-form"
+                    }
+                    st.session_state["freeform_gen_spec"] = freeform_spec
+                    set_lhs_source("freeform")
+                    st.success("✅ Free‑form LHS stored and selected. It will be used when generating ODEs.")
+                    
+                    except Exception as e:
+                    st.error(f"Failed to store free‑form LHS: {e}")
+                
     # Actions
     if st.button("🚀 Build y(x) via Theorem 4.1", type="primary", use_container_width=True):
         with st.spinner("Applying Theorem 4.1..."):
@@ -1584,456 +1693,68 @@ Compose terms like `sinh(y')`, `exp(y''''''')`, `ln(y'')`, `y(x/a+b)`, add power
 # ============================================================================
 # Helper utilities for batch/exports (unchanged structure)
 # ============================================================================
-def batch_generation_page():
-    """
-    Batch ODE Generation (patched):
-    - Mode A: Apply Theorem 4.1 using the *active LHS* (Constructor or Free-form)
-    - Mode B: Factories (fast), kept for backward compatibility
-    - Symbolic/Exact toggle, seed, progress, exports, and ML/DL registration
-    """
-    st.header("📊 Batch ODE Generation")
+def create_solution_plot(ode: Dict, x_range: Tuple, num_points: int) -> go.Figure:
+    x = np.linspace(x_range[0], x_range[1], num_points)
+    y = np.sin(x) * np.exp(-0.1*np.abs(x))  # placeholder demo
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name="Solution"))
+    fig.update_layout(title="ODE Solution", xaxis_title="x", yaxis_title="y(x)")
+    return fig
 
-    # ----------------------------
-    # Controls
-    # ----------------------------
-    mode = st.radio(
-        "Batch mode",
-        ["Apply Theorem (use active LHS)", "Factories (fast)"],
-        index=0,
-        help="Apply Theorem: uses your active LHS (Constructor or Free‑form). Factories: generate via linear/nonlinear factories."
-    )
+def generate_batch_latex(results: List[Dict]) -> str:
+    parts = [r"\begin{tabular}{|c|c|c|c|c|}", r"\hline", r"ID & Type & Generator & Function & Order \\", r"\hline"]
+    for r in results[:30]:
+        parts.append(f"{r.get('ID','')} & {r.get('Type','')} & {r.get('Generator','')} & {r.get('Function','')} & {r.get('Order','')} \\\\")
+    parts.append(r"\hline")
+    parts.append(r"\end{tabular}")
+    return "\n".join(parts)
 
-    col_top = st.columns(4)
-    with col_top[0]:
-        num_odes = st.slider("Number of ODEs", 1, 500, 25)
-    with col_top[1]:
-        seed_val = st.number_input("Random seed (reproducible)", value=123, step=1)
-    with col_top[2]:
-        add_to_global = st.checkbox("Add to global ODEs (counts for ML/DL)", value=True)
-    with col_top[3]:
-        include_latex_files = st.checkbox("Include per‑ODE LaTeX in ZIP (first 50)", value=False)
+def create_batch_package(results: List[Dict], df: pd.DataFrame) -> bytes:
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("batch_results.csv", df.to_csv(index=False))
+        zf.writestr("batch_results.json", json.dumps(results, indent=2, default=str))
+        zf.writestr("batch_results.tex", generate_batch_latex(results))
+        zf.writestr("README.txt", f"Batch ODE Generation Results\nGenerated: {datetime.now().isoformat()}\nTotal: {len(results)}\n")
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue()
 
-    st.markdown("---")
+def generate_complete_report() -> str:
+    parts = [r"""
+\documentclass[12pt]{report}
+\usepackage{amsmath,amssymb}
+\usepackage{geometry}
+\geometry{margin=1in}
+\title{Master Generators System\\Complete Report}
+\author{Generated Automatically}
+\date{\today}
+\begin{document}
+\maketitle
+\tableofcontents
 
-    # Shared: function palette
-    func_col = st.columns(3)
-    with func_col[0]:
-        func_libs = st.multiselect(
-            "Function libraries",
-            ["Basic", "Special"],
-            default=["Basic"],
-            help="Functions will be sampled uniformly from the selected libraries."
-        )
-    with func_col[1]:
-        # Try to collect names from src libs; otherwise fallback to a safe palette
-        names = []
-        try:
-            if "Basic" in func_libs and st.session_state.get("basic_functions"):
-                names += st.session_state.basic_functions.get_function_names()
-        except Exception:
-            pass
-        try:
-            if "Special" in func_libs and st.session_state.get("special_functions"):
-                names += st.session_state.special_functions.get_function_names()
-        except Exception:
-            pass
-        if not names:
-            names = ["exponential", "linear", "quadratic", "sin", "cos", "log", "tanh"]
-        st.write(f"Found **{len(names)}** candidate f(z) functions.")
-    with func_col[2]:
-        st.write("")
+\chapter{Executive Summary}
+This report contains all ODEs generated by the system.
 
-    # ----------------------------
-    # Mode A: Apply Theorem
-    # ----------------------------
-    if mode.startswith("Apply Theorem"):
-        st.subheader("Parameters for Theorem 4.1 (batch sampling)")
-        cA = st.columns(4)
-        with cA[0]:
-            alpha_range = st.text_input("α range [min,max]", "-2,2")
-        with cA[1]:
-            beta_range = st.text_input("β range [min,max] (β>0 recommended)", "0.5,2")
-        with cA[2]:
-            n_range = st.text_input("n range [min,max] (integers ≥1)", "1,3")
-        with cA[3]:
-            M_range = st.text_input("M range [min,max]", "-1,1")
+\chapter{Generated ODEs}
+"""]
+    for i, ode in enumerate(st.session_state.generated_odes):
+        parts.append(f"\\section{{ODE {i+1}}}")
+        parts.append(LaTeXExporter.generate_latex_document(ode, include_preamble=False))
+    parts.append(r"""
+\chapter{Conclusions}
+The system successfully generated and analyzed multiple ODEs.
+\end{document}
+""")
+    return "\n".join(parts)
 
-        cA2 = st.columns(3)
-        with cA2[0]:
-            use_exact = st.checkbox("Exact (symbolic) parameters", value=False,
-                                    help="Symbolic can be much slower in batch. Use sparingly.")
-        with cA2[1]:
-            simplify_out = st.checkbox("Simplify expressions", value=False,
-                                       help="Turning this off can speed up large batches.")
-        with cA2[2]:
-            lhs_source = st.selectbox(
-                "LHS source",
-                ["Auto (active)", "Constructor", "Free‑form"],
-                index=0,
-                help="Auto uses whichever LHS is currently active. You can force Constructor or Free‑form here."
-            )
-
-        # Helper to parse ranges safely
-        def _parse_range(txt, cast=float, default=(0, 1)):
-            try:
-                lo, hi = [cast(s.strip()) for s in txt.split(",")]
-                if lo > hi:
-                    lo, hi = hi, lo
-                return lo, hi
-            except Exception:
-                return default
-
-        a_rng = _parse_range(alpha_range, float, (-2.0, 2.0))
-        b_rng = _parse_range(beta_range, float, (0.5, 2.0))
-        n_rng = _parse_range(n_range, int, (1, 3))
-        M_rng = _parse_range(M_range, float, (-1.0, 1.0))
-
-        # Exactify helper
-        def _to_exact(v):
-            if use_exact:
-                try:
-                    return sp.nsimplify(v, rational=True)
-                except Exception:
-                    return sp.sympify(v)
-            return sp.Float(v)
-
-        # Resolve LHS spec
-        def _get_active_spec_for_batch():
-            # Respect override
-            if lhs_source.startswith("Constructor"):
-                return st.session_state.get("current_generator")
-            if lhs_source.startswith("Free"):
-                return st.session_state.get("freeform_gen_spec")
-            # Auto (active)
-            if callable(globals().get("get_active_generator_spec")):
-                return get_active_generator_spec()
-            # Fallback precedence: freeform -> constructor
-            return st.session_state.get("freeform_gen_spec") or st.session_state.get("current_generator")
-
-        # Apply LHS to y(x)
-        def _apply_lhs(lhs_expr, y_expr, x):
-            fn = globals().get("apply_lhs_to_solution")
-            if callable(fn):
-                return fn(lhs_expr, y_expr, x, y_name="y")
-            # Minimal fallback (y(x) & its derivatives only)
-            y = sp.Function("y")
-            mapping = {y(x): y_expr}
-            for d in lhs_expr.atoms(sp.Derivative):
-                try:
-                    if hasattr(d, "expr") and d.expr.func == y:
-                        # order
-                        k = 0
-                        for v in d.variables:
-                            if isinstance(v, sp.Symbol) and v == x:
-                                k += 1
-                            elif isinstance(v, (tuple, list)) and len(v) == 2 and v[0] == x:
-                                k += int(v[1])
-                        mapping[d] = sp.diff(y_expr, (x, k))
-                except Exception:
-                    pass
-            return lhs_expr.xreplace(mapping)
-
-        # Register to global list
-        def _register(rec: dict):
-            fn = globals().get("register_generated_ode")
-            if callable(fn):
-                register_generated_ode(rec)
-            else:
-                st.session_state.setdefault("generated_odes", [])
-                rec = dict(rec)
-                rec.setdefault("type", "nonlinear")
-                rec.setdefault("order", 0)
-                rec.setdefault("timestamp", datetime.now().isoformat())
-                rec["generator_number"] = len(st.session_state.generated_odes) + 1
-                st.session_state.generated_odes.append(rec)
-
-        # Launch
-        if st.button("🚀 Run batch (Apply Theorem)", type="primary", use_container_width=True):
-            if not names:
-                st.error("No candidate function names found.")
-                return
-
-            spec = _get_active_spec_for_batch()
-            if not (spec and hasattr(spec, "lhs") and spec.lhs is not None):
-                st.error("No active LHS found. Please build/select a Constructor or Free‑form LHS before running this batch.")
-                return
-
-            np.random.seed(int(seed_val))
-            x = sp.Symbol("x", real=True)
-            batch_rows = []
-            latex_files = []  # (filename, content)
-
-            progress = st.progress(0.0)
-            status = st.empty()
-
-            for i in range(1, num_odes + 1):
-                progress.progress(i / num_odes)
-                status.text(f"Generating ODE {i}/{num_odes} …")
-                try:
-                    # Sample params
-                    alpha = np.random.uniform(*a_rng)
-                    beta = np.random.uniform(*b_rng)
-                    n = int(np.random.randint(n_rng[0], n_rng[1] + 1))
-                    M = np.random.uniform(*M_rng)
-
-                    α, β, n_int, 𝑀 = _to_exact(alpha), _to_exact(beta), int(n), _to_exact(M)
-
-                    # Sample function
-                    fname = str(np.random.choice(names))
-                    f_expr = get_function_expr("Basic" if "Basic" in func_libs else "Special", fname)
-
-                    # Build solution and RHS
-                    yx = theorem_4_1_solution_expr(f_expr, α, β, n_int, 𝑀, x)
-                    if simplify_out:
-                        yx = sp.simplify(yx)
-
-                    lhs = spec.lhs
-                    rhs = _apply_lhs(lhs, yx, x)
-                    if simplify_out:
-                        rhs = sp.simplify(rhs)
-
-                    # Type/order inference (if helpers exist)
-                    ode_type = "nonlinear"
-                    ode_order = 0
-                    if hasattr(spec, "is_linear"):
-                        ode_type = "linear" if bool(getattr(spec, "is_linear")) else "nonlinear"
-                    # If you have a helper like _infer_order_from_spec(spec), use it; otherwise quick scan:
-                    try:
-                        orders = []
-                        for d in lhs.atoms(sp.Derivative):
-                            # count occurrences of x in derivative variables
-                            k = 0
-                            for v in d.variables:
-                                if isinstance(v, sp.Symbol) and v == x:
-                                    k += 1
-                                elif isinstance(v, (tuple, list)) and len(v) == 2 and v[0] == x:
-                                    k += int(v[1])
-                            orders.append(k)
-                        ode_order = max(orders) if orders else 0
-                    except Exception:
-                        pass
-
-                    # Build record
-                    rec = {
-                        "generator": lhs,
-                        "rhs": rhs,
-                        "solution": yx,
-                        "parameters": {"alpha": α, "beta": β, "n": n_int, "M": 𝑀},
-                        "function_used": fname,
-                        "type": ode_type,
-                        "order": ode_order,
-                        "classification": {
-                            "type": "Linear" if ode_type == "linear" else "Nonlinear",
-                            "order": ode_order,
-                            "linearity": "Linear" if ode_type == "linear" else "Nonlinear",
-                            "field": "Mathematical Physics",
-                            "applications": ["Research Equation"],
-                        },
-                        "initial_conditions": {},
-                        "timestamp": datetime.now().isoformat(),
-                        "lhs_source": st.session_state.get("lhs_source", "constructor"),
-                        "title": "Master Generators ODE System",
-                    }
-
-                    # Add to global set?
-                    if add_to_global:
-                        _register(rec)
-
-                    # Row for table
-                    batch_rows.append({
-                        "ID": i,
-                        "Function": fname,
-                        "Order": ode_order,
-                        "Type": ode_type,
-                        "α": str(α), "β": str(β), "n": n_int, "M": str(𝑀),
-                    })
-
-                    # Optional per‑ODE LaTeX (limited to first 50)
-                    if include_latex_files and i <= 50:
-                        try:
-                            from_latex = LaTeXExporter.generate_latex_document(rec, include_preamble=True)
-                            latex_files.append((f"ode_{i:03d}.tex", from_latex))
-                        except Exception as e:
-                            logging.debug(f"latex build failed for {i}: {e}")
-
-                except Exception as e:
-                    logging.debug(f"Batch item {i} failed: {e}")
-
-            # Present results
-            st.success(f"✅ Completed {len(batch_rows)} ODEs (Apply Theorem).")
-            df = pd.DataFrame(batch_rows)
-            st.dataframe(df, use_container_width=True)
-
-            # Exports
-            exp = st.columns(4)
-            with exp[0]:
-                csv = df.to_csv(index=False)
-                st.download_button("📊 CSV", csv, file_name=f"batch_apply_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv")
-            with exp[1]:
-                j = json.dumps(batch_rows, indent=2, default=str)
-                st.download_button("📄 JSON", j, file_name=f"batch_apply_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json", mime="application/json")
-            with exp[2]:
-                latex_table = "\\begin{tabular}{|c|c|c|c|c|c|c|}\\hline ID & Function & Type & Order & $\\alpha$ & $\\beta$ & $n$\\\\\\hline\n" + \
-                              "\n".join([f"{r['ID']} & {r['Function']} & {r['Type']} & {r['Order']} & {r['α']} & {r['β']} & {r['n']} \\\\" for r in batch_rows[:40]]) + \
-                              "\n\\hline\\end{tabular}"
-                st.download_button("📝 LaTeX table", latex_table, file_name=f"batch_apply_{datetime.now().strftime('%Y%m%d_%H%M%S')}.tex", mime="text/x-latex")
-            with exp[3]:
-                zbuf = io.BytesIO()
-                with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zf:
-                    zf.writestr("batch.csv", csv)
-                    zf.writestr("batch.json", j)
-                    zf.writestr("batch_table.tex", latex_table)
-                    zf.writestr("README.txt", f"Batch (Apply Theorem) generated on {datetime.now().isoformat()}")
-                    if include_latex_files and latex_files:
-                        for fname, content in latex_files:
-                            zf.writestr(f"odes/{fname}", content)
-                zbuf.seek(0)
-                st.download_button(
-                    "📦 ZIP (all)",
-                    zbuf.getvalue(),
-                    file_name=f"batch_apply_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-                    mime="application/zip"
-                )
-
-    # ----------------------------
-    # Mode B: Factories (fast) — unchanged behavior
-    # ----------------------------
-    else:
-        st.subheader("Factories mode (fast)")
-
-        cc = st.columns(3)
-        with cc[0]:
-            gen_types = st.multiselect("Generator types", ["linear", "nonlinear"], default=["linear", "nonlinear"])
-        with cc[1]:
-            a_rng = st.slider("α range", -5.0, 5.0, (-2.0, 2.0))
-            b_rng = st.slider("β range", 0.1, 5.0, (0.5, 2.0))
-        with cc[2]:
-            n_rng = st.slider("n range", 1, 5, (1, 3))
-
-        with st.expander("Advanced", expanded=False):
-            include_solutions = st.checkbox("Include solution preview", True)
-
-        # layered factories (imported elsewhere in your app)
-        CLF = globals().get("CompleteLinearGeneratorFactory")
-        CNLF = globals().get("CompleteNonlinearGeneratorFactory")
-
-        if st.button("🚀 Run batch (Factories)", type="primary", use_container_width=True):
-            if not names:
-                st.error("No candidate function names found.")
-                return
-            np.random.seed(int(seed_val))
-
-            all_rows = []
-            progress = st.progress(0.0)
-            status = st.empty()
-
-            for i in range(1, num_odes+1):
-                progress.progress(i / num_odes)
-                status.text(f"Generating ODE {i}/{num_odes} …")
-                try:
-                    params = {
-                        "alpha": float(np.random.uniform(*a_rng)),
-                        "beta": float(np.random.uniform(*b_rng)),
-                        "n": int(np.random.randint(n_rng[0], n_rng[1] + 1)),
-                        "M": float(np.random.uniform(-1, 1)),
-                    }
-                    gtype = str(np.random.choice(gen_types))
-                    fname = str(np.random.choice(names))
-                    f_expr = get_function_expr("Basic" if "Basic" in func_libs else "Special", fname)
-
-                    if gtype == "linear" and CLF:
-                        factory = CLF()
-                        gnum = int(np.random.randint(1, 9))
-                        if gnum in [4, 5]:
-                            params["a"] = float(np.random.uniform(1, 3))
-                        res = factory.create(gnum, f_expr, **params)
-                    elif gtype == "nonlinear" and CNLF:
-                        factory = CNLF()
-                        gnum = int(np.random.randint(1, 11))
-                        if gnum in [1, 2, 4]:
-                            params["q"] = int(np.random.randint(2, 6))
-                        if gnum in [2, 3, 5]:
-                            params["v"] = int(np.random.randint(2, 6))
-                        if gnum in [4, 5, 9, 10]:
-                            params["a"] = float(np.random.uniform(1, 3))
-                        res = factory.create(gnum, f_expr, **params)
-                    else:
-                        # fallback minimal record
-                        res = {
-                            "ode": None,
-                            "solution": None,
-                            "type": gtype,
-                            "order": 0,
-                            "generator_number": i,
-                            "function_used": fname,
-                            "subtype": "fallback",
-                        }
-
-                    # Register to global list if requested and result looks valid
-                    if add_to_global and isinstance(res, dict):
-                        rec = {
-                            "generator": res.get("ode", sp.Symbol("LHS")),
-                            "rhs": None,
-                            "solution": res.get("solution"),
-                            "parameters": {k: params[k] for k in ["alpha", "beta", "n", "M"] if k in params},
-                            "function_used": fname,
-                            "type": res.get("type", gtype),
-                            "order": res.get("order", 0),
-                            "classification": res.get("classification", {}),
-                            "initial_conditions": {},
-                            "timestamp": datetime.now().isoformat(),
-                            "title": "Master Generators ODE System",
-                        }
-                        register_generated_ode(rec)
-
-                    row = {
-                        "ID": i,
-                        "Type": res.get("type", gtype),
-                        "Generator": res.get("generator_number"),
-                        "Function": fname,
-                        "Order": res.get("order", 0),
-                        "α": round(params["alpha"], 3),
-                        "β": round(params["beta"], 3),
-                        "n": params["n"],
-                    }
-                    if include_solutions:
-                        row["Solution"] = str(res.get("solution"))[:120] + "..."
-                    all_rows.append(row)
-
-                except Exception as e:
-                    logging.debug(f"Factories batch item {i} failed: {e}")
-
-            st.success(f"✅ Completed {len(all_rows)} ODEs (Factories).")
-            df = pd.DataFrame(all_rows)
-            st.dataframe(df, use_container_width=True)
-
-            exp = st.columns(4)
-            with exp[0]:
-                csv = df.to_csv(index=False)
-                st.download_button("📊 CSV", csv, file_name=f"batch_fact_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv")
-            with exp[1]:
-                j = json.dumps(all_rows, indent=2, default=str)
-                st.download_button("📄 JSON", j, file_name=f"batch_fact_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json", mime="application/json")
-            with exp[2]:
-                latex_table = "\\begin{tabular}{|c|c|c|c|c|}\\hline ID & Type & Gen & Function & Order \\\\ \\hline\n" + \
-                              "\n".join([f"{r['ID']} & {r['Type']} & {r['Generator']} & {r['Function']} & {r['Order']} \\\\" for r in all_rows[:40]]) + \
-                              "\n\\hline\\end{tabular}"
-                st.download_button("📝 LaTeX table", latex_table, file_name=f"batch_fact_{datetime.now().strftime('%Y%m%d_%H%M%S')}.tex", mime="text/x-latex")
-            with exp[3]:
-                zbuf = io.BytesIO()
-                with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zf:
-                    zf.writestr("batch.csv", csv)
-                    zf.writestr("batch.json", j)
-                    zf.writestr("batch_table.tex", latex_table)
-                    zf.writestr("README.txt", f"Batch (Factories) generated on {datetime.now().isoformat()}")
-                zbuf.seek(0)
-                st.download_button(
-                    "📦 ZIP (all)",
-                    zbuf.getvalue(),
-                    file_name=f"batch_fact_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-                    mime="application/zip"
-                )
-
+def export_all_formats(formats: List[str]):
+    for fmt in formats:
+        if fmt == "LaTeX":
+            latex = generate_complete_report()
+            st.download_button("📄 Download LaTeX", latex, "all_odes.tex", "text/x-latex")
+        elif fmt == "JSON":
+            js = json.dumps(st.session_state.generated_odes, indent=2, default=str)
+            st.download_button("📄 Download JSON", js, "all_odes.json", "application/json")
 
 # ============================================================================
 # Main App
@@ -2045,7 +1766,7 @@ def main():
         """
     <div class="main-header">
       <div class="main-title">🔬 Master Generators for ODEs</div>
-      <div class="subtitle">By Mohammad Abu-Ghuwaleh• Free‑form generators • ML/DL • Export • Novelty</div>
+      <div class="subtitle">Theorems 4.1 & 4.2 (exact) • Free‑form generators • ML/DL • Export • Novelty</div>
     </div>
     """,
         unsafe_allow_html=True,
