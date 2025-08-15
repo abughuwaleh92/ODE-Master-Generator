@@ -29,7 +29,7 @@ from sympy.core.function import AppliedUndef
 import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
-
+import zipfile
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
