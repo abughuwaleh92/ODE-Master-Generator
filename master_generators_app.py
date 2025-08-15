@@ -476,7 +476,8 @@ class SessionStateManager:
 
 from functools import lru_cache
 import concurrent.futures as _futures
-from sympy import Derivative, Function, Symbol, AppliedUndef
+from sympy import Derivative, Function, Symbol
+from sympy.core.function import AppliedUndef
 
 def simplify_expr(expr: sp.Expr, level: str = "light") -> sp.Expr:
     if level == "none":
