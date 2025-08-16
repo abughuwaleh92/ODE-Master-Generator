@@ -114,6 +114,14 @@ st.set_page_config(page_title="Master Generators ODE System", page_icon="🔬", 
 
 
 # ── Session ───────────────────────────────────────────────────────────────────
+# --- Adapter so ode_core can treat Phi like "Special" without code changes ---
+class _PhiAdapter:
+    def __init__(self, phi_lib):
+        self._phi = phi_lib
+    def get_function(self, name):
+        return self._phi.get_function(name)
+    def get_function_names(self):
+        return self._phi.get_function_names()
 class SessionStateManager:
     @staticmethod
     def initialize():
