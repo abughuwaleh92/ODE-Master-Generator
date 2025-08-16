@@ -464,9 +464,8 @@ def page_apply_master_theorem():
         if info:
             if info.get("status") == "finished":
                 res = info["result"]
-                # re-cast SymPy (optional): display as strings is fine too
+                # optional: sympify for LaTeX rendering
                 try:
-                    # for UI richness, attempt sympify to render LaTeX
                     res["generator"] = sp.sympify(res["generator"])
                     res["rhs"]       = sp.sympify(res["rhs"])
                     res["solution"]  = sp.sympify(res["solution"])
@@ -635,7 +634,7 @@ def ml_pattern_learning_page():
         with c2: learning_rate = st.select_slider("Learning Rate", [0.0001,0.0005,0.001,0.005,0.01], value=0.001); samples = st.slider("Training Samples", 100, 5000, 1000)
         with c3: validation_split = st.slider("Validation Split", 0.1, 0.3, 0.2); use_gpu = st.checkbox("Use GPU if available", True)
 
-    # Use both individually generated ODEs and batch results as training data (addresses your request)
+    # Use both individually generated ODEs and batch results as training data
     use_batch_for_training = st.checkbox("Include Batch Results as Training Data", True)
 
     need = 5
@@ -651,7 +650,7 @@ def ml_pattern_learning_page():
                 trainer = MLTrainer(model_type=model_type, learning_rate=learning_rate, device=device)
                 st.session_state.ml_trainer = trainer
 
-                # If trainer supports data injection, pass both sets; otherwise it will synthesize.
+                # Optional dataset injection (safe no-op if not used)
                 try:
                     trainer.set_dataset(st.session_state.generated_odes,
                                         st.session_state.batch_results if use_batch_for_training else [])
@@ -726,11 +725,16 @@ def batch_generation_page():
             batch_results = []
             prog = st.progress(0); status = st.empty()
 
+            # Build function list and remember origins
             all_functions = []
+            basic_names = []
+            special_names = []
             if "Basic" in func_categories and st.session_state.get("basic_functions"):
-                all_functions += st.session_state.basic_functions.get_function_names()
+                basic_names = list(st.session_state.basic_functions.get_function_names())
+                all_functions += basic_names
             if "Special" in func_categories and st.session_state.get("special_functions"):
-                all_functions += st.session_state.special_functions.get_function_names()[:20]
+                special_names = list(st.session_state.special_functions.get_function_names())[:20]
+                all_functions += special_names
             if not all_functions:
                 st.warning("No function names available from libraries.")
                 return
@@ -745,6 +749,12 @@ def batch_generation_page():
                         "M": float(np.random.uniform(-1, 1)),
                     }
                     func_name = np.random.choice(all_functions)
+                    # pick correct function object from correct library (FIX)
+                    if func_name in basic_names:
+                        f_z = st.session_state.basic_functions.get_function(func_name)
+                    else:
+                        f_z = st.session_state.special_functions.get_function(func_name)
+
                     gt = np.random.choice(gen_types)
                     res = {}
                     if gt == "linear":
@@ -753,22 +763,21 @@ def batch_generation_page():
                             gen_num = np.random.randint(1, 9)
                             if gen_num in [4,5]:
                                 params["a"] = float(np.random.uniform(1,3))
-                            res = factory.create(gen_num, st.session_state.basic_functions.get_function(func_name), **params)
+                            res = factory.create(gen_num, f_z, **params)
                         elif LinearGeneratorFactory:
                             factory = LinearGeneratorFactory()
-                            res = factory.create(1, st.session_state.basic_functions.get_function(func_name), **params)
+                            res = factory.create(1, f_z, **params)
                     else:
                         if CompleteNonlinearGeneratorFactory:
                             factory = CompleteNonlinearGeneratorFactory()
                             gen_num = np.random.randint(1, 11)
-                            # safely attach optional params only if factory expects them
                             if gen_num in [1,2,4]: params["q"] = int(np.random.randint(2,6))
                             if gen_num in [2,3,5]: params["v"] = int(np.random.randint(2,6))
                             if gen_num in [4,5,9,10]: params["a"] = float(np.random.uniform(1,3))
-                            res = factory.create(gen_num, st.session_state.basic_functions.get_function(func_name), **params)
+                            res = factory.create(gen_num, f_z, **params)
                         elif NonlinearGeneratorFactory:
                             factory = NonlinearGeneratorFactory()
-                            res = factory.create(1, st.session_state.basic_functions.get_function(func_name), **params)
+                            res = factory.create(1, f_z, **params)
                     if not res: continue
 
                     row = {
@@ -799,7 +808,7 @@ def batch_generation_page():
                 st.download_button("📄 Download JSON", js, f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json", "application/json")
             with c3:
                 if export_format in ["LaTeX","All"]:
-                    latex = "\\n".join([
+                    latex = "\n".join([
                         r"\begin{tabular}{|c|c|c|c|c|}", r"\hline", r"ID & Type & Generator & Function & Order \\",
                         r"\hline", *[f"{r.get('ID','')} & {r.get('Type','')} & {r.get('Generator','')} & {r.get('Function','')} & {r.get('Order','')} \\\\" for r in batch_results[:30]],
                         r"\hline", r"\end{tabular}"
