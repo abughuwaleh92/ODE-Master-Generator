@@ -1,120 +1,84 @@
 """
-Machine Learning Trainer for ODE Generators (rewritten)
-- Robust to missing keys (fixes KeyError: 'v')
-- Works with Basic + Special + Phi libraries for function_id mapping
-- Mixed precision (optional), grad clipping, ReduceLROnPlateau
-- Optional external dataset injection via set_dataset()
+Machine Learning Trainer for ODE Generators
+- Handles training, evaluation, and ODE generation.
+- Fixes batch collation: custom collate_fn returns FEATURES ONLY to avoid dict key mismatches (e.g., 'v').
+- Preserves generator + dataset modes, AMP, checkpoints, VAE/Transformer, and ONNX export.
 """
 
+from __future__ import annotations
 import os
-import json
 import gc
-import math
+import json
 import logging
-from datetime import datetime
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
-import sympy as sp
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, IterableDataset, random_split
+from torch.utils.data import Dataset, IterableDataset, DataLoader, random_split
 from tqdm import tqdm
+import sympy as sp
 
 # Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Factories and functions
+# ---- Resilient imports from project ----
 try:
     from src.generators.linear_generators import LinearGeneratorFactory
-except Exception:
-    LinearGeneratorFactory = None
-
-try:
     from src.generators.nonlinear_generators import NonlinearGeneratorFactory
-except Exception:
-    NonlinearGeneratorFactory = None
-
-try:
     from src.functions.basic_functions import BasicFunctions
-except Exception:
-    BasicFunctions = None
-
-try:
     from src.functions.special_functions import SpecialFunctions
-except Exception:
-    SpecialFunctions = None
-
-try:
-    from src.functions.phi_library import PhiLibrary
-except Exception:
-    PhiLibrary = None
-
-# Optional models
-try:
     from src.ml.pattern_learner import (
-        GeneratorPatternLearner, GeneratorVAE, GeneratorTransformer, create_model
+        GeneratorPatternLearner,
+        GeneratorVAE,
+        GeneratorTransformer,
+        create_model,  # keep available if referenced elsewhere
     )
-except Exception:
-    GeneratorPatternLearner = GeneratorVAE = GeneratorTransformer = create_model = None
+except Exception as e:
+    logger.error(f"Import error: {e}")
+    # Allow partial functionality even if factories are missing
+    LinearGeneratorFactory = None  # type: ignore
+    NonlinearGeneratorFactory = None  # type: ignore
+    BasicFunctions = None  # type: ignore
+    SpecialFunctions = None  # type: ignore
+    GeneratorPatternLearner = None  # type: ignore
+    GeneratorVAE = None  # type: ignore
+    GeneratorTransformer = None  # type: ignore
+    create_model = None  # type: ignore
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers: function universe (IDs stable for training)
-# ──────────────────────────────────────────────────────────────────────────────
-def _function_universe() -> List[str]:
-    names: List[str] = []
-    if BasicFunctions:
-        try:
-            names += BasicFunctions().get_function_names()
-        except Exception:
-            pass
-    if SpecialFunctions:
-        try:
-            names += SpecialFunctions().get_function_names()[:50]
-        except Exception:
-            pass
-    if PhiLibrary:
-        try:
-            names += PhiLibrary().get_function_names()
-        except Exception:
-            pass
-    # unique order preserving
-    seen = set(); uniq = []
-    for n in names:
-        if n not in seen:
-            seen.add(n); uniq.append(n)
-    if not uniq:
-        uniq = ["id"]
-    return uniq
+# =========================================================
+# Collate: FEATURES ONLY (fix for KeyError: 'v')
+# =========================================================
+def features_only_collate(batch: List[Any]) -> Tuple[torch.Tensor, None]:
+    """
+    Collate a list of items where each item is either:
+      - (features_tensor, anything)  OR
+      - features_tensor
+    Returns: (stacked_features, None)
+    This bypasses dict collation entirely and prevents KeyError on missing keys.
+    """
+    feats: List[torch.Tensor] = []
+    for item in batch:
+        if isinstance(item, (tuple, list)):
+            feats.append(item[0])
+        else:
+            feats.append(item)
+    return torch.stack(feats, dim=0), None
 
-_FN_UNIVERSE = _function_universe()
-_FN2ID = {n: i for i, n in enumerate(_FN_UNIVERSE)}
-_ID2FN = {i: n for i, n in enumerate(_FN_UNIVERSE)}
 
-def _get_function_expr(name: str):
-    z = sp.Symbol("z", real=True)
-    if BasicFunctions and name in BasicFunctions().get_function_names():
-        return sp.sympify(BasicFunctions().get_function(name))
-    if SpecialFunctions and name in SpecialFunctions().get_function_names():
-        return sp.sympify(SpecialFunctions().get_function(name))
-    if PhiLibrary and name in PhiLibrary().get_function_names():
-        return sp.sympify(PhiLibrary().get_function(name))
-    return z
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Dataset
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================================================
+# Dataset / Generator
+# =========================================================
 class ODEDataset(Dataset):
     """
-    Dataset for ODE generator patterns (caches features).
-    Input feature vector (size=12 by default):
-      [alpha, beta, n, M, function_id, is_linear, generator_number, order,
-       q, v, a, noise]
+    Dataset for ODE generator patterns with a small in-memory feature cache.
+    We still return (features, meta) but the collate_fn discards meta during training.
     """
+
     def __init__(self, data: List[Dict[str, Any]], max_cache_size: int = 1000):
         self.data = data
         self.max_cache_size = min(max_cache_size, len(data))
@@ -122,161 +86,212 @@ class ODEDataset(Dataset):
         self._cache_hits = 0
         self._cache_misses = 0
 
-    def __len__(self) -> int:
-        return len(self.data)
-
     def _extract_features(self, item: Dict[str, Any]) -> torch.Tensor:
-        p = dict(item)
-        # If nested "parameters" present, overlay first (so local keys override)
-        if isinstance(item.get("parameters"), dict):
-            p = {**item["parameters"], **p}
-
-        fn_name = p.get("function_used") or p.get("function_name") or "id"
-        function_id = _FN2ID.get(fn_name, 0)
+        # Uniformly expose optional keys with defaults
+        alpha = float(item.get("alpha", 1.0))
+        beta = float(item.get("beta", 1.0))
+        n = float(item.get("n", 1))
+        M = float(item.get("M", 0.0))
+        function_id = float(item.get("function_id", 0))
+        is_linear = 1.0 if item.get("type") == "linear" else 0.0
+        generator_number = float(item.get("generator_number", 1))
+        order = float(item.get("order", 2))
+        q = float(item.get("q", 0))
+        v = float(item.get("v", 0))
+        a = float(item.get("a", 0.0))
+        noise = float(np.random.randn() * 0.1)
 
         features = [
-            float(p.get("alpha", 1.0)),
-            float(p.get("beta", 1.0)),
-            float(p.get("n", 1)),
-            float(p.get("M", 0.0)),
-            float(function_id),
-            1.0 if str(p.get("type","nonlinear")) == "linear" else 0.0,
-            float(p.get("generator_number", 1)),
-            float(p.get("order", 2)),
-            float(p.get("q", 0)),         # robust default
-            float(p.get("v", 0)),         # robust default (fixes KeyError 'v')
-            float(p.get("a", 0.0)),
-            float(np.random.randn() * 0.05),
+            alpha, beta, n, M, function_id, is_linear,
+            generator_number, order, q, v, a, noise
         ]
         return torch.tensor(features, dtype=torch.float32)
+
+    def __len__(self) -> int:
+        return len(self.data)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Dict[str, Any]]:
         if idx in self._feature_cache:
             self._cache_hits += 1
-            feats = self._feature_cache[idx]
+            features = self._feature_cache[idx]
         else:
             self._cache_misses += 1
-            feats = self._extract_features(self.data[idx])
+            features = self._extract_features(self.data[idx])
             if len(self._feature_cache) < self.max_cache_size:
-                self._feature_cache[idx] = feats
+                self._feature_cache[idx] = features
             else:
-                # Simple eviction
-                oldk = next(iter(self._feature_cache))
-                del self._feature_cache[oldk]
-                self._feature_cache[idx] = feats
-        return feats, self.data[idx]
+                # naive eviction
+                try:
+                    oldest = next(iter(self._feature_cache))
+                    del self._feature_cache[oldest]
+                except Exception:
+                    self._feature_cache.clear()
+                self._feature_cache[idx] = features
+
+        # Ensure uniform meta keys (not used during training, but nice to keep consistent)
+        meta = dict(self.data[idx])
+        meta.setdefault("q", 0)
+        meta.setdefault("v", 0)
+        meta.setdefault("a", 0.0)
+        return features, meta
 
     def get_cache_stats(self) -> Dict[str, float]:
         total = self._cache_hits + self._cache_misses
         return {
-            "cache_hits": self._cache_hits,
-            "cache_misses": self._cache_misses,
-            "hit_rate": (self._cache_hits / total) if total else 0.0,
-            "cache_size": len(self._feature_cache)
+            "cache_hits": float(self._cache_hits),
+            "cache_misses": float(self._cache_misses),
+            "hit_rate": float(self._cache_hits / total) if total else 0.0,
+            "cache_size": float(len(self._feature_cache)),
         }
 
 
 class ODEDataGenerator(IterableDataset):
     """
-    Streaming generator (memory efficient).
+    Memory-efficient on-the-fly sample generator for large-scale training.
+    Yields (features_tensor, meta_dict).
     """
+
     def __init__(self, num_samples: int, batch_size: int = 32, seed: Optional[int] = None):
         self.num_samples = int(num_samples)
         self.batch_size = int(batch_size)
         self.seed = seed
 
-        self.lin = LinearGeneratorFactory() if LinearGeneratorFactory else None
-        self.nonlin = NonlinearGeneratorFactory() if NonlinearGeneratorFactory else None
-        self.basic = BasicFunctions() if BasicFunctions else None
-        self.special = SpecialFunctions() if SpecialFunctions else None
-        self.phi = PhiLibrary() if PhiLibrary else None
+        # Factories & function libs (if available)
+        self.linear_factory = LinearGeneratorFactory() if LinearGeneratorFactory else None
+        self.nonlinear_factory = NonlinearGeneratorFactory() if NonlinearGeneratorFactory else None
+        self.basic_functions = BasicFunctions() if BasicFunctions else None
+        self.special_functions = SpecialFunctions() if SpecialFunctions else None
 
-        self.basic_names  = self.basic.get_function_names()  if self.basic else []
-        self.special_names= (self.special.get_function_names()[:20] if self.special else [])
-        self.phi_names    = self.phi.get_function_names()    if self.phi else []
-        self.all_names    = self.basic_names + self.special_names + self.phi_names
-        if not self.all_names:
-            self.all_names = ["id"]
+        # Function name lists
+        self.basic_func_names = (
+            self.basic_functions.get_function_names() if self.basic_functions else ["exp", "sin", "cos"]
+        )
+        special = self.special_functions.get_function_names() if self.special_functions else ["erf", "sinh", "cosh"]
+        self.special_func_names = special[:5]  # optional cap
+        self.all_func_names = list(self.basic_func_names) + list(self.special_func_names)
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, Dict[str, Any]]]:
         if self.seed is not None:
-            np.random.seed(self.seed); torch.manual_seed(self.seed)
+            np.random.seed(self.seed)
+            torch.manual_seed(self.seed)
 
         generated = 0
         while generated < self.num_samples:
             try:
-                params = {
-                    "alpha": np.random.uniform(-5, 5),
-                    "beta":  np.random.uniform(0.1, 5),
-                    "n":     int(np.random.randint(1, 5)),
-                    "M":     np.random.uniform(-5, 5),
+                # Base parameters
+                params: Dict[str, Any] = {
+                    "alpha": float(np.random.uniform(-5, 5)),
+                    "beta": float(np.random.uniform(0.1, 5)),
+                    "n": int(np.random.randint(1, 5)),
+                    "M": float(np.random.uniform(-5, 5)),
                 }
-                func_name = np.random.choice(self.all_names)
-                if func_name in self.basic_names:
-                    f_z = self.basic.get_function(func_name)
-                elif func_name in self.special_names:
-                    f_z = self.special.get_function(func_name)
+
+                # Random function
+                func_name = np.random.choice(self.all_func_names)
+                if func_name in self.basic_func_names:
+                    f_z = self.basic_functions.get_function(func_name) if self.basic_functions else None
+                    func_id = self.basic_func_names.index(func_name)
                 else:
-                    f_z = self.phi.get_function(func_name) if self.phi else None
+                    f_z = self.special_functions.get_function(func_name) if self.special_functions else None
+                    func_id = len(self.basic_func_names) + self.special_func_names.index(func_name)
 
-                function_id = _FN2ID.get(func_name, 0)
-                gen_type = np.random.choice(["linear","nonlinear"])
+                # Generator type & number
+                gen_type = np.random.choice(["linear", "nonlinear"])
+                gen_num = 1
 
-                if gen_type == "linear" and self.lin:
+                # Default optionals (IMPORTANT for uniform meta)
+                q = 0
+                v = 0
+                a = 0.0
+                order_val = 2
+
+                if gen_type == "linear":
                     gen_num = int(np.random.randint(1, 9))
-                    if gen_num in [4,5]:
-                        params["a"] = float(np.random.uniform(1, 3))
-                    result = self.lin.create(gen_num, f_z, **params)
-                elif gen_type == "nonlinear" and self.nonlin:
-                    gen_num = int(np.random.randint(1, 11))
-                    # only add params they might use
-                    if gen_num in [1,2,4]: params["q"] = int(np.random.randint(2,6))
-                    if gen_num in [2,3,5]: params["v"] = int(np.random.randint(2,6))
-                    if gen_num in [4,5,9,10]: params["a"] = float(np.random.uniform(1,5))
-                    result = self.nonlin.create(gen_num, f_z, **params)
+                    if gen_num in [4, 5]:
+                        a = float(np.random.uniform(1, 3))
+                        params["a"] = a
+                    if self.linear_factory and f_z is not None:
+                        try:
+                            result = self.linear_factory.create(gen_num, f_z, **params)
+                            order_val = int(result.get("order", 2))
+                        except Exception:
+                            order_val = int(np.random.randint(1, 5))
+                    else:
+                        order_val = int(np.random.randint(1, 5))
                 else:
-                    # no factories available: synthesize minimal record
-                    gen_type = "linear"
-                    gen_num = 1
-                    result = {"order": 1}
+                    gen_num = int(np.random.randint(1, 11))
+                    extra_params: Dict[str, Any] = {}
+                    if gen_num in [1, 2, 4]:
+                        q = int(np.random.randint(2, 6))
+                        extra_params["q"] = q
+                    if gen_num in [2, 3, 5]:
+                        v = int(np.random.randint(2, 6))
+                        extra_params["v"] = v
+                    if gen_num in [4, 5, 9, 10]:
+                        a = float(np.random.uniform(1, 5))
+                        extra_params["a"] = a
+                    params.update(extra_params)
+                    if self.nonlinear_factory and f_z is not None:
+                        try:
+                            result = self.nonlinear_factory.create(gen_num, f_z, **params)
+                            order_val = int(result.get("order", 2))
+                        except Exception:
+                            order_val = int(np.random.randint(1, 5))
+                    else:
+                        order_val = int(np.random.randint(1, 5))
 
-                data_item = {
+                # Meta (uniform keys present)
+                meta = {
                     **params,
                     "function_name": func_name,
-                    "function_used": func_name,
-                    "function_id": function_id,
+                    "function_id": func_id,
                     "type": gen_type,
                     "generator_number": gen_num,
-                    "order": result.get("order", 1),
+                    "order": order_val,
+                    "q": q,
+                    "v": v,
+                    "a": a,
                 }
 
-                feats = torch.tensor([
-                    float(params["alpha"]), float(params["beta"]), float(params["n"]), float(params["M"]),
-                    float(function_id), 1.0 if gen_type=="linear" else 0.0, float(gen_num),
-                    float(result.get("order", 1)), float(params.get("q",0)), float(params.get("v",0)),
-                    float(params.get("a",0.0)), float(np.random.randn()*0.05)
-                ], dtype=torch.float32)
+                # Features
+                features = torch.tensor(
+                    [
+                        params["alpha"],
+                        params["beta"],
+                        float(params["n"]),
+                        params["M"],
+                        float(func_id),
+                        1.0 if gen_type == "linear" else 0.0,
+                        float(gen_num),
+                        float(order_val),
+                        float(q),
+                        float(v),
+                        float(a),
+                        float(np.random.randn() * 0.1),
+                    ],
+                    dtype=torch.float32,
+                )
 
-                yield feats, data_item
+                yield features, meta
                 generated += 1
+
             except Exception as e:
                 logger.debug(f"Error generating sample: {e}")
                 continue
 
     def __len__(self) -> int:
-        return self.num_samples
+        return int(self.num_samples)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================================================
 # Trainer
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================================================
 class MLTrainer:
     """
-    Baseline trainer compatible with your UI:
-      - model_type ∈ {'pattern_learner','vae','transformer'}
-      - memory safe generator or static dataset (set_dataset)
-      - AMP/mixed precision optional
+    Main trainer for feature-reconstruction/self-supervised learning on generator features.
+    Supports model types: pattern_learner, vae, transformer.
     """
+
     def __init__(
         self,
         model_type: str = "pattern_learner",
@@ -286,66 +301,59 @@ class MLTrainer:
         learning_rate: float = 1e-3,
         device: Optional[str] = None,
         checkpoint_dir: str = "checkpoints",
-        enable_mixed_precision: bool = False
+        enable_mixed_precision: bool = False,
     ):
         self.model_type = model_type
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.output_dim = output_dim
+        self.input_dim = int(input_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.output_dim = int(output_dim)
         self.learning_rate = float(learning_rate)
         self.checkpoint_dir = checkpoint_dir
-        self.enable_mixed_precision = enable_mixed_precision
 
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        self.device = torch.device(device) if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        # Build model
-        if model_type == "pattern_learner" and GeneratorPatternLearner:
-            self.model = GeneratorPatternLearner(input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim)
-        elif model_type == "vae" and GeneratorVAE:
-            self.model = GeneratorVAE(input_dim=input_dim, hidden_dim=hidden_dim, latent_dim=32)
-        elif model_type == "transformer" and GeneratorTransformer:
-            self.model = GeneratorTransformer(input_dim=input_dim, d_model=hidden_dim)
+        # Device
+        if device:
+            self.device = torch.device(device)
         else:
-            # Fallback: small MLP
-            self.model = nn.Sequential(
-                nn.Linear(input_dim, hidden_dim), nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
-                nn.Linear(hidden_dim, output_dim),
-            )
-        self.model.to(self.device)
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        # AMP only if CUDA
+        self.enable_mixed_precision = bool(enable_mixed_precision and self.device.type == "cuda")
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.enable_mixed_precision)
+
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+
+        # Model
+        self.model = self._create_model().to(self.device)
+
+        # Optimizer & Scheduler
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode="min", patience=5, factor=0.5)
-        self.criterion = self._vae_loss if model_type == "vae" else nn.MSELoss()
-        self.scaler = torch.cuda.amp.GradScaler() if (enable_mixed_precision and self.device.type == "cuda") else None
 
-        self.history: Dict[str, Any] = {"train_loss": [], "val_loss": [], "epochs": 0, "best_val_loss": float("inf")}
-        self._injected_dataset: Optional[ODEDataset] = None
+        # Loss
+        self.criterion = self._vae_loss if self.model_type == "vae" else nn.MSELoss()
 
-    # External dataset injection (optional)
-    def set_dataset(self, generated_odes: List[Dict[str,Any]], batch_rows: List[Dict[str,Any]] = []):
-        data = []
-        data.extend(generated_odes or [])
-        # batch_rows are typically table rows; we only take usable bits
-        for r in (batch_rows or []):
-            data.append({
-                "alpha": r.get("α", 1.0),
-                "beta":  r.get("β", 1.0),
-                "n":     r.get("n", 1),
-                "M":     0.0,
-                "function_used": r.get("Function", "id"),
-                "type": r.get("Type", "nonlinear"),
-                "generator_number": r.get("Generator", 1),
-                "order": r.get("Order", 1),
-            })
-        if data:
-            self._injected_dataset = ODEDataset(data, max_cache_size=min(2000, len(data)))
+        # Training history
+        self.history: Dict[str, Any] = {
+            "train_loss": [],
+            "val_loss": [],
+            "epochs": 0,
+            "best_val_loss": float("inf"),
+        }
 
-    def _vae_loss(self, recon_x, x, mu, log_var):
-        recon_loss = F.mse_loss(recon_x, x, reduction='mean')
-        kld_loss = -0.5 * torch.mean(1 + log_var - mu.pow(2) - log_var.exp())
-        return recon_loss + kld_loss
+        # Optional libs for generation
+        self.basic_functions = BasicFunctions() if BasicFunctions else None
+        self.special_functions = SpecialFunctions() if SpecialFunctions else None
+
+        # Optional injected datasets (from UI)
+        self._injected_data: List[Dict[str, Any]] = []
+
+    # ----------------- Public API -----------------
+    def set_dataset(self, single_odes: List[Dict[str, Any]], batch_results: List[Dict[str, Any]] = None) -> None:
+        """Allow UI to inject existing ODE samples (optional)."""
+        merged = list(single_odes or [])
+        if batch_results:
+            merged.extend(batch_results)
+        self._injected_data = merged
 
     def train(
         self,
@@ -357,118 +365,154 @@ class MLTrainer:
         use_generator: bool = True,
         checkpoint_interval: int = 10,
         gradient_accumulation_steps: int = 1,
-        grad_clip: float = 1.0,
-        progress_callback: Optional[Callable[[int, int], None]] = None
-    ):
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> None:
+        """
+        Train the model. By default uses the ODEDataGenerator (memory-efficient), which avoids the dict collation issue.
+        """
         logger.info(f"Starting training for {epochs} epochs...")
 
-        if self._injected_dataset is not None:
-            dataset = self._injected_dataset
-            use_generator = False
-
+        # ---------- Data loaders ----------
+        pin = self.device.type == "cuda"
         if use_generator:
             train_samples = int(samples * (1 - validation_split))
-            val_samples = max(1, samples - train_samples)
+            val_samples = max(int(samples - train_samples), 1)
+
             train_dataset = ODEDataGenerator(train_samples, batch_size)
-            val_dataset   = ODEDataGenerator(val_samples,   batch_size, seed=42)
-            train_loader = DataLoader(train_dataset, batch_size=batch_size, num_workers=0)
-            val_loader   = DataLoader(val_dataset,   batch_size=batch_size, num_workers=0)
+            val_dataset = ODEDataGenerator(val_samples, batch_size, seed=42)
+
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                num_workers=0,
+                pin_memory=pin,
+                collate_fn=features_only_collate,  # <- FIX
+            )
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                num_workers=0,
+                pin_memory=pin,
+                collate_fn=features_only_collate,  # <- FIX
+            )
         else:
-            if self._injected_dataset is None:
-                # build a static dataset from the streaming generator
-                gen = ODEDataGenerator(samples, batch_size)
-                static_data = []
-                for feats, item in tqdm(gen, total=samples, desc="Preparing data"):
-                    static_data.append(item)
-                dataset = ODEDataset(static_data, max_cache_size=min(1500, len(static_data)))
-            val_size = int(len(dataset) * validation_split)
-            train_size = max(1, len(dataset) - val_size)
+            # traditional: pre-generate + cache
+            data = self._generate_training_data_batch(samples)
+            dataset = ODEDataset(data, max_cache_size=min(1000, len(data)))
+            val_size = max(int(len(dataset) * validation_split), 1)
+            train_size = max(len(dataset) - val_size, 1)
             train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-            pin_mem = self.device.type == "cuda"
-            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=pin_mem)
-            val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, pin_memory=pin_mem)
+
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                pin_memory=pin,
+                num_workers=0,
+                collate_fn=features_only_collate,  # <- FIX
+            )
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                pin_memory=pin,
+                num_workers=0,
+                collate_fn=features_only_collate,  # <- FIX
+            )
 
         best_val_loss = float("inf")
 
+        # ---------- Epochs ----------
         for epoch in range(epochs):
+            # Train
             self.model.train()
-            train_loss = 0.0; batch_count = 0
-            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
+            train_loss = 0.0
+            batch_count = 0
 
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
             for batch_idx, (batch_features, _) in enumerate(pbar):
-                batch_features = batch_features.to(self.device)
-                if self.scaler:
+                batch_features = batch_features.to(self.device, non_blocking=pin)
+
+                if self.enable_mixed_precision:
                     with torch.cuda.amp.autocast():
                         if self.model_type == "vae":
                             recon, mu, log_var = self.model(batch_features)
                             loss = self.criterion(recon, batch_features, mu, log_var)
                         else:
-                            out = self.model(batch_features)
-                            loss = self.criterion(out, batch_features)
+                            output = self.model(batch_features)
+                            loss = self.criterion(output, batch_features)
                     loss = loss / gradient_accumulation_steps
                     self.scaler.scale(loss).backward()
+
                     if (batch_idx + 1) % gradient_accumulation_steps == 0:
-                        if grad_clip and grad_clip > 0:
-                            self.scaler.unscale_(self.optimizer)
-                            nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
-                        self.optimizer.zero_grad()
+                        self.optimizer.zero_grad(set_to_none=True)
                 else:
                     if self.model_type == "vae":
                         recon, mu, log_var = self.model(batch_features)
                         loss = self.criterion(recon, batch_features, mu, log_var)
                     else:
-                        out = self.model(batch_features)
-                        loss = self.criterion(out, batch_features)
+                        output = self.model(batch_features)
+                        loss = self.criterion(output, batch_features)
                     loss = loss / gradient_accumulation_steps
                     loss.backward()
+
                     if (batch_idx + 1) % gradient_accumulation_steps == 0:
-                        if grad_clip and grad_clip > 0:
-                            nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
                         self.optimizer.step()
-                        self.optimizer.zero_grad()
+                        self.optimizer.zero_grad(set_to_none=True)
 
-                train_loss += float(loss.item()) * gradient_accumulation_steps
+                train_loss += loss.item() * gradient_accumulation_steps
                 batch_count += 1
-                pbar.set_postfix({"loss": train_loss / max(1, batch_count)})
+                pbar.set_postfix({"loss": train_loss / max(batch_count, 1)})
 
-            # Validation
+            # Validate
             self.model.eval()
-            val_loss = 0.0; val_batch_count = 0
+            val_loss = 0.0
+            val_count = 0
             with torch.no_grad():
                 for batch_features, _ in val_loader:
-                    batch_features = batch_features.to(self.device)
+                    batch_features = batch_features.to(self.device, non_blocking=pin)
                     if self.model_type == "vae":
                         recon, mu, log_var = self.model(batch_features)
                         loss = self.criterion(recon, batch_features, mu, log_var)
                     else:
-                        out = self.model(batch_features)
-                        loss = self.criterion(out, batch_features)
-                    val_loss += float(loss.item()); val_batch_count += 1
+                        output = self.model(batch_features)
+                        loss = self.criterion(output, batch_features)
+                    val_loss += loss.item()
+                    val_count += 1
 
-            avg_train = train_loss / max(1, batch_count)
-            avg_val   = val_loss   / max(1, val_batch_count)
+            avg_train = train_loss / max(batch_count, 1)
+            avg_val = val_loss / max(val_count, 1)
             self.history["train_loss"].append(avg_train)
             self.history["val_loss"].append(avg_val)
             self.history["epochs"] = epoch + 1
             self.scheduler.step(avg_val)
-            logger.info(f"Epoch {epoch+1}: Train={avg_train:.4f}  Val={avg_val:.4f}")
 
+            logger.info(f"Epoch {epoch+1}: Train {avg_train:.4f} | Val {avg_val:.4f}")
+
+            # Callback (for RQ meta progress or Streamlit progress bar)
             if progress_callback:
-                try: progress_callback(epoch+1, epochs)
-                except Exception: pass
+                try:
+                    progress_callback(epoch + 1, epochs)
+                except Exception:
+                    pass
 
             # Save best
-            if save_best and avg_val < best_val_loss - 1e-9:
+            if save_best and avg_val < best_val_loss:
                 best_val_loss = avg_val
                 self.history["best_val_loss"] = best_val_loss
-                self.save_model(os.path.join(self.checkpoint_dir, f"{self.model_type}_best.pth"))
-                logger.info(f"Saved best model (val={best_val_loss:.4f})")
+                best_path = os.path.join(self.checkpoint_dir, f"{self.model_type}_best.pth")
+                self.save_model(best_path)
+                logger.info(f"Saved best model to {best_path} (val={best_val_loss:.4f})")
 
-            if (epoch + 1) % checkpoint_interval == 0:
-                self.save_checkpoint(os.path.join(self.checkpoint_dir, f"{self.model_type}_epoch_{epoch+1}.pth"), epoch+1)
+            # Periodic checkpoint
+            if checkpoint_interval and (epoch + 1) % checkpoint_interval == 0:
+                ckpt_path = os.path.join(self.checkpoint_dir, f"{self.model_type}_epoch_{epoch+1}.pth")
+                self.save_checkpoint(ckpt_path, epoch + 1)
+                logger.info(f"Saved checkpoint at epoch {epoch+1}")
 
+            # Memory cleanup
             if (epoch + 1) % 10 == 0:
                 gc.collect()
                 if self.device.type == "cuda":
@@ -476,22 +520,58 @@ class MLTrainer:
 
         logger.info("Training completed.")
 
-    # I/O utils
+    # ----------------- Internals -----------------
+    def _create_model(self) -> nn.Module:
+        if self.model_type == "pattern_learner":
+            assert GeneratorPatternLearner is not None, "PatternLearner not available"
+            return GeneratorPatternLearner(self.input_dim, self.hidden_dim, self.output_dim)
+        elif self.model_type == "vae":
+            assert GeneratorVAE is not None, "VAE not available"
+            return GeneratorVAE(self.input_dim, self.hidden_dim, latent_dim=32)
+        elif self.model_type == "transformer":
+            assert GeneratorTransformer is not None, "Transformer not available"
+            return GeneratorTransformer(input_dim=self.input_dim, d_model=self.hidden_dim)
+        else:
+            raise ValueError(f"Unknown model type: {self.model_type}")
+
+    def _vae_loss(self, recon_x, x, mu, log_var):
+        recon_loss = F.mse_loss(recon_x, x, reduction="sum")
+        kld_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
+        return recon_loss + kld_loss
+
+    def _generate_training_data_batch(self, num_samples: int) -> List[Dict[str, Any]]:
+        """
+        Generates synthetic training meta in batches using the on-the-fly generator (for memory saving).
+        The training loop uses features_only_collate, so meta variability is harmless.
+        """
+        logger.info(f"Generating {num_samples} synthetic samples...")
+        data: List[Dict[str, Any]] = []
+        gen = ODEDataGenerator(num_samples, batch_size=64)
+        for _, meta in tqdm(gen, total=num_samples, desc="Generating data"):
+            data.append(meta)
+        logger.info(f"Generated {len(data)} samples")
+        return data
+
+    # ----------------- Checkpoints -----------------
     def save_checkpoint(self, path: str, epoch: int):
-        ck = {
+        ckpt: Dict[str, Any] = {
             "epoch": epoch,
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "history": self.history,
             "model_type": self.model_type,
-            "input_dim": self.input_dim, "hidden_dim": self.hidden_dim, "output_dim": self.output_dim,
-            "learning_rate": self.learning_rate
+            "input_dim": self.input_dim,
+            "hidden_dim": self.hidden_dim,
+            "output_dim": self.output_dim,
+            "learning_rate": self.learning_rate,
         }
-        if self.scaler:
-            ck["scaler_state_dict"] = self.scaler.state_dict()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save(ck, path)
+        if self.scaler and self.enable_mixed_precision:
+            try:
+                ckpt["scaler_state_dict"] = self.scaler.state_dict()
+            except Exception:
+                pass
+        torch.save(ckpt, path)
         logger.info(f"Checkpoint saved to {path}")
 
     def load_checkpoint(self, path: str) -> int:
@@ -499,29 +579,31 @@ class MLTrainer:
             logger.warning(f"Checkpoint not found: {path}")
             return 0
         try:
-            ck = torch.load(path, map_location=self.device)
-            self.model.load_state_dict(ck["model_state_dict"])
-            self.optimizer.load_state_dict(ck["optimizer_state_dict"])
-            self.scheduler.load_state_dict(ck["scheduler_state_dict"])
-            self.history = ck.get("history", self.history)
-            if self.scaler and "scaler_state_dict" in ck:
-                self.scaler.load_state_dict(ck["scaler_state_dict"])
-            epoch = int(ck.get("epoch", 0))
-            logger.info(f"Loaded checkpoint (epoch {epoch})")
+            checkpoint = torch.load(path, map_location=self.device)
+            self.model.load_state_dict(checkpoint["model_state_dict"])
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            self.history = checkpoint.get("history", self.history)
+            if self.scaler and self.enable_mixed_precision and "scaler_state_dict" in checkpoint:
+                self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+            epoch = int(checkpoint.get("epoch", 0))
+            logger.info(f"Loaded checkpoint from {path} (epoch {epoch})")
             return epoch
         except Exception as e:
             logger.error(f"Error loading checkpoint: {e}")
             return 0
 
     def save_model(self, path: str):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save({
+        payload = {
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "history": self.history,
             "model_type": self.model_type,
-            "input_dim": self.input_dim, "hidden_dim": self.hidden_dim, "output_dim": self.output_dim
-        }, path)
+            "input_dim": self.input_dim,
+            "hidden_dim": self.hidden_dim,
+            "output_dim": self.output_dim,
+        }
+        torch.save(payload, path)
         logger.info(f"Model saved to {path}")
 
     def load_model(self, path: str) -> bool:
@@ -529,69 +611,107 @@ class MLTrainer:
             logger.warning(f"Model file not found: {path}")
             return False
         try:
-            ck = torch.load(path, map_location=self.device)
-            self.model.load_state_dict(ck["model_state_dict"])
-            self.optimizer.load_state_dict(ck["optimizer_state_dict"])
-            self.history = ck.get("history", self.history)
-            logger.info(f"Model loaded from {path}")
+            payload = torch.load(path, map_location=self.device)
+            self.model.load_state_dict(payload["model_state_dict"])
+            if "optimizer_state_dict" in payload:
+                self.optimizer.load_state_dict(payload["optimizer_state_dict"])
+            self.history = payload.get("history", self.history)
+            logger.info(f"Loaded model from {path}")
             return True
         except Exception as e:
             logger.error(f"Error loading model: {e}")
             return False
 
-    # Generation utility (kept simple)
+    # ----------------- Generation / Eval / Export -----------------
     def generate_new_ode(self, seed: Optional[torch.Tensor] = None) -> Optional[Dict[str, Any]]:
+        """
+        Generate new ODE-style parameter vector and attempt to build an ODE via factories.
+        """
         self.model.eval()
         with torch.no_grad():
             if seed is None:
-                seed = torch.randn(1, self.input_dim, device=self.device)
-            if self.model_type == "vae":
-                gen, _, _ = self.model(seed)
+                if self.model_type == "vae":
+                    generated = self.model.sample(1)
+                else:
+                    seed = torch.randn(1, self.input_dim).to(self.device)
+                    generated = self.model(seed)
             else:
-                gen = self.model(seed)
+                seed = seed.to(self.device)
+                if self.model_type == "vae":
+                    generated, _, _ = self.model(seed)
+                else:
+                    generated = self.model(seed)
 
-            v = gen.detach().cpu().numpy()[0]
-            alpha = float(np.clip(v[0], -100, 100))
-            beta  = float(np.clip(abs(v[1])+0.1, 0.1, 100))
-            n     = int(np.clip(abs(v[2]), 1, 10))
-            M     = float(np.clip(v[3], -100, 100))
-            func_id = int(abs(v[4])) % max(1, len(_FN_UNIVERSE))
-            is_linear = v[5] > 0.5
-            gen_num = int(np.clip(abs(v[6]), 1, 10 if not is_linear else 8))
-            a = float(np.clip(abs(v[10]), 0.0, 5.0))
+            params = generated.detach().cpu().numpy()[0]
 
-            fn_name = _ID2FN.get(func_id, "id")
-            # resolve f_z for factories
-            if BasicFunctions and fn_name in BasicFunctions().get_function_names():
-                f_z = BasicFunctions().get_function(fn_name)
-            elif SpecialFunctions and fn_name in SpecialFunctions().get_function_names():
-                f_z = SpecialFunctions().get_function(fn_name)
-            elif PhiLibrary and fn_name in PhiLibrary().get_function_names():
-                f_z = PhiLibrary().get_function(fn_name)
+            alpha = float(np.clip(params[0], -100, 100))
+            beta = float(np.clip(abs(params[1]) + 0.1, 0.1, 100))
+            n = int(np.clip(abs(params[2]), 1, 10))
+            M = float(np.clip(params[3], -100, 100))
+            func_id = int(abs(params[4]))
+            is_linear = bool(params[5] > 0.5)
+            gen_num = int(np.clip(abs(params[6]), 1, 8 if is_linear else 10))
+            q = int(np.clip(abs(params[8]) + 2, 2, 10))
+            v = int(np.clip(abs(params[9]) + 2, 2, 10))
+            a = float(np.clip(abs(params[10]) + 1, 1, 5))
+
+            # Choose function name from basic set
+            if self.basic_functions:
+                funcs = self.basic_functions.get_function_names()
+                if not funcs:
+                    funcs = ["exp"]
             else:
-                f_z = sp.Symbol("z")
-
-            generator_params = {"alpha": alpha, "beta": beta, "n": n, "M": M}
-            res = {}
+                funcs = ["exp", "sin", "cos"]
+            func_id = func_id % len(funcs)
+            func_name = funcs[func_id]
+            f_z = self.basic_functions.get_function(func_name) if self.basic_functions else None
 
             try:
-                if is_linear and LinearGeneratorFactory:
-                    fac = LinearGeneratorFactory()
-                    if gen_num in [4,5]: generator_params["a"] = max(1.0, a)
-                    res = fac.create(gen_num, f_z, **generator_params)
-                elif (not is_linear) and NonlinearGeneratorFactory:
-                    fac = NonlinearGeneratorFactory()
-                    extra = {}
-                    if gen_num in [1,2,4]: extra["q"] = int(np.clip(abs(v[8])+2, 2, 10))
-                    if gen_num in [2,3,5]: extra["v"] = int(np.clip(abs(v[9])+2, 2, 10))
-                    if gen_num in [4,5,9,10]: extra["a"] = max(1.0, a)
-                    res = fac.create(gen_num, f_z, **{**generator_params, **extra})
+                base_params = {"alpha": alpha, "beta": beta, "n": n, "M": M}
+                if is_linear:
+                    if LinearGeneratorFactory and f_z is not None:
+                        factory = LinearGeneratorFactory()
+                        if gen_num in [4, 5]:
+                            base_params["a"] = a
+                        res = factory.create(gen_num, f_z, **base_params)
+                    else:
+                        # fallback meta
+                        res = {
+                            "type": "linear",
+                            "order": int(np.random.randint(1, 4)),
+                            "generator_number": gen_num,
+                            "rhs": sp.Integer(0),
+                            "generator": sp.Symbol("L")[sp.Symbol("y")],
+                            "solution": sp.Integer(0),
+                        }
                 else:
-                    # fallback
-                    res = {"order": 1, "type": "linear"}
-                res["function_used"] = fn_name
+                    if NonlinearGeneratorFactory and f_z is not None:
+                        factory = NonlinearGeneratorFactory()
+                        extra = {}
+                        if gen_num in [1, 2, 4]:
+                            extra["q"] = q
+                        if gen_num in [2, 3, 5]:
+                            extra["v"] = v
+                        if gen_num in [4, 5, 9, 10]:
+                            extra["a"] = a
+                        res = factory.create(gen_num, f_z, **{**base_params, **extra})
+                    else:
+                        res = {
+                            "type": "nonlinear",
+                            "order": int(np.random.randint(1, 4)),
+                            "generator_number": gen_num,
+                            "rhs": sp.Integer(0),
+                            "generator": sp.Symbol("L")[sp.Symbol("y")],
+                            "solution": sp.Integer(0),
+                        }
+
+                res["function_used"] = func_name
                 res["ml_generated"] = True
-                res["generation_params"] = generator_params
+                res["generation_params"] = {**base_params, "q": q, "v": v, "a": a}
+                try:
+                    res["ode"] = sp.Eq(res["generator"], res["rhs"])
+                except Exception:
+                    pass
                 return res
             except Exception as e:
                 logger.error(f"Error generating ODE: {e}")
@@ -600,23 +720,51 @@ class MLTrainer:
     def evaluate(self, test_data: List[Dict[str, Any]]) -> Dict[str, float]:
         self.model.eval()
         dataset = ODEDataset(test_data)
-        loader = DataLoader(dataset, batch_size=32, shuffle=False)
+        loader = DataLoader(dataset, batch_size=32, shuffle=False, collate_fn=features_only_collate)
+        predictions: List[torch.Tensor] = []
+        targets: List[torch.Tensor] = []
+        total_loss = 0.0
 
-        total_loss = 0.0; preds = []; targs = []
         with torch.no_grad():
-            for feats, _ in loader:
-                feats = feats.to(self.device)
+            for batch_features, _ in loader:
+                batch_features = batch_features.to(self.device)
                 if self.model_type == "vae":
-                    recon, mu, log_var = self.model(feats)
-                    loss = self.criterion(recon, feats, mu, log_var)
-                    out = recon
+                    recon, mu, log_var = self.model(batch_features)
+                    loss = self.criterion(recon, batch_features, mu, log_var)
+                    output = recon
                 else:
-                    out = self.model(feats)
-                    loss = self.criterion(out, feats)
-                total_loss += float(loss.item())
-                preds.append(out.cpu()); targs.append(feats.cpu())
-        pred = torch.cat(preds); targ = torch.cat(targs)
-        mse = F.mse_loss(pred, targ).item()
-        mae = F.l1_loss(pred, targ).item()
-        corr = float(np.corrcoef(pred.flatten().numpy(), targ.flatten().numpy())[0,1])
-        return {"loss": total_loss / max(1, len(loader)), "mse": mse, "mae": mae, "correlation": corr}
+                    output = self.model(batch_features)
+                    loss = self.criterion(output, batch_features)
+                total_loss += loss.item()
+                predictions.append(output.detach().cpu())
+                targets.append(batch_features.detach().cpu())
+
+        predictions = torch.cat(predictions, dim=0)
+        targets = torch.cat(targets, dim=0)
+        mse = F.mse_loss(predictions, targets).item()
+        mae = F.l1_loss(predictions, targets).item()
+        pred_flat = predictions.flatten().numpy()
+        target_flat = targets.flatten().numpy()
+        correlation = float(np.corrcoef(pred_flat, target_flat)[0, 1])
+        return {
+            "loss": total_loss / max(len(loader), 1),
+            "mse": mse,
+            "mae": mae,
+            "correlation": correlation,
+        }
+
+    def export_onnx(self, path: str):
+        self.model.eval()
+        dummy_input = torch.randn(1, self.input_dim).to(self.device)
+        torch.onnx.export(
+            self.model,
+            dummy_input,
+            path,
+            export_params=True,
+            opset_version=11,
+            do_constant_folding=True,
+            input_names=["input"],
+            output_names=["output"],
+            dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
+        )
+        logger.info(f"Model exported to ONNX: {path}")
