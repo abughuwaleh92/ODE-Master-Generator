@@ -1,31 +1,25 @@
 {
-  "$schema": "https://railway.app/railway.schema.json",
-  "services": {
-    "ui": {
+  "services": [
+    {
       "name": "ui",
-      "source": "services/ui",
       "dockerfilePath": "services/ui/Dockerfile",
-      "env": {
-        "PORT": "8501",
-        "REDIS_URL": "${{ Redis.REDIS_URL }}"
+      "envs": {
+        "PORT": "8501"
       }
     },
-    "api": {
+    {
       "name": "api",
-      "source": "services/api",
       "dockerfilePath": "services/api/Dockerfile",
-      "env": {
-        "PORT": "8000",
-        "REDIS_URL": "${{ Redis.REDIS_URL }}"
+      "envs": {
+        "PORT": "8000"
       }
     },
-    "worker": {
+    {
       "name": "worker",
-      "source": "services/worker",
       "dockerfilePath": "services/worker/Dockerfile",
-      "env": {
+      "envs": {
         "REDIS_URL": "${{ Redis.REDIS_URL }}"
       }
     }
-  }
+  ]
 }
