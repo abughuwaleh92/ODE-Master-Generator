@@ -1,41 +1,52 @@
-# rq_utils.py
+# rq_utils.py (excerpt)
 import os
-import json
-from typing import Optional, Any, Dict
+from typing import Optional, Dict, Any
+from rq import Queue
+from redis import Redis
 
 def has_redis() -> bool:
-    return bool(os.environ.get("REDIS_URL"))
+    url = os.getenv("REDIS_URL", "")
+    return url.startswith("redis://") or url.startswith("rediss://") or url.startswith("unix://")
 
-# Only import redis/rq if present, to allow local sync mode.
-_redis = None
-_rq = None
-if has_redis():
-    import redis as _redis
-    import rq as _rq
-
-def get_queue():
-    if not has_redis():
+def _conn() -> Optional[Redis]:
+    url = os.getenv("REDIS_URL", "")
+    if not url:
         return None
-    conn = _redis.from_url(os.environ["REDIS_URL"])
-    return _rq.Queue("ode_jobs", connection=conn), conn
+    return Redis.from_url(url)
 
-def enqueue_job(func_path: str, payload: Dict[str, Any]) -> Optional[str]:
+def enqueue_job(func_path: str, payload: dict, **rq_kwargs) -> Optional[str]:
     """
-    func_path: e.g. 'worker.compute_job'
+    Enqueue a job on RQ. Accepts passthrough kwargs like:
+      job_timeout, ttl, result_ttl, failure_ttl, depends_on, at_front, on_success, on_failure, meta, etc.
     """
-    if not has_redis():
+    r = _conn()
+    if not r:
         return None
-    q, _ = get_queue()
-    job = q.enqueue(func_path, payload)
+    qname = os.getenv("RQ_QUEUE", "ode_jobs")
+    q = Queue(qname, connection=r)
+    # func_path is like "worker.compute_job"
+    job = q.enqueue(func_path, kwargs={"payload": payload}, **rq_kwargs)
     return job.id
 
 def fetch_job(job_id: str) -> Optional[Dict[str, Any]]:
-    if not has_redis():
+    r = _conn()
+    if not r:
         return None
-    _, conn = get_queue()
-    job = _rq.job.Job.fetch(job_id, connection=conn)
-    if job.is_failed:
-        return {"status": "failed", "error": str(job.exc_info)}
+    from rq.job import Job
+    try:
+        job = Job.fetch(job_id, connection=r)
+    except Exception:
+        return None
+    out: Dict[str, Any] = {
+        "id": job_id,
+        "status": job.get_status(refresh=False),
+        "meta": dict(job.meta or {}),
+    }
     if job.is_finished:
-        return {"status": "finished", "result": job.result}
-    return {"status": "queued"}
+        out["result"] = job.result
+    elif job.is_failed:
+        try:
+            out["error"] = str(job.exc_info or job._exc_info)  # rq stores traceback
+        except Exception:
+            out["error"] = "failed"
+    return out
