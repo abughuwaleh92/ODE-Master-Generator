@@ -1173,48 +1173,76 @@ def generator_constructor_page():
         st.session_state.current_generator = None
 
 def ml_pattern_learning_page():
+    import os
     st.header("🤖 ML Pattern Learning")
     if not MLTrainer:
         st.warning("MLTrainer not found in src/.")
         return
+
+    # Metrics
     c1, c2, c3, c4 = st.columns(4)
     with c1: st.metric("Patterns", len(st.session_state.generator_patterns))
     with c2: st.metric("Generated ODEs", len(st.session_state.generated_odes))
     with c3: st.metric("Training Epochs", len(st.session_state.training_history))
     with c4: st.metric("Model Status", "Trained" if st.session_state.get("ml_trained") else "Not Trained")
 
-    model_type = st.selectbox("Select ML Model", ["pattern_learner","vae","transformer"], format_func=lambda s: {"pattern_learner":"Pattern Learner","vae":"VAE","transformer":"Transformer"}[s])
+    model_type = st.selectbox(
+        "Select ML Model",
+        ["pattern_learner", "vae", "transformer"],
+        format_func=lambda s: {"pattern_learner":"Pattern Learner","vae":"VAE","transformer":"Transformer"}[s]
+    )
 
     with st.expander("🎯 Training Configuration", True):
         c1, c2, c3 = st.columns(3)
-        with c1: epochs = st.slider("Epochs", 10, 500, 100); batch_size = st.slider("Batch Size", 8, 128, 32)
-        with c2: learning_rate = st.select_slider("Learning Rate", [0.0001,0.0005,0.001,0.005,0.01], value=0.001); samples = st.slider("Training Samples", 100, 5000, 1000)
-        with c3: validation_split = st.slider("Validation Split", 0.1, 0.3, 0.2); use_gpu = st.checkbox("Use GPU if available", True)
+        with c1:
+            epochs = st.slider("Epochs", 10, 500, 100)
+            batch_size = st.slider("Batch Size", 8, 128, 32)
+        with c2:
+            learning_rate = st.select_slider("Learning Rate", [0.0001,0.0005,0.001,0.005,0.01], value=0.001)
+            samples = st.slider("Training Samples", 100, 5000, 1000)
+        with c3:
+            validation_split = st.slider("Validation Split", 0.1, 0.3, 0.2)
+            use_gpu = st.checkbox("Use GPU if available", True)
+        enable_mixed_precision = st.checkbox("Enable mixed precision (fp16)", False)
+        run_in_background = st.checkbox("Run training in background (RQ worker)", False)
+        st.caption("Background training requires REDIS_URL and a running RQ worker.")
 
-    # include both generated and batch data if you want
-    use_batch_for_training = st.checkbox("Include Batch Results as Training Data", True)
-
+    # Require a few ODEs mainly for UX parity (the trainer can synthesize anyway)
     need = 5
-    count = len(st.session_state.generated_odes) + (len(st.session_state.batch_results) if use_batch_for_training else 0)
-    if count < need:
-        st.warning(f"Need at least {need} ODEs to train. Current: {count}")
-        return
+    have = len(st.session_state.generated_odes) + len(st.session_state.batch_results)
+    if have < need:
+        st.info(f"Tip: You have {have} ODEs recorded. The trainer can still synthesize data (use_generator=True).")
 
-    if st.button("🚀 Train Model", type="primary"):
+    # ---------- Local (in-UI) training ----------
+    if not run_in_background and st.button("🚀 Train Model (local)", type="primary"):
         with st.spinner("Training..."):
             try:
                 device = "cuda" if use_gpu and (torch and torch.cuda.is_available()) else "cpu"
-                trainer = MLTrainer(model_type=model_type, learning_rate=learning_rate, device=device)
+                trainer = MLTrainer(
+                    model_type=model_type,
+                    learning_rate=learning_rate,
+                    device=device,
+                    enable_mixed_precision=enable_mixed_precision,
+                )
                 st.session_state.ml_trainer = trainer
-
                 prog = st.progress(0); status = st.empty()
+
                 def progress_callback(epoch, total_epochs):
                     prog.progress(min(1.0, epoch/total_epochs)); status.text(f"Epoch {epoch}/{total_epochs}")
 
-                trainer.train(epochs=epochs, batch_size=batch_size, samples=samples, validation_split=validation_split, progress_callback=progress_callback)
+                trainer.train(
+                    epochs=epochs,
+                    batch_size=batch_size,
+                    samples=samples,
+                    validation_split=validation_split,
+                    progress_callback=progress_callback,
+                    save_best=True,
+                    use_generator=True
+                )
                 st.session_state.ml_trained = True
                 st.session_state.training_history = getattr(trainer, "history", {})
                 st.success("Model trained.")
+
                 if trainer.history.get("train_loss"):
                     fig = go.Figure()
                     fig.add_trace(go.Scatter(x=list(range(1,len(trainer.history["train_loss"])+1)), y=trainer.history["train_loss"], mode="lines", name="Training Loss"))
@@ -1222,31 +1250,82 @@ def ml_pattern_learning_page():
                         fig.add_trace(go.Scatter(x=list(range(1,len(trainer.history["val_loss"])+1)), y=trainer.history["val_loss"], mode="lines", name="Validation Loss"))
                     fig.update_layout(title="Training History", xaxis_title="Epoch", yaxis_title="Loss")
                     st.plotly_chart(fig, use_container_width=True)
+
             except Exception as e:
                 st.error(f"Training failed: {e}")
 
-    if st.session_state.get("ml_trained") and st.session_state.get("ml_trainer"):
-        st.subheader("🎨 Generate Novel Patterns")
-        c1, c2 = st.columns(2)
-        with c1: num_generate = st.slider("Number to Generate", 1, 10, 1)
-        with c2:
-            if st.button("🎲 Generate Novel ODEs", type="primary"):
-                with st.spinner("Generating..."):
-                    try:
-                        for i in range(num_generate):
-                            res = st.session_state.ml_trainer.generate_new_ode()
-                            if res:
-                                st.success(f"Generated ODE {i+1}")
-                                with st.expander(f"ODE {i+1}"):
-                                    if "ode" in res:
-                                        try: st.latex(sp.latex(res["ode"]))
-                                        except Exception: st.code(str(res["ode"]))
-                                    for k in ["type","order","function_used","description"]:
-                                        if k in res: st.write(f"**{k}:** {res[k]}")
-                                st.session_state.generated_odes.append(res)
-                    except Exception as e:
-                        st.error(f"Generation failed: {e}")
+    # ---------- Background (RQ) training ----------
+    if run_in_background and st.button("🚀 Train Model (background via RQ)", type="primary"):
+        if not has_redis():
+            st.error("REDIS_URL not set or Redis not reachable.")
+        else:
+            payload = {
+                "model_type": model_type,
+                "learning_rate": float(learning_rate),
+                "epochs": int(epochs),
+                "batch_size": int(batch_size),
+                "samples": int(samples),
+                "validation_split": float(validation_split),
+                "use_generator": True,
+                "enable_mixed_precision": bool(enable_mixed_precision),
+                "checkpoint_dir": os.getenv("CHECKPOINT_DIR", "checkpoints"),
+                # dims are optional; the defaults match your trainer
+                "input_dim": 12, "hidden_dim": 128, "output_dim": 12,
+                "device": "cuda" if use_gpu and (torch and torch.cuda.is_available()) else "cpu",
+            }
+            job_id = enqueue_job("worker.train_job", payload, job_timeout=86400)  # up to 24h
+            if job_id:
+                st.session_state["ml_train_job_id"] = job_id
+                st.success(f"Training job submitted. ID = {job_id}")
+            else:
+                st.error("Failed to submit training job.")
 
+    # ---------- Poll background job ----------
+    if "ml_train_job_id" in st.session_state:
+        st.markdown("### 📡 Background Training Status")
+        col1, col2 = st.columns([1,1])
+        with col1:
+            if st.button("🔄 Refresh status"):
+                pass
+        info = fetch_job(st.session_state["ml_train_job_id"])
+        if info:
+            meta = info.get("meta") or {}
+            prog = meta.get("progress") or {}
+            if prog:
+                e = prog.get("epoch", 0); t = prog.get("total_epochs", 1)
+                st.progress(min(1.0, float(e)/float(t)))
+                st.caption(f"Epoch {e}/{t}")
+
+            status = info.get("status")
+            st.write("Status:", status)
+
+            if status == "finished":
+                res = info.get("result") or {}
+                st.session_state.training_history = res.get("history", {})
+                st.session_state.ml_trained = True
+                best_path = res.get("best_model_path")
+                st.success(f"Training finished. Best val loss: {res.get('best_val_loss')}.")
+                if best_path:
+                    st.info(f"Best checkpoint: {best_path}")
+                    # try to load if the path is accessible (shared volume)
+                    try:
+                        if os.path.exists(best_path):
+                            trainer = MLTrainer(model_type=model_type)
+                            trainer.load_model(best_path)
+                            st.session_state.ml_trainer = trainer
+                            st.success("Loaded trained model from checkpoint.")
+                        else:
+                            st.warning("Checkpoint not visible in this container. Mount a shared volume and set CHECKPOINT_DIR in both services.")
+                    except Exception as e:
+                        st.warning(f"Could not load checkpoint here: {e}")
+                del st.session_state["ml_train_job_id"]
+
+            elif status == "failed":
+                st.error(f"Training job failed: {info.get('error')}")
+                del st.session_state["ml_train_job_id"]
+            else:
+                st.info("⏳ Still training...")
+                
 def batch_generation_page():
     st.header("📊 Batch ODE Generation")
     st.markdown('<div class="info-box">Generate many ODEs with your factories.</div>', unsafe_allow_html=True)
