@@ -24,7 +24,7 @@ psycopg2-binary==2.9.9
 alembic==1.12.1
 
 # Caching and Message Queue
-redis==5.0.0
+redis
 celery==5.3.4
 flower==2.0.1
 
@@ -67,6 +67,7 @@ fastapi>=0.110
 uvicorn>=0.29
 requests>=2.31
 rq>=1.16.2
+
 
 
 
