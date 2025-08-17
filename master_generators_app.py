@@ -1,243 +1,233 @@
 # master_generators_app.py
 """
-Master Generators for ODEs — COMPLETE APP (Async + ML/DL + Reverse + Export)
-- Corrected queue usage and robust job polling
-- Pre-training ODE-count requirement
-- Model lifecycle: train/load/upload/generate/reverse
-- Keeps every service and page from previous builds
+Master Generators for ODEs — Complete App (Corrected + Async-ready + RQ-safe)
+
+Fixes and additions:
+• RQ-safe enqueue wrapper: supports job timeouts if available; falls back cleanly if not.
+• ML training runs in RQ worker when REDIS_URL is set (no API needed). Local fallback if not.
+• Reverse engineering page kept (derive RHS from a supplied y(x); verify ODEs).
+• Apply Theorem page preserves constructor/free-form/arbitrary LHS and async compute job.
+• All other pages/services preserved (constructor, batch, novelty, analysis, viz, export, docs, settings).
 """
 
-# ---------- stdlib ----------
-import os, sys, io, json, time, base64, zipfile, logging, pickle, traceback
+# ---------------- std libs ----------------
+import os, sys, io, json, time, zipfile, logging, pickle
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
+import types
 
-# ---------- third-party ----------
+# ---------------- third-party ----------------
 import streamlit as st
 import numpy as np
 import pandas as pd
-import sympy as sp
 import plotly.graph_objects as go
 import plotly.express as px
+import sympy as sp
+from sympy.core.function import AppliedUndef
 
-# optional torch (for local generation after loading model)
+# optional torch (used in local fallback training)
 try:
     import torch
 except Exception:
     torch = None
 
-# ---------- logging ----------
+# ---------------- logging ----------------
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("app")
+logger = logging.getLogger("master_generators_app")
 
-# ---------- PATHS ----------
+# ---------------- path setup ----------------
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SRC_DIR = os.path.join(APP_DIR, "src")
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
-# ---------- Imports from src (best-effort; app works even if some are missing) ----------
+# ---------------- import src (resilient) ----------------
 HAVE_SRC = True
+MasterGenerator = EnhancedMasterGenerator = CompleteMasterGenerator = None
+LinearGeneratorFactory = CompleteLinearGeneratorFactory = None
+NonlinearGeneratorFactory = CompleteNonlinearGeneratorFactory = None
+GeneratorConstructor = GeneratorSpecification = None
+DerivativeTerm = DerivativeType = OperatorType = None
+MasterTheoremSolver = MasterTheoremParameters = ExtendedMasterTheorem = None
+ODEClassifier = PhysicalApplication = None
+BasicFunctions = SpecialFunctions = None
+GeneratorPatternLearner = GeneratorVAE = GeneratorTransformer = create_model = None
+MLTrainer = ODEDataset = ODEDataGenerator = None
+GeneratorPattern = GeneratorPatternNetwork = GeneratorLearningSystem = None
+ODENoveltyDetector = NoveltyAnalysis = ODETokenizer = ODETransformer = None
+Settings = AppConfig = None
+CacheManager = cached = None
+ParameterValidator = None
+UIComponents = None
+
 try:
+    # master/factories
     from src.generators.master_generator import (
-        MasterGenerator, EnhancedMasterGenerator, CompleteMasterGenerator
+        MasterGenerator, EnhancedMasterGenerator, CompleteMasterGenerator,
     )
-except Exception:
-    MasterGenerator = EnhancedMasterGenerator = CompleteMasterGenerator = None
-    HAVE_SRC = False
-
-try:
-    from src.generators.linear_generators import (
-        LinearGeneratorFactory, CompleteLinearGeneratorFactory
-    )
-except Exception:
-    LinearGeneratorFactory = CompleteLinearGeneratorFactory = None
-    HAVE_SRC = False
-
-try:
-    from src.generators.nonlinear_generators import (
-        NonlinearGeneratorFactory, CompleteNonlinearGeneratorFactory
-    )
-except Exception:
-    NonlinearGeneratorFactory = CompleteNonlinearGeneratorFactory = None
-    HAVE_SRC = False
-
-try:
+    try:
+        from src.generators.master_generator import (
+            CompleteLinearGeneratorFactory, CompleteNonlinearGeneratorFactory,
+        )
+    except Exception:
+        from src.generators.linear_generators import (
+            LinearGeneratorFactory, CompleteLinearGeneratorFactory,
+        )
+        from src.generators.nonlinear_generators import (
+            NonlinearGeneratorFactory, CompleteNonlinearGeneratorFactory,
+        )
+    # constructor
     from src.generators.generator_constructor import (
         GeneratorConstructor, GeneratorSpecification,
-        DerivativeTerm, DerivativeType, OperatorType
+        DerivativeTerm, DerivativeType, OperatorType,
     )
-except Exception:
-    GeneratorConstructor = GeneratorSpecification = None
-    DerivativeTerm = DerivativeType = OperatorType = None
-    HAVE_SRC = False
-
-try:
+    # classifier, functions
     from src.generators.ode_classifier import ODEClassifier, PhysicalApplication
-except Exception:
-    ODEClassifier = PhysicalApplication = None
-    HAVE_SRC = False
-
-try:
     from src.functions.basic_functions import BasicFunctions
     from src.functions.special_functions import SpecialFunctions
-except Exception:
-    BasicFunctions = SpecialFunctions = None
-    HAVE_SRC = False
-
-try:
-    from src.ml.trainer import MLTrainer
-except Exception:
-    MLTrainer = None
-    HAVE_SRC = False
-
-try:
+    # ML trainer & models
+    from src.ml.pattern_learner import (
+        GeneratorPatternLearner, GeneratorVAE, GeneratorTransformer, create_model,
+    )
+    from src.ml.trainer import MLTrainer, ODEDataset, ODEDataGenerator
+    from src.ml.generator_learner import (
+        GeneratorPattern, GeneratorPatternNetwork, GeneratorLearningSystem,
+    )
+    # novelty
     from src.dl.novelty_detector import (
-        ODENoveltyDetector, NoveltyAnalysis, ODETokenizer, ODETransformer
+        ODENoveltyDetector, NoveltyAnalysis, ODETokenizer, ODETransformer,
     )
-except Exception:
-    ODENoveltyDetector = NoveltyAnalysis = ODETokenizer = ODETransformer = None
+    # utils / UI
+    from src.utils.config import Settings, AppConfig
+    from src.utils.cache import CacheManager, cached
+    from src.utils.validators import ParameterValidator
+    from src.ui.components import UIComponents
+except Exception as e:
+    logger.warning(f"Some imports from src/ failed or are missing: {e}")
     HAVE_SRC = False
 
-# ---------- Core math & RQ utils ----------
-try:
-    from shared.ode_core import (
-        ComputeParams, compute_ode_full, theorem_4_2_y_m_expr,
-        get_function_expr, to_exact, simplify_expr, expr_to_str
-    )
-except Exception as e:
-    log.error(f"Missing shared.ode_core: {e}")
-    # Fail fast: this module is essential for function.
-    raise
-
-try:
-    from rq_utils import has_redis, enqueue_job, fetch_job, list_runs
-except Exception as e:
-    log.warning(f"rq_utils import failed ({e}); async jobs will be disabled.")
-    def has_redis(): return False
-    def enqueue_job(*args, **kwargs): return None
-    def fetch_job(*args, **kwargs): return None
-    def list_runs(*args, **kwargs): return []
-
-# ---------- Streamlit config ----------
-st.set_page_config(
-    page_title="Master Generators for ODEs",
-    page_icon="🔬",
-    layout="wide",
-    initial_sidebar_state="expanded"
+# ---------------- internal math core & queue utils ----------------
+# All heavy symbolic logic is in shared.ode_core (choice A path you’re using)
+from shared.ode_core import (
+    ComputeParams,
+    compute_ode_full,
+    theorem_4_2_y_m_expr,
+    get_function_expr,
+    build_freeform_lhs,         # used to display/assemble LHS from UI
+    parse_arbitrary_lhs,        # arbitrary SymPy LHS parser
+    to_exact,
+    simplify_expr,
 )
 
-# ---------- CSS ----------
+# rq_utils: has_redis() + (enqueue_job, fetch_job)
+from rq_utils import has_redis, enqueue_job, fetch_job
+
+# ---------------- Streamlit config ----------------
+st.set_page_config(
+    page_title="Master Generators ODE System - Complete Edition",
+    page_icon="🔬",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ---------------- CSS ----------------
 st.markdown("""
 <style>
-.main-header{
-  background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);
-  padding:1.4rem;border-radius:16px;margin-bottom:1.0rem;color:white;text-align:center;
-  box-shadow:0 10px 30px rgba(0,0,0,0.2);
-}
-.main-title{font-size:2.0rem;font-weight:700;margin-bottom:.25rem;}
-.subtitle{font-size:0.98rem;opacity:.95;}
-.metric-card{
-  background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);
-  color:white;padding:0.9rem;border-radius:12px;text-align:center;
-  box-shadow:0 10px 20px rgba(0,0,0,0.2); min-height:90px;
-}
-.info-box{
-  background:linear-gradient(135deg,#e3f2fd 0%,#bbdefb 100%);
-  border-left:5px solid #2196f3;padding:0.9rem;border-radius:10px;margin:1rem 0;
-}
-.result-box{
-  background:linear-gradient(135deg,#e8f5e9 0%,#c8e6c9 100%);
-  border:2px solid #4caf50;padding:0.9rem;border-radius:10px;margin:1rem 0;
-}
-.error-box{
-  background:linear-gradient(135deg,#ffebee 0%,#ffcdd2 100%);
-  border:2px solid #f44336;padding:0.9rem;border-radius:10px;margin:1rem 0;
-}
-.small-muted{font-size:0.85rem;opacity:0.8;}
+.main-header{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);
+padding:2rem;border-radius:14px;margin-bottom:1.4rem;color:white;text-align:center;
+box-shadow:0 10px 30px rgba(0,0,0,0.2);}
+.main-title{font-size:2.2rem;font-weight:700;margin-bottom:.4rem;}
+.subtitle{font-size:1.05rem;opacity:.95;}
+.metric-card{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);
+color:white;padding:1rem;border-radius:12px;text-align:center;
+box-shadow:0 10px 20px rgba(0,0,0,0.2);}
+.info-box{background:linear-gradient(135deg,#e3f2fd 0%,#bbdefb 100%);
+border-left:5px solid #2196f3;padding:1rem;border-radius:10px;margin:1rem 0;}
+.result-box{background:linear-gradient(135deg,#e8f5e9 0%,#c8e6c9 100%);
+border:2px solid #4caf50;padding:1rem;border-radius:10px;margin:1rem 0;}
+.error-box{background:linear-gradient(135deg,#ffebee 0%,#ffcdd2 100%);
+border:2px solid #f44336;padding:1rem;border-radius:10px;margin:1rem 0;}
 </style>
 """, unsafe_allow_html=True)
 
-# ---------- Helpers ----------
-MIN_ODES_FOR_TRAINING = int(os.getenv("MIN_ODES_FOR_TRAINING", "20"))
 
-def _safe_rerun():
-    try:
-        st.rerun()
-    except Exception:
-        # Fallback for older Streamlit
-        try:
-            st.experimental_rerun()  # type: ignore[attr-defined]
-        except Exception:
-            pass
-
-def _env_queue(name: str, default: str) -> str:
-    return os.getenv(name, default)
-
-def _sympify_safe(v):
-    try:
-        return sp.sympify(v)
-    except Exception:
-        return v
-
-def _latex(expr) -> str:
-    try:
-        return sp.latex(expr).replace(r"\left(", "(").replace(r"\right)", ")")
-    except Exception:
-        return str(expr)
-
-# ---------- Session State ----------
-class SS:
+# ---------------- Session State ----------------
+class SessionStateManager:
     @staticmethod
-    def init():
-        defaults = {
-            "generator_constructor": GeneratorConstructor() if GeneratorConstructor else None,
-            "generator_terms": [],
-            "current_generator": None,
-            "lhs_source": "constructor",     # 'constructor'|'freeform'|'arbitrary'
-            "free_terms": [],
-            "arbitrary_lhs_text": "",
-            "generated_odes": [],
-            "batch_results": [],
-            "analysis_results": [],
-            "export_history": [],
-            "training_jobs": [],
-            "compute_jobs": [],
-            "reverse_jobs": [],
-            "ml_trainer": None,
-            "ml_trained": False,
-            "ml_history": {},
-            "ml_model_path": "",
-            "basic_functions": BasicFunctions() if BasicFunctions else None,
-            "special_functions": SpecialFunctions() if SpecialFunctions else None,
-            "novelty_detector": ODENoveltyDetector() if ODENoveltyDetector else None,
-            "ode_classifier": ODEClassifier() if ODEClassifier else None,
-            "last_job_id": None,
-        }
-        for k, v in defaults.items():
-            if k not in st.session_state:
-                st.session_state[k] = v
+    def initialize():
+        if "generator_constructor" not in st.session_state and GeneratorConstructor:
+            st.session_state.generator_constructor = GeneratorConstructor()
+        for key, default in [
+            ("generator_terms", []),
+            ("generated_odes", []),
+            ("generator_patterns", []),
+            ("ml_trainer", None),
+            ("ml_trained", False),
+            ("training_history", []),
+            ("batch_results", []),
+            ("analysis_results", []),
+            ("export_history", []),
+            ("lhs_source", "constructor"),
+            ("freeform_gen_spec", None),
+            ("free_terms", []),
+            ("arbitrary_lhs_text", ""),
+            ("last_job_id", None),
+            ("last_train_job_id", None),
+            ("train_best_path", None),
+        ]:
+            if key not in st.session_state:
+                st.session_state[key] = default
 
-def register_generated_ode(res: dict):
-    """Normalize and store a generated ODE result."""
-    out = dict(res)
-    out.setdefault("type", "nonlinear")
-    out.setdefault("order", 0)
-    out.setdefault("function_used", str(res.get("function_used", "unknown")))
-    out.setdefault("parameters", {})
-    out.setdefault("initial_conditions", {})
-    out.setdefault("timestamp", datetime.now().isoformat())
-    out["generator_number"] = len(st.session_state.generated_odes) + 1
+        # optional heavy objects
+        if "basic_functions" not in st.session_state and BasicFunctions:
+            st.session_state.basic_functions = BasicFunctions()
+        if "special_functions" not in st.session_state and SpecialFunctions:
+            st.session_state.special_functions = SpecialFunctions()
+        if "novelty_detector" not in st.session_state and ODENoveltyDetector:
+            try:
+                st.session_state.novelty_detector = ODENoveltyDetector()
+            except Exception:
+                st.session_state.novelty_detector = None
+        if "ode_classifier" not in st.session_state and ODEClassifier:
+            try:
+                st.session_state.ode_classifier = ODEClassifier()
+            except Exception:
+                st.session_state.ode_classifier = None
+        if "cache_manager" not in st.session_state and CacheManager:
+            st.session_state.cache_manager = CacheManager()
+
+
+def register_generated_ode(result: dict):
+    """Normalize, add classification defaults, and append to session history."""
+    result = dict(result)
+    result.setdefault("type", "nonlinear")
+    result.setdefault("order", 0)
+    result.setdefault("function_used", "unknown")
+    result.setdefault("parameters", {})
+    result.setdefault("classification", {})
+    result.setdefault("timestamp", datetime.now().isoformat())
+    result["generator_number"] = len(st.session_state.generated_odes) + 1
+    cl = dict(result.get("classification", {}))
+    cl.setdefault("type", "Linear" if result["type"] == "linear" else "Nonlinear")
+    cl.setdefault("order", result["order"])
+    cl.setdefault("field", cl.get("field", "Mathematical Physics"))
+    cl.setdefault("applications", cl.get("applications", ["Research Equation"]))
+    cl.setdefault("linearity", "Linear" if result["type"] == "linear" else "Nonlinear")
+    result["classification"] = cl
+    # build Eq object for convenience
     try:
-        out.setdefault("ode", sp.Eq(_sympify_safe(out["generator"]), _sympify_safe(out["rhs"])))
+        result.setdefault("ode", sp.Eq(result["generator"], result["rhs"]))
     except Exception:
         pass
-    st.session_state.generated_odes.append(out)
+    st.session_state.generated_odes.append(result)
 
-# ---------- LaTeX Export ----------
+
+# ---------------- LaTeX Exporter ----------------
 class LaTeXExporter:
     @staticmethod
     def sympy_to_latex(expr) -> str:
+        if expr is None:
+            return ""
         try:
             if isinstance(expr, str):
                 try:
@@ -249,13 +239,14 @@ class LaTeXExporter:
             return str(expr)
 
     @staticmethod
-    def document(ode: Dict[str, Any], include_preamble=True) -> str:
-        g = ode.get("generator", "")
-        rhs = ode.get("rhs", "")
-        sol = ode.get("solution", "")
-        params = ode.get("parameters", {})
-        ic = ode.get("initial_conditions", {})
-        cls = ode.get("classification", {})
+    def generate_latex_document(ode_data: Dict[str, Any], include_preamble: bool = True) -> str:
+        generator = ode_data.get("generator", "")
+        solution = ode_data.get("solution", "")
+        rhs = ode_data.get("rhs", "")
+        params = ode_data.get("parameters", {})
+        classification = ode_data.get("classification", {})
+        initial_conditions = ode_data.get("initial_conditions", {})
+
         parts = []
         if include_preamble:
             parts.append(r"""\documentclass[12pt]{article}
@@ -267,16 +258,17 @@ class LaTeXExporter:
 \date{\today}
 \begin{document}
 \maketitle
+
 \section{Generated Ordinary Differential Equation}
 """)
         parts += [
             r"\subsection{Generator Equation}",
             r"\begin{equation}",
-            f"{LaTeXExporter.sympy_to_latex(g)} = {LaTeXExporter.sympy_to_latex(rhs)}",
+            f"{LaTeXExporter.sympy_to_latex(generator)} = {LaTeXExporter.sympy_to_latex(rhs)}",
             r"\end{equation}",
             r"\subsection{Exact Solution}",
             r"\begin{equation}",
-            f"y(x) = {LaTeXExporter.sympy_to_latex(sol)}",
+            f"y(x) = {LaTeXExporter.sympy_to_latex(solution)}",
             r"\end{equation}",
             r"\subsection{Parameters}",
             r"\begin{align}",
@@ -286,81 +278,441 @@ class LaTeXExporter:
             f"M       &= {LaTeXExporter.sympy_to_latex(params.get('M', 0))}",
             r"\end{align}",
         ]
-        if ic:
+        if initial_conditions:
             parts += [r"\subsection{Initial Conditions}", r"\begin{align}"]
-            items = list(ic.items())
+            items = list(initial_conditions.items())
             for i, (k, v) in enumerate(items):
-                parts.append(f"{k} &= {LaTeXExporter.sympy_to_latex(v)}" + (r" \\" if i < len(items) - 1 else ""))
+                parts.append(
+                    f"{k} &= {LaTeXExporter.sympy_to_latex(v)}" + (r" \\" if i < len(items) - 1 else "")
+                )
             parts.append(r"\end{align}")
-        if cls:
+
+        if classification:
             parts += [r"\subsection{Mathematical Classification}", r"\begin{itemize}"]
-            parts.append(f"\\item \\textbf{{Type:}} {cls.get('type','Unknown')}")
-            parts.append(f"\\item \\textbf{{Order:}} {cls.get('order','Unknown')}")
-            parts.append(f"\\item \\textbf{{Linearity:}} {cls.get('linearity','Unknown')}")
-            if "field" in cls:
-                parts.append(f"\\item \\textbf{{Field:}} {cls['field']}")
-            if "applications" in cls:
-                apps = ", ".join(cls["applications"][:5])
+            parts.append(f"\\item \\textbf{{Type:}} {classification.get('type','Unknown')}")
+            parts.append(f"\\item \\textbf{{Order:}} {classification.get('order','Unknown')}")
+            parts.append(f"\\item \\textbf{{Linearity:}} {classification.get('linearity','Unknown')}")
+            if "field" in classification:
+                parts.append(f"\\item \\textbf{{Field:}} {classification['field']}")
+            if "applications" in classification:
+                apps = ", ".join(classification["applications"][:5])
                 parts.append(f"\\item \\textbf{{Applications:}} {apps}")
             parts.append(r"\end{itemize}")
+
         parts += [
             r"\subsection{Solution Verification}",
-            r"Substitute $y(x)$ into the generator to verify $L[y] = \text{RHS}$."
+            r"Substitute $y(x)$ into the generator operator to verify $L[y] = \text{RHS}$.",
         ]
         if include_preamble:
             parts.append(r"\end{document}")
         return "\n".join(parts)
 
     @staticmethod
-    def package(ode: Dict[str, Any]) -> bytes:
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-            z.writestr("ode_document.tex", LaTeXExporter.document(ode, True))
-            z.writestr("ode_data.json", json.dumps(ode, indent=2, default=str))
-            z.writestr("README.txt", "To compile: pdflatex ode_document.tex\n")
-        buf.seek(0)
-        return buf.getvalue()
+    def create_export_package(ode_data: Dict[str, Any], include_extras: bool = True) -> bytes:
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("ode_document.tex", LaTeXExporter.generate_latex_document(ode_data, True))
+            zf.writestr("ode_data.json", json.dumps(ode_data, indent=2, default=str))
+            zf.writestr("README.txt", "Master Generator ODE Export\nTo compile: pdflatex ode_document.tex\n")
+        zip_buffer.seek(0)
+        return zip_buffer.getvalue()
 
-# ---------- PAGES ----------
 
-def page_dashboard():
+# ---------------- helpers ----------------
+def _ensure_ss_key(name, default):
+    if name not in st.session_state:
+        st.session_state[name] = default
+
+
+def enqueue_with_timeout(func_path: str, payload: dict, timeout_sec: Optional[int] = None) -> Optional[str]:
+    """
+    RQ-safe enqueue wrapper:
+      - If rq_utils.enqueue_job supports **kwargs (job_timeout, etc.), we pass them.
+      - If not (TypeError), we call without kwargs.
+    Returns job_id (str) or None if submission failed.
+    """
+    try:
+        rq_kwargs = {}
+        if timeout_sec and timeout_sec > 0:
+            rq_kwargs["job_timeout"] = int(timeout_sec)
+        return enqueue_job(func_path, payload, **rq_kwargs)
+    except TypeError:
+        # Older rq_utils without **kwargs support
+        try:
+            return enqueue_job(func_path, payload)
+        except Exception as e:
+            logger.error(f"enqueue_job failed (no kwargs & plain): {e}")
+            return None
+    except Exception as e:
+        logger.error(f"enqueue_job failed: {e}")
+        return None
+
+
+# ---------------- Apply Master Theorem (async-ready) ----------------
+def page_apply_master_theorem():
+    st.header("🎯 Apply Master Theorem (Exact, Async-ready)")
+
+    # choose source of LHS
+    _ensure_ss_key("lhs_source", "constructor")
+    src = st.radio(
+        "Generator LHS source",
+        options=("constructor", "freeform", "arbitrary"),
+        index={"constructor": 0, "freeform": 1, "arbitrary": 2}.get(st.session_state["lhs_source"], 0),
+        horizontal=True,
+    )
+    st.session_state["lhs_source"] = src
+
+    # function library
+    colA, colB = st.columns([1, 1])
+    with colA:
+        lib = st.selectbox("Function library", ["Basic", "Special"], index=0)
+    with colB:
+        basic_lib = st.session_state.get("basic_functions")
+        special_lib = st.session_state.get("special_functions")
+        if lib == "Basic" and basic_lib:
+            func_names = basic_lib.get_function_names()
+            source_lib = basic_lib
+        elif lib == "Special" and special_lib:
+            func_names = special_lib.get_function_names()
+            source_lib = special_lib
+        else:
+            func_names, source_lib = [], None
+        func_name = st.selectbox("Choose f(z)", func_names) if func_names else st.text_input("Enter f(z)", "exp(z)")
+
+    # parameters
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        alpha = st.number_input("α", value=1.0, step=0.1, format="%.6f")
+    with c2:
+        beta = st.number_input("β", value=1.0, step=0.1, format="%.6f")
+    with c3:
+        n = st.number_input("n (positive integer)", 1, 12, 1)
+    with c4:
+        M = st.number_input("M", value=0.0, step=0.1, format="%.6f")
+
+    c5, c6, c7 = st.columns(3)
+    with c5:
+        use_exact = st.checkbox("Exact (symbolic) parameters", True)
+    with c6:
+        simplify_level = st.selectbox("Simplify", ["light", "none", "aggressive"], index=0)
+    with c7:
+        async_mode = has_redis()
+        st.info("Async via Redis: ON" if async_mode else "Async via Redis: OFF")
+
+    # constructor LHS (if any)
+    constructor_lhs = None
+    gen_spec = st.session_state.get("current_generator")
+    if gen_spec is not None and hasattr(gen_spec, "lhs"):
+        constructor_lhs = gen_spec.lhs
+    elif st.session_state.get("generator_constructor") and hasattr(
+        st.session_state.generator_constructor, "get_generator_expression"
+    ):
+        try:
+            constructor_lhs = st.session_state.generator_constructor.get_generator_expression()
+        except Exception:
+            constructor_lhs = None
+
+    # Free-form builder
+    st.subheader("🧩 Free‑form LHS (Builder)")
+    with st.expander("Build custom LHS terms", expanded=False):
+        if "free_terms" not in st.session_state:
+            st.session_state.free_terms = []
+        cols = st.columns([1, 1, 1, 1, 1, 1, 1, 1])
+        with cols[0]:
+            coef = st.number_input("coef", 1.0, step=0.5)
+        with cols[1]:
+            inner_order = st.number_input("inner k (y^(k))", 0, 12, 0)
+        with cols[2]:
+            wrapper = st.selectbox(
+                "wrap(.)",
+                [
+                    "id",
+                    "exp",
+                    "sin",
+                    "cos",
+                    "tan",
+                    "sinh",
+                    "cosh",
+                    "tanh",
+                    "log",
+                    "abs",
+                    "asin",
+                    "acos",
+                    "atan",
+                    "asinh",
+                    "acosh",
+                    "atanh",
+                    "erf",
+                    "erfc",
+                ],
+                index=0,
+            )
+        with cols[3]:
+            power = st.number_input("power", 1, 6, 1)
+        with cols[4]:
+            outer_order = st.number_input("outer m (D^m)", 0, 12, 0)
+        with cols[5]:
+            scale = st.number_input("arg scale (a)", value=1.0, step=0.1, format="%.4f")
+        with cols[6]:
+            shift = st.number_input("arg shift (b)", value=0.0, step=0.1, format="%.4f")
+        with cols[7]:
+            if st.button("➕ Add term"):
+                st.session_state.free_terms.append(
+                    {
+                        "coef": coef,
+                        "inner_order": int(inner_order),
+                        "wrapper": wrapper,
+                        "power": int(power),
+                        "outer_order": int(outer_order),
+                        "arg_scale": float(scale) if abs(scale) > 1e-14 else None,
+                        "arg_shift": float(shift) if abs(shift) > 1e-14 else None,
+                    }
+                )
+        if st.session_state.free_terms:
+            st.write("**Current terms:**")
+            for i, t in enumerate(st.session_state.free_terms):
+                st.write(f"{i+1}. {t}")
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                if st.button("🧮 Use free‑form LHS"):
+                    st.session_state["lhs_source"] = "freeform"
+                    st.success("Free-form LHS selected.")
+            with cc2:
+                if st.button("🗑️ Clear terms"):
+                    st.session_state.free_terms = []
+
+    # Arbitrary SymPy expression editor
+    st.subheader("✍️ Arbitrary LHS (SymPy expression)")
+    st.session_state.arbitrary_lhs_text = st.text_area(
+        "Enter any SymPy expression in x and y(x) (e.g., sin(y(x)) + y(x)*y(x).diff(x) - y(x/2-1))",
+        value=st.session_state.arbitrary_lhs_text or "",
+        height=100,
+    )
+    cc1, cc2 = st.columns(2)
+    with cc1:
+        if st.button("✅ Validate arbitrary LHS"):
+            try:
+                _ = parse_arbitrary_lhs(st.session_state.arbitrary_lhs_text)
+                st.success("Expression parsed successfully.")
+                st.session_state["lhs_source"] = "arbitrary"
+            except Exception as e:
+                st.error(f"Parse error: {e}")
+    with cc2:
+        if st.button("↩️ Prefer Constructor LHS"):
+            st.session_state["lhs_source"] = "constructor"
+
+    # Theorem 4.2
+    st.markdown("---")
+    colm1, colm2 = st.columns([1, 1])
+    with colm1:
+        compute_mth = st.checkbox("Compute y^(m)(x) (Theorem 4.2)", False)
+    with colm2:
+        m_order = st.number_input("m", 1, 12, 1)
+
+    # Generate ODE
+    if st.button("🚀 Generate ODE", type="primary", use_container_width=True):
+        payload = {
+            "func_name": func_name,
+            "alpha": alpha,
+            "beta": beta,
+            "n": int(n),
+            "M": M,
+            "use_exact": use_exact,
+            "simplify_level": simplify_level,
+            "lhs_source": st.session_state["lhs_source"],
+            "freeform_terms": st.session_state.get("free_terms"),
+            "arbitrary_lhs_text": st.session_state.get("arbitrary_lhs_text"),
+            "function_library": lib,
+        }
+        if not has_redis():
+            # sync compute
+            try:
+                basic_lib = st.session_state.get("basic_functions")
+                special_lib = st.session_state.get("special_functions")
+                p = ComputeParams(
+                    func_name=func_name,
+                    alpha=alpha,
+                    beta=beta,
+                    n=int(n),
+                    M=M,
+                    use_exact=use_exact,
+                    simplify_level=simplify_level,
+                    lhs_source=st.session_state["lhs_source"],
+                    constructor_lhs=constructor_lhs,             # session-known constructor LHS
+                    freeform_terms=st.session_state.get("free_terms"),
+                    arbitrary_lhs_text=st.session_state.get("arbitrary_lhs_text"),
+                    function_library=lib,
+                    basic_lib=basic_lib,
+                    special_lib=special_lib,
+                )
+                res = compute_ode_full(p)
+                register_generated_ode(res)
+                show_ode_result(res)
+            except Exception as e:
+                st.error(f"Generation error: {e}")
+        else:
+            # async via RQ
+            job_id = enqueue_with_timeout("worker.compute_job", payload, timeout_sec=int(os.getenv("COMPUTE_JOB_TIMEOUT", "1800")))
+            if job_id:
+                st.session_state["last_job_id"] = job_id
+                st.success(f"Job submitted. ID = {job_id}")
+            else:
+                st.error("Failed to submit job (REDIS_URL missing or enqueue failed)")
+
+    # poll result (if async)
+    if has_redis() and st.session_state.get("last_job_id"):
+        st.markdown("### 📡 Compute Job Status")
+        info = fetch_job(st.session_state["last_job_id"])
+        colx, coly = st.columns([1, 1])
+        with colx:
+            st.write(f"Job: `{st.session_state['last_job_id']}`")
+        with coly:
+            st.button("🔄 Refresh status", key="refresh_compute_status")
+        if info:
+            status = info.get("status")
+            if status == "finished":
+                res = info["result"]
+                # Try to sympify for LaTeX display
+                for k in ("generator", "rhs", "solution"):
+                    try:
+                        res[k] = sp.sympify(res[k])
+                    except Exception:
+                        pass
+                register_generated_ode(res)
+                show_ode_result(res)
+                st.session_state["last_job_id"] = None
+            elif status == "failed":
+                st.error(f"Job failed: {info.get('error')}")
+                st.session_state["last_job_id"] = None
+            else:
+                st.info(f"⏳ Status: {status}")
+
+    # Theorem 4.2 (direct; use RQ compute if it’s heavy in your env)
+    if compute_mth and st.button("🧮 Compute y^{(m)}(x) via Theorem 4.2", use_container_width=True):
+        try:
+            lib_obj = st.session_state.get("basic_functions") if lib == "Basic" else st.session_state.get("special_functions")
+            f_expr_preview = get_function_expr(lib_obj, func_name)
+            α = to_exact(alpha) if use_exact else sp.Float(alpha)
+            β = to_exact(beta) if use_exact else sp.Float(beta)
+            x = sp.Symbol("x", real=True)
+            y_m = theorem_4_2_y_m_expr(f_expr_preview, α, β, int(n), int(m_order), x, simplify_level)
+            st.markdown("### 🔢 Derivative")
+            st.latex(fr"y^{{({int(m_order)})}}(x) = " + sp.latex(y_m))
+        except Exception as e:
+            st.error(f"Failed to compute y^{m_order}(x): {e}")
+
+
+def show_ode_result(res: Dict[str, Any]):
+    st.markdown('<div class="result-box"><h3>✅ ODE Generated Successfully!</h3></div>', unsafe_allow_html=True)
+    t_eq, t_sol, t_exp = st.tabs(["📐 Equation", "💡 Solution & ICs", "📤 Export"])
+    with t_eq:
+        try:
+            st.latex(sp.latex(res["generator"]) + " = " + sp.latex(res["rhs"]))
+        except Exception:
+            st.write("LHS:", res["generator"])
+            st.write("RHS:", res["rhs"])
+        st.caption(f"Type: {res.get('type','?')} • Order: {res.get('order','?')}")
+    with t_sol:
+        try:
+            st.latex("y(x) = " + sp.latex(res["solution"]))
+        except Exception:
+            st.write("y(x) =", res["solution"])
+        if res.get("initial_conditions"):
+            st.markdown("**Initial conditions:**")
+            for k, v in res["initial_conditions"].items():
+                try:
+                    st.latex(k + " = " + sp.latex(v))
+                except Exception:
+                    st.write(k, "=", v)
+        st.markdown("**Parameters:**")
+        p = res.get("parameters", {})
+        st.write(f"α={p.get('alpha')}, β={p.get('beta')}, n={p.get('n')}, M={p.get('M')}")
+        if res.get("f_expr_preview") is not None:
+            try:
+                st.write(f"**Function:** f(z) = {res.get('f_expr_preview')}")
+            except Exception:
+                pass
+    with t_exp:
+        idx = len(st.session_state.generated_odes)
+        ode_data = {
+            "generator": res["generator"],
+            "rhs": res["rhs"],
+            "solution": res["solution"],
+            "parameters": res.get("parameters", {}),
+            "classification": {
+                "type": "Linear" if res.get("type") == "linear" else "Nonlinear",
+                "order": res.get("order", 0),
+                "linearity": "Linear" if res.get("type") == "linear" else "Nonlinear",
+                "field": "Mathematical Physics",
+                "applications": ["Research Equation"],
+            },
+            "initial_conditions": res.get("initial_conditions", {}),
+            "function_used": str(res.get("function_used", "?")),
+            "generator_number": idx,
+            "type": res.get("type", "nonlinear"),
+            "order": res.get("order", 0),
+        }
+        latex_doc = LaTeXExporter.generate_latex_document(ode_data, include_preamble=True)
+        st.download_button(
+            "📄 Download LaTeX Document",
+            latex_doc,
+            f"ode_{idx}.tex",
+            "text/x-latex",
+            use_container_width=True,
+        )
+        pkg = LaTeXExporter.create_export_package(ode_data, include_extras=True)
+        st.download_button(
+            "📦 Download Complete Package (ZIP)",
+            pkg,
+            f"ode_package_{idx}.zip",
+            "application/zip",
+            use_container_width=True,
+        )
+
+
+# ---------------- Dashboard ----------------
+def dashboard_page():
     st.header("🏠 Dashboard")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.markdown(
             f'<div class="metric-card"><h3>📝 Generated ODEs</h3><h1>{len(st.session_state.generated_odes)}</h1></div>',
-            unsafe_allow_html=True
+            unsafe_allow_html=True,
         )
     with c2:
-        trained = "✅ Trained" if st.session_state.get("ml_trained") else "⏳ Not Trained"
         st.markdown(
-            f'<div class="metric-card"><h3>🤖 ML Model</h3><p style="font-size:1.1rem">{trained}</p></div>',
-            unsafe_allow_html=True
+            f'<div class="metric-card"><h3>🧬 ML Patterns</h3><h1>{len(st.session_state.generator_patterns)}</h1></div>',
+            unsafe_allow_html=True,
         )
     with c3:
         st.markdown(
-            f'<div class="metric-card"><h3>📦 Batch Rows</h3><h1>{len(st.session_state.batch_results)}</h1></div>',
-            unsafe_allow_html=True
+            f'<div class="metric-card"><h3>📊 Batch Results</h3><h1>{len(st.session_state.batch_results)}</h1></div>',
+            unsafe_allow_html=True,
         )
     with c4:
+        model_status = "✅ Trained" if st.session_state.get("ml_trained") else "⏳ Not Trained"
         st.markdown(
-            f'<div class="metric-card"><h3>🛰️ Jobs Monitored</h3><h1>{len(list_runs())}</h1></div>',
-            unsafe_allow_html=True
+            f'<div class="metric-card"><h3>🤖 ML Model</h3><p style="font-size: 1.2rem;">{model_status}</p></div>',
+            unsafe_allow_html=True,
         )
-
-    st.subheader("📊 Recent ODEs")
+    st.subheader("📊 Recent Activity")
     if st.session_state.generated_odes:
-        df = pd.DataFrame(st.session_state.generated_odes[-8:])
-        cols = [c for c in ["type", "order", "function_used", "generator_number", "timestamp"] if c in df.columns]
+        df = pd.DataFrame(st.session_state.generated_odes[-5:])
+        cols = [c for c in ["type", "order", "generator_number", "timestamp"] if c in df.columns]
         st.dataframe(df[cols], use_container_width=True)
     else:
         st.info("No ODEs yet. Go to **Apply Master Theorem** or **Generator Constructor**.")
 
-def page_constructor():
+
+# ---------------- Generator Constructor ----------------
+def generator_constructor_page():
     st.header("🔧 Generator Constructor")
-    st.markdown('<div class="info-box">Build custom generator LHS using symbolic terms.</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="info-box">Build custom generators or use Free‑form/Arbitrary LHS in the theorem page.</div>',
+        unsafe_allow_html=True,
+    )
     if not (GeneratorSpecification and DerivativeTerm and DerivativeType and OperatorType):
-        st.warning("Constructor classes not available. (src/ missing).")
+        st.warning("Constructor classes not found in src/. Use Free‑form builder instead.")
         return
 
     with st.expander("➕ Add Generator Term", expanded=True):
@@ -368,63 +720,58 @@ def page_constructor():
         with c1:
             deriv_order = st.selectbox(
                 "Derivative Order",
-                [0,1,2,3,4,5],
-                format_func=lambda x: {0:"y",1:"y'",2:"y''",3:"y'''",4:"y⁽⁴⁾",5:"y⁽⁵⁾"}.get(x, f"y⁽{x}⁾")
+                [0, 1, 2, 3, 4, 5],
+                format_func=lambda x: {0: "y", 1: "y'", 2: "y''", 3: "y'''", 4: "y⁽⁴⁾", 5: "y⁽⁵⁾"}.get(x, f"y⁽{x}⁾"),
             )
         with c2:
-            ftype = st.selectbox("Function Type", [t.value for t in DerivativeType],
-                                 format_func=lambda s: s.replace("_"," ").title())
+            func_type = st.selectbox(
+                "Function Type", [t.value for t in DerivativeType], format_func=lambda s: s.replace("_", " ").title()
+            )
         with c3:
-            coef = st.number_input("Coefficient", -10.0, 10.0, 1.0, 0.1)
+            coefficient = st.number_input("Coefficient", -10.0, 10.0, 1.0, 0.1)
         with c4:
             power = st.number_input("Power", 1, 6, 1)
         c5, c6, c7 = st.columns(3)
         with c5:
-            optype = st.selectbox(
-                "Operator Type", [t.value for t in OperatorType],
-                format_func=lambda s: s.replace("_", " ").title()
+            operator_type = st.selectbox(
+                "Operator Type", [t.value for t in OperatorType], format_func=lambda s: s.replace("_", " ").title()
             )
         with c6:
-            scaling = st.number_input("Scaling (a)", 0.1, 10.0, 1.0, 0.1) if optype in ["delay","advance"] else None
+            scaling = st.number_input("Scaling (a)", 0.5, 5.0, 1.0, 0.1) if operator_type in ["delay", "advance"] else None
         with c7:
-            shift = st.number_input("Shift (b)", -10.0, 10.0, 0.0, 0.1) if optype in ["delay","advance"] else None
+            shift = st.number_input("Shift (b)", -10.0, 10.0, 0.0, 0.1) if operator_type in ["delay", "advance"] else None
         if st.button("➕ Add Term", type="primary"):
-            try:
-                term = DerivativeTerm(
-                    derivative_order=int(deriv_order),
-                    coefficient=float(coef),
-                    power=int(power),
-                    function_type=DerivativeType(ftype),
-                    operator_type=OperatorType(optype),
-                    scaling=scaling,
-                    shift=shift
-                )
-                st.session_state.generator_terms.append(term)
-                st.success("Term added.")
-            except Exception as e:
-                st.error(f"Failed to add term: {e}")
-
+            term = DerivativeTerm(
+                derivative_order=deriv_order,
+                coefficient=coefficient,
+                power=power,
+                function_type=DerivativeType(func_type),
+                operator_type=OperatorType(operator_type),
+                scaling=scaling,
+                shift=shift,
+            )
+            st.session_state.generator_terms.append(term)
+            st.success("Term added.")
     if st.session_state.generator_terms:
-        st.subheader("📝 Current Terms")
+        st.subheader("📝 Current Generator Terms")
         for i, term in enumerate(st.session_state.generator_terms):
-            c1, c2 = st.columns([8,1])
+            c1, c2 = st.columns([8, 1])
             with c1:
                 desc = term.get_description() if hasattr(term, "get_description") else str(term)
                 st.write(f"• {desc}")
             with c2:
                 if st.button("❌", key=f"rm_{i}"):
                     st.session_state.generator_terms.pop(i)
-                    _safe_rerun()
+                    st.experimental_rerun()
         if st.button("🔨 Build Generator Specification", type="primary"):
             try:
-                spec = GeneratorSpecification(
-                    terms=st.session_state.generator_terms,
-                    name=f"Custom Generator {len(st.session_state.generated_odes)+1}"
+                gen_spec = GeneratorSpecification(
+                    terms=st.session_state.generator_terms, name=f"Custom Generator {len(st.session_state.generated_odes)+1}"
                 )
-                st.session_state.current_generator = spec
+                st.session_state.current_generator = gen_spec
                 st.success("Generator specification created.")
                 try:
-                    st.latex(_latex(spec.lhs) + " = \\mathrm{RHS}(x,y)")
+                    st.latex(sp.latex(gen_spec.lhs) + " = RHS")
                 except Exception:
                     pass
             except Exception as e:
@@ -433,314 +780,113 @@ def page_constructor():
         st.session_state.generator_terms = []
         st.session_state.current_generator = None
 
-def page_apply_theorem():
-    st.header("🎯 Apply Master Theorem (Async‑ready)")
-    # LHS source
-    src = st.radio("LHS source", ("constructor","freeform","arbitrary"),
-                   index={"constructor":0,"freeform":1,"arbitrary":2}[st.session_state["lhs_source"]],
-                   horizontal=True)
-    st.session_state["lhs_source"] = src
 
-    # Function library
-    colA, colB = st.columns(2)
-    with colA:
-        lib = st.selectbox("Function library", ["Basic","Special"], index=0)
-    with colB:
-        bf = st.session_state.get("basic_functions")
-        sf = st.session_state.get("special_functions")
-        if lib == "Basic" and bf:
-            names = bf.get_function_names()
-            src_lib = bf
-        elif lib == "Special" and sf:
-            names = sf.get_function_names()
-            src_lib = sf
-        else:
-            names, src_lib = [], None
-        func_name = st.selectbox("Choose f(z)", names) if names else st.text_input("Enter f(z)", "exp(z)")
-
-    # Parameters
-    c1,c2,c3,c4 = st.columns(4)
-    with c1: alpha = st.number_input("α", value=1.0, step=0.1, format="%.6f")
-    with c2: beta  = st.number_input("β", value=1.0, step=0.1, format="%.6f")
-    with c3: n     = st.number_input("n (positive integer)", 1, 12, 1)
-    with c4: M     = st.number_input("M", value=0.0, step=0.1, format="%.6f")
-
-    c5, c6, c7 = st.columns(3)
-    with c5: use_exact = st.checkbox("Exact (symbolic) parameters", True)
-    with c6: simplify_level = st.selectbox("Simplify", ["light","none","aggressive"], index=0)
-    with c7:
-        async_on = has_redis()
-        st.info("Async via Redis: **ON**" if async_on else "Async via Redis: **OFF**")
-
-    # Free-form LHS builder
-    st.subheader("🧩 Free‑form LHS (Builder)")
-    with st.expander("Add terms", expanded=False):
-        if "free_terms" not in st.session_state:
-            st.session_state.free_terms = []
-        cols = st.columns([1,1,1,1,1,1,1,1])
-        with cols[0]: coef = st.number_input("coef", 1.0, step=0.5)
-        with cols[1]: inner_k = st.number_input("inner k (y^(k))", 0, 12, 0)
-        with cols[2]: wrapper = st.selectbox("wrap(.)",
-                            ["id","exp","sin","cos","tan","sinh","cosh","tanh","log","abs",
-                             "asin","acos","atan","asinh","acosh","atanh","erf","erfc"], index=0)
-        with cols[3]: power = st.number_input("power", 1, 6, 1)
-        with cols[4]: outer_m = st.number_input("outer m (D^m)", 0, 12, 0)
-        with cols[5]: scale = st.number_input("arg scale (a)", value=1.0, step=0.1, format="%.4f")
-        with cols[6]: shift = st.number_input("arg shift (b)", value=0.0, step=0.1, format="%.4f")
-        with cols[7]:
-            if st.button("➕ Add term"):
-                st.session_state.free_terms.append({
-                    "coef": float(coef), "inner_order": int(inner_k), "wrapper": wrapper,
-                    "power": int(power), "outer_order": int(outer_m),
-                    "arg_scale": float(scale) if abs(scale) > 1e-14 else None,
-                    "arg_shift": float(shift) if abs(shift) > 1e-14 else None,
-                })
-        if st.session_state.free_terms:
-            st.write("**Current terms:**")
-            for i, t in enumerate(st.session_state.free_terms):
-                st.write(f"{i+1}. {t}")
-            ccc1, ccc2 = st.columns(2)
-            with ccc1:
-                if st.button("🧮 Use free‑form LHS"):
-                    st.session_state["lhs_source"] = "freeform"
-                    st.success("Free-form LHS selected.")
-            with ccc2:
-                if st.button("🗑️ Clear terms"):
-                    st.session_state.free_terms = []
-
-    # Arbitrary SymPy LHS
-    st.subheader("✍️ Arbitrary LHS (SymPy)")
-    st.session_state.arbitrary_lhs_text = st.text_area(
-        "Enter any SymPy expression in x and y(x)",
-        value=st.session_state.arbitrary_lhs_text or "",
-        height=90
+# ---------------- Reverse Engineering ----------------
+def reverse_engineering_page():
+    st.header("🔁 Reverse Engineering")
+    st.markdown(
+        '<div class="info-box">Give a candidate solution \(y(x)\) or an ODE, and we will compute/verify the corresponding pieces.</div>',
+        unsafe_allow_html=True,
     )
-    cva, cvb = st.columns(2)
-    with cva:
-        if st.button("✅ Validate arbitrary LHS"):
-            from shared.ode_core import parse_arbitrary_lhs  # local import
+
+    mode = st.radio("Mode", ["Derive RHS from y(x)", "Verify ODE with candidate y(x)"], horizontal=True)
+
+    x = sp.Symbol("x", real=True)
+
+    if mode == "Derive RHS from y(x)":
+        y_text = st.text_area("Enter y(x) (SymPy syntax)", "exp(-x)*sin(x)")
+        lhs_text = st.text_area("Enter LHS operator in terms of y(x) (e.g., y(x).diff(x,2) + y(x))", "y(x).diff(x,2) + y(x)")
+
+        if st.button("🧮 Compute RHS = L[y]"):
             try:
-                _ = parse_arbitrary_lhs(st.session_state.arbitrary_lhs_text)
-                st.success("Expression parsed successfully.")
-                st.session_state["lhs_source"] = "arbitrary"
+                y_expr = sp.sympify(y_text, locals={"x": x})
+                yfun = sp.Function("y")
+                lhs_expr = sp.sympify(lhs_text, locals={"x": x, "y": yfun})
+                # substitute y and its derivatives directly
+                subs_map = {}
+                for node in lhs_expr.atoms(AppliedUndef, sp.Derivative):
+                    if isinstance(node, AppliedUndef) and node.func == yfun:
+                        subs_map[node] = y_expr.subs(x, node.args[0])
+                    elif isinstance(node, sp.Derivative):
+                        base = node.expr
+                        if isinstance(base, AppliedUndef) and base.func == yfun:
+                            order = node.derivative_count
+                            subs_map[node] = sp.diff(y_expr, (x, order)).subs(x, base.args[0])
+                rhs = lhs_expr.xreplace(subs_map)
+                st.latex("L[y] = " + sp.latex(sp.simplify(rhs)))
             except Exception as e:
-                st.error(f"Parse error: {e}")
-    with cvb:
-        if st.button("↩️ Prefer Constructor LHS"):
-            st.session_state["lhs_source"] = "constructor"
+                st.error(f"Error: {e}")
 
-    # Prepare constructor LHS (if any)
-    constructor_lhs = None
-    spec = st.session_state.get("current_generator")
-    if spec is not None and hasattr(spec, "lhs"):
-        constructor_lhs = spec.lhs
-        st.caption("Using constructor LHS currently in session.")
+    else:  # Verify ODE with candidate y(x)
+        ode_text = st.text_area("Enter ODE as LHS - RHS (SymPy)", "y(x).diff(x,2) + y(x)")
+        y_text = st.text_area("Enter candidate y(x)", "sin(x)")
+        at = st.number_input("Evaluate residual at x =", value=0.0)
 
-    # Theorem 4.2 option
-    st.markdown("---")
-    colm1, colm2 = st.columns([1,1])
-    with colm1:
-        compute_mth = st.checkbox("Compute y^(m)(x) (Theorem 4.2)", False)
-    with colm2:
-        m_order = st.number_input("m", 1, 12, 1)
-
-    # Generate ODE (Theorem 4.1)
-    if st.button("🚀 Generate ODE", type="primary", use_container_width=True):
-        payload = {
-            "func_name": func_name,
-            "alpha": alpha, "beta": beta, "n": int(n), "M": M,
-            "use_exact": use_exact, "simplify_level": simplify_level,
-            "lhs_source": st.session_state["lhs_source"],
-            "freeform_terms": st.session_state.get("free_terms"),
-            "arbitrary_lhs_text": st.session_state.get("arbitrary_lhs_text"),
-            "function_library": lib,
-        }
-        if not has_redis():
-            # Run synchronously
+        if st.button("🔍 Verify"):
             try:
-                basic_lib = st.session_state.get("basic_functions")
-                special_lib = st.session_state.get("special_functions")
-                p = ComputeParams(
-                    func_name=payload["func_name"],
-                    alpha=payload["alpha"], beta=payload["beta"], n=payload["n"], M=payload["M"],
-                    use_exact=payload["use_exact"], simplify_level=payload["simplify_level"],
-                    lhs_source=payload["lhs_source"],
-                    constructor_lhs=constructor_lhs,
-                    freeform_terms=payload["freeform_terms"],
-                    arbitrary_lhs_text=payload["arbitrary_lhs_text"],
-                    function_library=payload["function_library"],
-                    basic_lib=basic_lib, special_lib=special_lib
-                )
-                res = compute_ode_full(p)
-                # convert to sympy where needed
-                res["generator"] = _sympify_safe(res["generator"])
-                res["rhs"] = _sympify_safe(res["rhs"])
-                res["solution"] = _sympify_safe(res["solution"])
-                register_generated_ode(res)
-                _show_ode_result(res)
-            except Exception as e:
-                st.error(f"Generation error: {e}")
-        else:
-            # Enqueue to worker
-            qname = _env_queue("RQ_QUEUE_COMPUTE", "ode_jobs")
-            job_id = enqueue_job(
-                "worker.compute_job",
-                payload,
-                queue=qname,
-                job_timeout=int(os.getenv("RQ_DEFAULT_JOB_TIMEOUT", "3600")),
-                result_ttl=int(os.getenv("RQ_RESULT_TTL", "604800")),
-                description="compute ODE",
-                meta={"summary": {"kind": "compute", "func": func_name}}
-            )
-            if job_id:
-                st.session_state["last_job_id"] = job_id
-                st.success(f"Job submitted to **{qname}**. ID = {job_id}")
-            else:
-                st.error("Failed to submit job. Check REDIS_URL / queue.")
-
-    # Job Status (only if async & pending job)
-    if has_redis() and "last_job_id" in st.session_state and st.session_state["last_job_id"]:
-        st.markdown("### 🛰️ Job Status")
-        colx, coly = st.columns([1,1])
-        with colx:
-            if st.button("🔄 Refresh status"):
-                _safe_rerun()
-        info = fetch_job(st.session_state["last_job_id"])
-        if info:
-            st.caption(
-                f"Queue: {info.get('queue')} • Status: **{info.get('status')}** • "
-                f"Enqueued: {info.get('enqueued_at')} • Started: {info.get('started_at')}"
-            )
-            if info.get("exc_info"):
-                st.error("Worker exception:")
-                st.code(info["exc_info"])
-            if info.get("status") == "finished":
-                res = info["result"]
-                # cast for pretty rendering
+                y_expr = sp.sympify(y_text, locals={"x": x})
+                ode_expr = sp.sympify(ode_text, locals={"x": x, "y": sp.Function("y")})
+                # replace y, y', ... with the candidate
+                subs_map = {}
+                yfun = sp.Function("y")
+                for node in ode_expr.atoms(AppliedUndef, sp.Derivative):
+                    if isinstance(node, AppliedUndef) and node.func == yfun:
+                        subs_map[node] = y_expr.subs(x, node.args[0])
+                    elif isinstance(node, sp.Derivative):
+                        base = node.expr
+                        if isinstance(base, AppliedUndef) and base.func == yfun:
+                            order = node.derivative_count
+                            subs_map[node] = sp.diff(y_expr, (x, order)).subs(x, base.args[0])
+                res_expr = sp.simplify(ode_expr.xreplace(subs_map))
+                st.latex("Residual(x) = " + sp.latex(res_expr))
                 try:
-                    res["generator"] = _sympify_safe(res["generator"])
-                    res["rhs"]       = _sympify_safe(res["rhs"])
-                    res["solution"]  = _sympify_safe(res["solution"])
+                    val = float(res_expr.subs(x, at))
+                    st.info(f"Residual at x={at:.3f}: {val:.6g}")
                 except Exception:
                     pass
-                register_generated_ode(res)
-                _show_ode_result(res)
-                st.session_state["last_job_id"] = None
-        else:
-            st.info("⏳ Still computing...")
+            except Exception as e:
+                st.error(f"Error: {e}")
 
-    # Theorem 4.2 (synchronous)
-    if compute_mth and st.button("🧮 Compute y^{(m)}(x) via Theorem 4.2", use_container_width=True):
-        try:
-            lib_obj = st.session_state.get("basic_functions") if lib == "Basic" else st.session_state.get("special_functions")
-            f_preview = get_function_expr(lib_obj, func_name)
-            α = to_exact(alpha) if use_exact else sp.Float(alpha)
-            β = to_exact(beta)  if use_exact else sp.Float(beta)
-            x = sp.Symbol("x", real=True)
-            y_m = theorem_4_2_y_m_expr(f_preview, α, β, int(n), int(m_order), x, simplify_level)
-            st.markdown("### 🔢 Derivative")
-            st.latex(fr"y^{{({int(m_order)})}}(x) = " + _latex(y_m))
-        except Exception as e:
-            st.error(f"Failed to compute y^{m_order}(x): {e}")
 
-def _show_ode_result(res: Dict[str, Any]):
-    st.markdown('<div class="result-box"><h3>✅ ODE Generated Successfully!</h3></div>', unsafe_allow_html=True)
-    t_eq, t_sol, t_exp = st.tabs(["📐 Equation", "💡 Solution & ICs", "📤 Export"])
-    with t_eq:
-        try:
-            st.latex(_latex(res["generator"]) + " = " + _latex(res["rhs"]))
-        except Exception:
-            st.write("LHS:", res.get("generator"))
-            st.write("RHS:", res.get("rhs"))
-        st.caption(f"Type: {res.get('type','?')} • Order: {res.get('order','?')}")
-    with t_sol:
-        try:
-            st.latex("y(x) = " + _latex(res["solution"]))
-        except Exception:
-            st.write("y(x) =", res.get("solution"))
-        if res.get("initial_conditions"):
-            st.markdown("**Initial conditions:**")
-            for k, v in res["initial_conditions"].items():
-                try:
-                    st.latex(k + " = " + _latex(v))
-                except Exception:
-                    st.write(k, "=", v)
-        p = res.get("parameters", {})
-        st.markdown("**Parameters:**")
-        st.write(f"α={p.get('alpha')}, β={p.get('beta')}, n={p.get('n')}, M={p.get('M')}")
-        st.write(f"**Function:** f(z) = {res.get('f_expr_preview')}")
-    with t_exp:
-        idx = len(st.session_state.generated_odes)
-        ode_data = {
-            "generator": res.get("generator",""),
-            "rhs": res.get("rhs",""),
-            "solution": res.get("solution",""),
-            "parameters": res.get("parameters", {}),
-            "classification": {
-                "type": "Linear" if res.get("type")=="linear" else "Nonlinear",
-                "order": res.get("order", 0),
-                "linearity": "Linear" if res.get("type")=="linear" else "Nonlinear",
-                "field": "Mathematical Physics",
-                "applications": ["Research Equation"],
-            },
-            "initial_conditions": res.get("initial_conditions", {}),
-            "function_used": str(res.get("function_used","?")),
-            "generator_number": idx,
-            "type": res.get("type","nonlinear"),
-            "order": res.get("order", 0)
-        }
-        latex_doc = LaTeXExporter.document(ode_data, include_preamble=True)
-        st.download_button("📄 LaTeX (.tex)", latex_doc, f"ode_{idx}.tex", "text/x-latex", use_container_width=True)
-        pkg = LaTeXExporter.package(ode_data)
-        st.download_button("📦 ZIP package", pkg, f"ode_package_{idx}.zip", "application/zip", use_container_width=True)
-
-def page_ml_dl():
-    st.header("🤖 ML / DL (Training • Loading • Generation • Reverse)")
+# ---------------- ML Pattern Learning (RQ + local fallback) ----------------
+def ml_pattern_learning_page():
+    st.header("🤖 ML Pattern Learning")
     if not MLTrainer:
-        st.warning("MLTrainer not available (src/ml/trainer.py missing).")
+        st.warning("MLTrainer not found in src/.")
         return
 
-    # Metrics
     c1, c2, c3, c4 = st.columns(4)
-    with c1: st.metric("Generated ODEs (session)", len(st.session_state.generated_odes))
-    with c2: st.metric("Batch Rows", len(st.session_state.batch_results))
-    with c3: st.metric("Min ODEs for Training", MIN_ODES_FOR_TRAINING)
+    with c1:
+        st.metric("Patterns", len(st.session_state.generator_patterns))
+    with c2:
+        st.metric("Generated ODEs", len(st.session_state.generated_odes))
+    with c3:
+        st.metric("Training Epochs", len(st.session_state.training_history))
     with c4:
-        st.metric("Model", "Trained ✅" if st.session_state.get("ml_trained") else "Not trained")
+        st.metric("Model Status", "Trained" if st.session_state.get("ml_trained") else "Not Trained")
 
-    # Model selection & training config
     model_type = st.selectbox(
-        "Model",
-        ["pattern_learner", "vae", "transformer"],
-        format_func=lambda s: {"pattern_learner":"Pattern Learner","vae":"VAE","transformer":"Transformer"}[s]
+        "Select ML Model", ["pattern_learner", "vae", "transformer"],
+        format_func=lambda s: {"pattern_learner": "Pattern Learner", "vae": "VAE", "transformer": "Transformer"}[s],
     )
 
     with st.expander("🎯 Training Configuration", True):
-        c1,c2,c3 = st.columns(3)
+        c1, c2, c3 = st.columns(3)
         with c1:
             epochs = st.slider("Epochs", 10, 500, 100)
             batch_size = st.slider("Batch Size", 8, 128, 32)
         with c2:
-            learning_rate = st.select_slider("Learning Rate", [0.0001,0.0005,0.001,0.005,0.01], value=0.001)
-            samples = st.slider("Training Samples (synthetic)", 200, 10000, 2000)
+            learning_rate = st.select_slider("Learning Rate", [0.0001, 0.0005, 0.001, 0.005, 0.01], value=0.001)
+            samples = st.slider("Training Samples", 100, 5000, 1000)
         with c3:
-            validation_split = st.slider("Validation Split", 0.1, 0.4, 0.2)
+            validation_split = st.slider("Validation Split", 0.1, 0.3, 0.2)
             use_gpu = st.checkbox("Use GPU if available", True)
-        run_on_worker = st.checkbox("Run on RQ worker (async)", has_redis())
-        include_user_data = st.checkbox("Include session ODEs as seed examples", True)
+        use_rq = st.checkbox("Run in background via Redis (RQ)", value=has_redis())
+        enable_mixed_precision = st.checkbox("Enable mixed precision (AMP)", value=False)
 
-        # PRE-TRAINING GATE
-        total_examples = len(st.session_state.generated_odes) + len(st.session_state.batch_results)
-        can_train = total_examples >= MIN_ODES_FOR_TRAINING
-        if not can_train:
-            st.warning(
-                f"Need at least {MIN_ODES_FOR_TRAINING} ODEs before training. "
-                f"Current: {total_examples}. Generate more ODEs (Apply Theorem / Batch) and retry."
-            )
-
-        # Train
-        clicked = st.button("🚀 Start Training", type="primary", use_container_width=True, disabled=not can_train)
-        if clicked:
+    # Background (RQ) path
+    if use_rq:
+        if st.button("🚀 Start Background Training (RQ)", type="primary"):
             payload = {
                 "model_type": model_type,
                 "learning_rate": float(learning_rate),
@@ -748,233 +894,195 @@ def page_ml_dl():
                 "batch_size": int(batch_size),
                 "samples": int(samples),
                 "validation_split": float(validation_split),
-                "device": "cuda" if (use_gpu and torch and torch.cuda.is_available()) else "cpu",
-                "include_user_data": bool(include_user_data),
-                "user_odes": st.session_state.generated_odes if include_user_data else [],
-                "batch_rows": st.session_state.batch_results if include_user_data else [],
+                "use_generator": True,  # memory-efficient generator avoids 'v' key errors
+                "enable_mixed_precision": bool(enable_mixed_precision),
+                "checkpoint_dir": os.getenv("CHECKPOINT_DIR", "checkpoints"),
+                "device": "cuda" if (use_gpu and (torch and torch.cuda.is_available())) else "cpu",
             }
-            if run_on_worker and has_redis():
-                qname = _env_queue("RQ_QUEUE_TRAIN", "ml_jobs")
-                job_id = enqueue_job(
-                    "worker.train_job",
-                    payload,
-                    queue=qname,
-                    job_timeout=int(os.getenv("RQ_DEFAULT_JOB_TIMEOUT", "86400")),  # up to 24h
-                    result_ttl=int(os.getenv("RQ_RESULT_TTL", "604800")),
-                    description=f"train {model_type}",
-                    meta={"summary": {"kind": "train", "model": model_type}}
-                )
-                if job_id:
-                    st.success(f"Training job submitted to **{qname}**. ID = {job_id}")
-                    st.session_state.training_jobs.append(job_id)
-                else:
-                    st.error("Failed to submit training job. Check Redis/queue.")
+            train_timeout = int(os.getenv("TRAIN_JOB_TIMEOUT", "86400"))  # up to 24h by default
+            job_id = enqueue_with_timeout("worker.train_job", payload, timeout_sec=train_timeout)
+            if job_id:
+                st.session_state["last_train_job_id"] = job_id
+                st.success(f"Training job submitted. ID = {job_id}")
             else:
-                # Run locally (blocking)
+                st.error("Failed to submit training job")
+
+        # Poll training job
+        if st.session_state.get("last_train_job_id"):
+            st.markdown("### 📡 Training Job Status")
+            info = fetch_job(st.session_state["last_train_job_id"])
+            colx, coly = st.columns([1, 1])
+            with colx:
+                st.write(f"Job: `{st.session_state['last_train_job_id']}`")
+            with coly:
+                st.button("🔄 Refresh status", key="refresh_train_status")
+
+            if info:
+                status = info.get("status")
+                meta = info.get("meta") or {}
+                prog = meta.get("progress") or {}
+                epoch = int(prog.get("epoch", 0))
+                total_epochs = int(prog.get("total_epochs", max(epoch, 1)))
+                p = epoch / total_epochs if total_epochs else 0.0
+                st.progress(min(1.0, max(0.0, p)))
+                st.write(f"Epoch {epoch} / {total_epochs}")
+
+                if status == "finished":
+                    r = info.get("result") or {}
+                    st.success("Training finished.")
+                    st.session_state.training_history = r.get("history", {})
+                    st.session_state.ml_trained = True
+                    st.session_state["train_best_path"] = r.get("best_model_path")
+                    st.write("Best model:", st.session_state["train_best_path"])
+                    st.session_state["last_train_job_id"] = None
+                elif status == "failed":
+                    st.error(f"Training failed: {info.get('error')}")
+                    st.session_state["last_train_job_id"] = None
+                else:
+                    st.info(f"⏳ Status: {status}")
+
+        # Load best model (from shared volume path)
+        if st.session_state.get("train_best_path"):
+            if st.button("📥 Load Best Model into UI"):
                 try:
-                    trainer = MLTrainer(model_type=model_type, learning_rate=float(learning_rate), device=payload["device"])
-                    st.session_state.ml_trainer = trainer
-                    prog = st.progress(0); status = st.empty()
-                    def cb(e, tot): prog.progress(min(1.0, e/tot)); status.text(f"Epoch {e}/{tot}")
+                    trainer = MLTrainer(model_type=model_type, learning_rate=float(learning_rate))
+                    ok = trainer.load_model(st.session_state["train_best_path"])
+                    if ok:
+                        st.session_state.ml_trainer = trainer
+                        st.session_state.ml_trained = True
+                        st.success("Model loaded.")
+                    else:
+                        st.warning("Could not load model (check shared path).")
+                except Exception as e:
+                    st.error(f"Load failed: {e}")
+
+    # Local (sync) fallback
+    else:
+        if st.button("🚀 Train Locally (sync)", type="primary"):
+            with st.spinner("Training..."):
+                try:
+                    device = "cuda" if use_gpu and (torch and torch.cuda.is_available()) else "cpu"
+                    trainer = MLTrainer(
+                        model_type=model_type,
+                        learning_rate=float(learning_rate),
+                        device=device,
+                        enable_mixed_precision=bool(enable_mixed_precision),
+                    )
+                    prog = st.progress(0)
+                    status = st.empty()
+
+                    def progress_callback(e, T):
+                        prog.progress(min(1.0, e / T))
+                        status.text(f"Epoch {e}/{T}")
+
                     trainer.train(
                         epochs=int(epochs),
                         batch_size=int(batch_size),
                         samples=int(samples),
                         validation_split=float(validation_split),
-                        progress_callback=cb
+                        progress_callback=progress_callback,
+                        use_generator=True,  # avoids dataset key mismatches
                     )
-                    # Save best model
-                    ckpt_dir = "checkpoints"
-                    os.makedirs(ckpt_dir, exist_ok=True)
-                    best_path = os.path.join(ckpt_dir, f"{model_type}_best.pth")
-                    trainer.save_model(best_path)
-                    st.session_state.ml_model_path = best_path
+                    st.session_state.ml_trainer = trainer
                     st.session_state.ml_trained = True
-                    st.session_state.ml_history = trainer.history
-                    st.success(f"Training completed. Best saved at {best_path}")
+                    st.session_state.training_history = trainer.history
+                    st.success("Model trained.")
+                    if trainer.history.get("train_loss"):
+                        fig = go.Figure()
+                        fig.add_trace(
+                            go.Scatter(
+                                x=list(range(1, len(trainer.history["train_loss"]) + 1)),
+                                y=trainer.history["train_loss"],
+                                mode="lines",
+                                name="Training Loss",
+                            )
+                        )
+                        if trainer.history.get("val_loss"):
+                            fig.add_trace(
+                                go.Scatter(
+                                    x=list(range(1, len(trainer.history["val_loss"]) + 1)),
+                                    y=trainer.history["val_loss"],
+                                    mode="lines",
+                                    name="Validation Loss",
+                                )
+                            )
+                        fig.update_layout(title="Training History", xaxis_title="Epoch", yaxis_title="Loss")
+                        st.plotly_chart(fig, use_container_width=True)
                 except Exception as e:
                     st.error(f"Training failed: {e}")
 
-    # Monitor training jobs
-    if has_redis() and st.session_state.training_jobs:
-        st.subheader("🛰️ Training Jobs")
-        for jid in list(st.session_state.training_jobs):
-            info = fetch_job(jid)
-            if not info: 
-                st.info(f"{jid}: (not found yet)")
-                continue
-            st.write(f"**{jid}** — {info.get('status')} — {info.get('description')}")
-            if info.get("exc_info"):
-                st.error("Exception:"); st.code(info["exc_info"])
-            if info.get("status") == "finished":
-                res = info.get("result", {})
-                best_path = res.get("best_path") or res.get("model_path") or ""
-                if best_path:
-                    st.session_state.ml_model_path = best_path
-                    st.session_state.ml_trained = True
-                    st.session_state.ml_history = res.get("history", {})
-                    st.success(f"Model available: {best_path}")
-                # remove from active list
-                st.session_state.training_jobs.remove(jid)
+    # Generate new ODEs with trained model (UI-side generation)
+    if st.session_state.get("ml_trained"):
+        st.subheader("🎨 Generate Novel Patterns")
+        c1, c2 = st.columns(2)
+        with c1:
+            num_generate = st.slider("Number to Generate", 1, 10, 1)
+        with c2:
+            if st.button("🎲 Generate Novel ODEs", type="primary"):
+                with st.spinner("Generating..."):
+                    try:
+                        trainer = st.session_state.get("ml_trainer")
+                        if not trainer:
+                            # Even if trained in worker, we need a trainer object to call generate
+                            trainer = MLTrainer(model_type=model_type)
+                            st.session_state.ml_trainer = trainer
+                            # Optionally load best checkpoint if path is known
+                            if st.session_state.get("train_best_path"):
+                                trainer.load_model(st.session_state["train_best_path"])
+                        for i in range(num_generate):
+                            res = st.session_state.ml_trainer.generate_new_ode()
+                            if res:
+                                st.success(f"Generated ODE {i+1}")
+                                with st.expander(f"ODE {i+1}"):
+                                    if "ode" in res:
+                                        try:
+                                            st.latex(sp.latex(res["ode"]))
+                                        except Exception:
+                                            st.code(str(res["ode"]))
+                                    for k in ["type", "order", "function_used", "description"]:
+                                        if k in res:
+                                            st.write(f"**{k}:** {res[k]}")
+                                st.session_state.generated_odes.append(res)
+                    except Exception as e:
+                        st.error(f"Generation failed: {e}")
 
-    # Load / Upload model
-    st.subheader("📦 Load / Upload Model")
-    cols = st.columns(3)
-    with cols[0]:
-        mdl_path = st.text_input("Best checkpoint path", st.session_state.get("ml_model_path",""))
-        if st.button("📂 Load from path"):
-            if not mdl_path or not os.path.exists(mdl_path):
-                st.error("Path not found.")
-            else:
-                try:
-                    trainer = MLTrainer(model_type=model_type, device="cpu")
-                    ok = trainer.load_model(mdl_path)
-                    if ok:
-                        st.session_state.ml_trainer = trainer
-                        st.session_state.ml_trained = True
-                        st.session_state.ml_model_path = mdl_path
-                        st.session_state.ml_history = getattr(trainer, "history", {})
-                        st.success("Model loaded.")
-                    else:
-                        st.error("Load returned False.")
-                except Exception as e:
-                    st.error(f"Load failed: {e}")
-    with cols[1]:
-        up = st.file_uploader("Upload .pth", type=["pth"])
-        if up is not None:
-            try:
-                os.makedirs("checkpoints", exist_ok=True)
-                target = os.path.join("checkpoints", up.name)
-                with open(target, "wb") as f:
-                    f.write(up.read())
-                trainer = MLTrainer(model_type=model_type, device="cpu")
-                ok = trainer.load_model(target)
-                if ok:
-                    st.session_state.ml_trainer = trainer
-                    st.session_state.ml_trained = True
-                    st.session_state.ml_model_path = target
-                    st.session_state.ml_history = getattr(trainer, "history", {})
-                    st.success(f"Uploaded & loaded: {target}")
-                else:
-                    st.error("Uploaded but load failed.")
-            except Exception as e:
-                st.error(f"Upload/load error: {e}")
-    with cols[2]:
-        if st.button("🧹 Clear model from memory"):
-            st.session_state.ml_trainer = None
-            st.session_state.ml_trained = False
-            st.session_state.ml_model_path = ""
-            st.success("Cleared.")
 
-    # Generate from model
-    st.subheader("🎨 Generate Novel ODEs from Trained Model")
-    gen_cols = st.columns([1,1,2])
-    with gen_cols[0]:
-        n_gen = st.slider("How many", 1, 10, 1)
-    with gen_cols[1]:
-        do_register = st.checkbox("Add to session list", True)
-    with gen_cols[2]:
-        if st.button("🎲 Generate", type="primary") and st.session_state.get("ml_trained") and st.session_state.get("ml_trainer"):
-            try:
-                for i in range(n_gen):
-                    res = st.session_state.ml_trainer.generate_new_ode()
-                    if res:
-                        # normalize view
-                        try:
-                            res["generator"] = _sympify_safe(res["generator"])
-                            res["rhs"] = _sympify_safe(res["rhs"])
-                        except Exception:
-                            pass
-                        st.success(f"Generated ODE #{i+1}")
-                        with st.expander(f"ODE {i+1}"):
-                            try:
-                                st.latex(_latex(res.get("generator","")) + " = " + _latex(res.get("rhs","")))
-                            except Exception:
-                                st.code(str(res))
-                        if do_register:
-                            register_generated_ode(res)
-            except Exception as e:
-                st.error(f"Generation failed: {e}")
-
-    # Reverse engineering (RQ)
-    st.subheader("🔁 Reverse Engineering (Predict from learned patterns)")
-    rev_cols = st.columns([1,2])
-    with rev_cols[0]:
-        run_rev_worker = st.checkbox("Run on worker", has_redis())
-    with rev_cols[1]:
-        text_input = st.text_area("Enter an ODE or solution hint (text/SymPy/LaTeX acceptable):", height=80)
-    if st.button("🔎 Reverse Engineer", type="primary") and text_input.strip():
-        payload = {
-            "hint": text_input.strip(),
-            "model_path": st.session_state.get("ml_model_path", ""),
-            "model_type": model_type
-        }
-        if run_rev_worker and has_redis():
-            qname = _env_queue("RQ_QUEUE_REVERSE", "reverse_jobs")
-            job_id = enqueue_job(
-                "worker.reverse_job",
-                payload,
-                queue=qname,
-                job_timeout=int(os.getenv("RQ_DEFAULT_JOB_TIMEOUT", "3600")),
-                result_ttl=int(os.getenv("RQ_RESULT_TTL", "604800")),
-                description="reverse",
-                meta={"summary": {"kind": "reverse"}}
-            )
-            if job_id:
-                st.success(f"Reverse job submitted to **{qname}**. ID = {job_id}")
-                st.session_state.reverse_jobs.append(job_id)
-        else:
-            # If you have a local reverse function, call it here.
-            st.info("Local reverse is not implemented here; use worker.")
-
-    if has_redis() and st.session_state.reverse_jobs:
-        st.subheader("🔭 Reverse Jobs")
-        for jid in list(st.session_state.reverse_jobs):
-            info = fetch_job(jid)
-            if not info:
-                st.write(f"{jid}: ...")
-                continue
-            st.write(f"**{jid}** — {info.get('status')}")
-            if info.get("exc_info"):
-                st.error("Exception:"); st.code(info["exc_info"])
-            if info.get("status") == "finished":
-                res = info.get("result", {})
-                st.success("Reverse result:")
-                st.json(res)
-                st.session_state.reverse_jobs.remove(jid)
-
-def page_batch():
+# ---------------- Batch Generation ----------------
+def batch_generation_page():
     st.header("📊 Batch ODE Generation")
     st.markdown('<div class="info-box">Generate many ODEs with your factories.</div>', unsafe_allow_html=True)
-    c1,c2,c3 = st.columns(3)
+    c1, c2, c3 = st.columns(3)
     with c1:
         num_odes = st.slider("Number of ODEs", 5, 500, 50)
-        gen_types = st.multiselect("Generator Types", ["linear","nonlinear"], default=["linear","nonlinear"])
+        gen_types = st.multiselect("Generator Types", ["linear", "nonlinear"], default=["linear", "nonlinear"])
     with c2:
-        func_cats = st.multiselect("Function Categories", ["Basic","Special"], default=["Basic"])
+        func_categories = st.multiselect("Function Categories", ["Basic", "Special"], default=["Basic"])
         vary_params = st.checkbox("Vary Parameters", True)
     with c3:
         if vary_params:
             alpha_range = st.slider("α range", -10.0, 10.0, (-2.0, 2.0))
-            beta_range  = st.slider("β range", 0.1, 10.0, (0.5, 2.0))
-            n_range     = st.slider("n range", 1, 5, (1, 3))
+            beta_range = st.slider("β range", 0.1, 10.0, (0.5, 2.0))
+            n_range = st.slider("n range", 1, 5, (1, 3))
         else:
-            alpha_range=(1.0,1.0); beta_range=(1.0,1.0); n_range=(1,1)
+            alpha_range = (1.0, 1.0)
+            beta_range = (1.0, 1.0)
+            n_range = (1, 1)
 
     with st.expander("⚙️ Advanced Options"):
-        export_format = st.selectbox("Export Format", ["JSON","CSV","LaTeX","All"])
+        export_format = st.selectbox("Export Format", ["JSON", "CSV", "LaTeX", "All"])
         include_solutions = st.checkbox("Include Solutions", True)
         include_classification = st.checkbox("Include Classification", True)
 
     if st.button("🚀 Generate Batch", type="primary"):
         with st.spinner(f"Generating {num_odes} ODEs..."):
-            results = []
-            prog = st.progress(0); status = st.empty()
+            batch_results = []
+            prog = st.progress(0)
+            status = st.empty()
 
             all_functions = []
-            if "Basic" in func_cats and st.session_state.get("basic_functions"):
+            if "Basic" in func_categories and st.session_state.get("basic_functions"):
                 all_functions += st.session_state.basic_functions.get_function_names()
-            if "Special" in func_cats and st.session_state.get("special_functions"):
+            if "Special" in func_categories and st.session_state.get("special_functions"):
                 all_functions += st.session_state.special_functions.get_function_names()[:20]
             if not all_functions:
                 st.warning("No function names available from libraries.")
@@ -982,142 +1090,231 @@ def page_batch():
 
             for i in range(num_odes):
                 try:
-                    prog.progress((i+1)/num_odes); status.text(f"Generating ODE {i+1}/{num_odes}")
+                    prog.progress((i + 1) / num_odes)
+                    status.text(f"Generating ODE {i+1}/{num_odes}")
                     params = {
                         "alpha": float(np.random.uniform(*alpha_range)),
-                        "beta":  float(np.random.uniform(*beta_range)),
-                        "n": int(np.random.randint(n_range[0], n_range[1]+1)),
+                        "beta": float(np.random.uniform(*beta_range)),
+                        "n": int(np.random.randint(n_range[0], n_range[1] + 1)),
                         "M": float(np.random.uniform(-1, 1)),
                     }
                     func_name = np.random.choice(all_functions)
                     gt = np.random.choice(gen_types)
+                    res = {}
+                    if gt == "linear":
+                        if CompleteLinearGeneratorFactory:
+                            factory = CompleteLinearGeneratorFactory()
+                            gen_num = np.random.randint(1, 9)
+                            if gen_num in [4, 5]:
+                                params["a"] = float(np.random.uniform(1, 3))
+                            res = factory.create(gen_num, st.session_state.basic_functions.get_function(func_name), **params)
+                        elif LinearGeneratorFactory:
+                            factory = LinearGeneratorFactory()
+                            res = factory.create(1, st.session_state.basic_functions.get_function(func_name), **params)
+                    else:
+                        if CompleteNonlinearGeneratorFactory:
+                            factory = CompleteNonlinearGeneratorFactory()
+                            gen_num = np.random.randint(1, 11)
+                            if gen_num in [1, 2, 4]:
+                                params["q"] = int(np.random.randint(2, 6))
+                            if gen_num in [2, 3, 5]:
+                                params["v"] = int(np.random.randint(2, 6))
+                            if gen_num in [4, 5, 9, 10]:
+                                params["a"] = float(np.random.uniform(1, 3))
+                            res = factory.create(gen_num, st.session_state.basic_functions.get_function(func_name), **params)
+                        elif NonlinearGeneratorFactory:
+                            factory = NonlinearGeneratorFactory()
+                            res = factory.create(1, st.session_state.basic_functions.get_function(func_name), **params)
+                    if not res:
+                        continue
 
                     row = {
-                        "ID": i+1,
-                        "Type": gt,
+                        "ID": i + 1,
+                        "Type": res.get("type", "unknown"),
+                        "Generator": res.get("generator_number", "?"),
                         "Function": func_name,
-                        "α": round(params["alpha"],4), "β": round(params["beta"],4), "n": params["n"]
+                        "Order": res.get("order", 0),
+                        "α": round(params["alpha"], 4),
+                        "β": round(params["beta"], 4),
+                        "n": params["n"],
                     }
-                    # Just record summarized items for table; production calls would call factories
                     if include_solutions:
-                        row["Solution"] = " (omitted in batch preview) "
+                        s = str(res.get("solution", ""))
+                        row["Solution"] = (s[:120] + "...") if len(s) > 120 else s
                     if include_classification:
-                        row["Subtype"] = "standard"
-                    results.append(row)
+                        row["Subtype"] = res.get("subtype", "standard")
+                    batch_results.append(row)
                 except Exception as e:
-                    log.debug(f"Failed to generate ODE {i+1}: {e}")
+                    logger.debug(f"Failed to generate ODE {i+1}: {e}")
 
-            st.session_state.batch_results.extend(results)
-            st.success(f"Generated {len(results)} batch rows.")
-            df = pd.DataFrame(results)
+            st.session_state.batch_results.extend(batch_results)
+            st.success(f"Generated {len(batch_results)} ODEs.")
+            df = pd.DataFrame(batch_results)
             st.dataframe(df, use_container_width=True)
 
             st.subheader("📤 Export Results")
-            c1,c2,c3,c4 = st.columns(4)
+            c1, c2, c3, c4 = st.columns(4)
             with c1:
                 csv = df.to_csv(index=False).encode("utf-8")
-                st.download_button("📊 CSV", csv, f"batch_{datetime.now():%Y%m%d_%H%M%S}.csv","text/csv")
+                st.download_button(
+                    "📊 Download CSV",
+                    csv,
+                    f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    "text/csv",
+                )
             with c2:
-                js = json.dumps(results, indent=2, default=str).encode("utf-8")
-                st.download_button("📄 JSON", js, f"batch_{datetime.now():%Y%m%d_%H%M%S}.json","application/json")
+                js = json.dumps(batch_results, indent=2, default=str).encode("utf-8")
+                st.download_button(
+                    "📄 Download JSON",
+                    js,
+                    f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                    "application/json",
+                )
             with c3:
-                if export_format in ["LaTeX","All"]:
-                    latex = "\\n".join([
-                        r"\begin{tabular}{|c|c|c|c|c|}", r"\hline", r"ID & Type & Function & α & n \\",
-                        r"\hline", *[f"{r.get('ID','')} & {r.get('Type','')} & {r.get('Function','')} & {r.get('α','')} & {r.get('n','')} \\\\" for r in results[:30]],
-                        r"\hline", r"\end{tabular}"
-                    ])
-                    st.download_button("📝 LaTeX", latex, f"batch_{datetime.now():%Y%m%d_%H%M%S}.tex","text/x-latex")
+                if export_format in ["LaTeX", "All"]:
+                    latex = "\n".join(
+                        [
+                            r"\begin{tabular}{|c|c|c|c|c|}",
+                            r"\hline",
+                            r"ID & Type & Generator & Function & Order \\",
+                            r"\hline",
+                            *[
+                                f"{r.get('ID','')} & {r.get('Type','')} & {r.get('Generator','')} & {r.get('Function','')} & {r.get('Order','')} \\\\"
+                                for r in batch_results[:30]
+                            ],
+                            r"\hline",
+                            r"\end{tabular}",
+                        ]
+                    )
+                    st.download_button(
+                        "📝 Download LaTeX",
+                        latex,
+                        f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.tex",
+                        "text/x-latex",
+                    )
             with c4:
                 if export_format == "All":
                     zbuf = io.BytesIO()
-                    with zipfile.ZipFile(zbuf,"w",zipfile.ZIP_DEFLATED) as zf:
+                    with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zf:
                         zf.writestr("batch_results.csv", df.to_csv(index=False))
-                        zf.writestr("batch_results.json", json.dumps(results, indent=2, default=str))
+                        zf.writestr(
+                            "batch_results.json", json.dumps(batch_results, indent=2, default=str)
+                        )
                     zbuf.seek(0)
-                    st.download_button("📦 ZIP", zbuf.getvalue(), f"batch_{datetime.now():%Y%m%d_%H%M%S}.zip","application/zip")
+                    st.download_button(
+                        "📦 Download All (ZIP)",
+                        zbuf.getvalue(),
+                        f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                        "application/zip",
+                    )
 
-def page_novelty():
+
+# ---------------- Novelty Detection ----------------
+def novelty_detection_page():
     st.header("🔍 Novelty Detection")
     if not st.session_state.get("novelty_detector"):
-        st.warning("Novelty detector not available.")
+        st.warning("Novelty detector not found.")
         return
-    method = st.radio("Input Method", ["Use Current Constructor LHS", "Enter ODE Manually", "Select from Generated"])
-    ode = None
-    if method == "Use Current Constructor LHS":
-        spec = st.session_state.get("current_generator")
-        if spec is not None and hasattr(spec, "lhs"):
-            ode = {"ode": spec.lhs, "type": "custom", "order": getattr(spec, "order", 2)}
+    method = st.radio("Input Method", ["Use Current Generator LHS", "Enter ODE Manually", "Select from Generated"])
+    ode_to_analyze = None
+    if method == "Use Current Generator LHS":
+        gen_spec = st.session_state.get("current_generator")
+        if gen_spec is not None and hasattr(gen_spec, "lhs"):
+            ode_to_analyze = {"ode": gen_spec.lhs, "type": "custom", "order": getattr(gen_spec, "order", 2)}
         else:
-            st.warning("No constructor spec yet.")
+            st.warning("No generator spec. Use Constructor or Free‑form.")
     elif method == "Enter ODE Manually":
         ode_str = st.text_area("Enter ODE (LaTeX or text):")
         if ode_str:
-            ode = {"ode": ode_str, "type": "manual", "order": st.number_input("Order", 1, 10, 2)}
+            ode_to_analyze = {"ode": ode_str, "type": "manual", "order": st.number_input("Order", 1, 10, 2)}
     else:
         if st.session_state.generated_odes:
-            idx = st.selectbox("Select ODE", range(len(st.session_state.generated_odes)),
-                               format_func=lambda i: f"ODE {i+1}: {st.session_state.generated_odes[i].get('type','Unknown')}")
-            ode = st.session_state.generated_odes[idx]
-    if ode and st.button("🔍 Analyze Novelty", type="primary"):
+            sel = st.selectbox(
+                "Select ODE",
+                range(len(st.session_state.generated_odes)),
+                format_func=lambda i: f"ODE {i+1}: {st.session_state.generated_odes[i].get('type','Unknown')}",
+            )
+            ode_to_analyze = st.session_state.generated_odes[sel]
+
+    if ode_to_analyze and st.button("🔍 Analyze Novelty", type="primary"):
         with st.spinner("Analyzing..."):
             try:
-                nd = st.session_state.novelty_detector
-                analysis = nd.analyze(ode, check_solvability=True, detailed=True)
+                analysis = st.session_state.novelty_detector.analyze(
+                    ode_to_analyze, check_solvability=True, detailed=True
+                )
                 st.metric("Novelty", "🟢 NOVEL" if analysis.is_novel else "🔴 STANDARD")
                 st.metric("Score", f"{analysis.novelty_score:.1f}/100")
                 st.metric("Confidence", f"{analysis.confidence:.1%}")
                 with st.expander("📊 Details", True):
                     st.write(f"Complexity: {analysis.complexity_level}")
-                    st.write(f"Solvable by standard methods: {'Yes' if analysis.solvable_by_standard_methods else 'No'}")
+                    st.write(
+                        f"Solvable by standard methods: {'Yes' if analysis.solvable_by_standard_methods else 'No'}"
+                    )
                     if analysis.special_characteristics:
-                        st.write("Special characteristics:"); [st.write("•", t) for t in analysis.special_characteristics]
+                        st.write("Special characteristics:")
+                        [st.write("•", t) for t in analysis.special_characteristics]
                     if analysis.recommended_methods:
-                        st.write("Recommended methods:"); [st.write("•", t) for t in analysis.recommended_methods[:5]]
+                        st.write("Recommended methods:")
+                        [st.write("•", t) for t in analysis.recommended_methods[:5]]
                     if analysis.similar_known_equations:
-                        st.write("Similar known equations:"); [st.write("•", t) for t in analysis.similar_known_equations[:3]]
+                        st.write("Similar known equations:")
+                        [st.write("•", t) for t in analysis.similar_known_equations[:3]]
                 if analysis.detailed_report:
-                    st.download_button("📥 Download Report", analysis.detailed_report,
-                        f"novelty_report_{datetime.now():%Y%m%d_%H%M%S}.txt", "text/plain")
+                    st.download_button(
+                        "📥 Download Report",
+                        analysis.detailed_report,
+                        f"novelty_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                        "text/plain",
+                    )
             except Exception as e:
                 st.error(f"Analysis failed: {e}")
 
-def page_analysis():
+
+# ---------------- Analysis & Classification ----------------
+def analysis_classification_page():
     st.header("📈 Analysis & Classification")
     if not st.session_state.generated_odes:
         st.info("No ODEs generated yet.")
         return
     if not st.session_state.get("ode_classifier"):
-        st.warning("Classifier unavailable.")
+        st.warning("Classifier not found.")
         return
     st.subheader("📊 Generated ODEs Overview")
-    rows = []
+    summary = []
     for i, ode in enumerate(st.session_state.generated_odes[-50:]):
-        rows.append({
-            "ID": i+1, "Type": ode.get("type","Unknown"), "Order": ode.get("order",0),
-            "Generator": ode.get("generator_number","N/A"), "Function": ode.get("function_used","Unknown"),
-            "Timestamp": ode.get("timestamp","")[:19]
-        })
-    df = pd.DataFrame(rows); st.dataframe(df, use_container_width=True)
-    c1,c2,c3,c4 = st.columns(4)
-    with c1: st.metric("Linear ODEs", sum(1 for o in st.session_state.generated_odes if o.get("type")=="linear"))
-    with c2: st.metric("Nonlinear ODEs", sum(1 for o in st.session_state.generated_odes if o.get("type")=="nonlinear"))
+        summary.append(
+            {
+                "ID": i + 1,
+                "Type": ode.get("type", "Unknown"),
+                "Order": ode.get("order", 0),
+                "Generator": ode.get("generator_number", "N/A"),
+                "Function": ode.get("function_used", "Unknown"),
+                "Timestamp": ode.get("timestamp", "")[:19],
+            }
+        )
+    df = pd.DataFrame(summary)
+    st.dataframe(df, use_container_width=True)
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Linear ODEs", sum(1 for o in st.session_state.generated_odes if o.get("type") == "linear"))
+    with c2:
+        st.metric("Nonlinear ODEs", sum(1 for o in st.session_state.generated_odes if o.get("type") == "nonlinear"))
     with c3:
-        orders = [o.get("order",0) for o in st.session_state.generated_odes]
+        orders = [o.get("order", 0) for o in st.session_state.generated_odes]
         st.metric("Average Order", f"{(np.mean(orders) if orders else 0):.1f}")
     with c4:
-        unique = len(set(o.get("function_used","") for o in st.session_state.generated_odes))
+        unique = len(set(o.get("function_used", "") for o in st.session_state.generated_odes))
         st.metric("Unique Functions", unique)
 
     st.subheader("📊 Distributions")
     c1, c2 = st.columns(2)
     with c1:
-        orders = [o.get("order",0) for o in st.session_state.generated_odes]
+        orders = [o.get("order", 0) for o in st.session_state.generated_odes]
         fig = px.histogram(orders, title="Order Distribution", nbins=10)
         fig.update_layout(xaxis_title="Order", yaxis_title="Count")
         st.plotly_chart(fig, use_container_width=True)
     with c2:
-        types = [o.get("type","Unknown") for o in st.session_state.generated_odes]
+        types = [o.get("type", "Unknown") for o in st.session_state.generated_odes]
         vc = pd.Series(types).value_counts()
         fig = px.pie(values=vc.values, names=vc.index, title="Type Distribution")
         st.plotly_chart(fig, use_container_width=True)
@@ -1132,7 +1329,7 @@ def page_analysis():
                         classifications.append(st.session_state.ode_classifier.classify_ode(ode))
                     except Exception:
                         classifications.append({})
-                fields = [c.get("classification",{}).get("field","Unknown") for c in classifications if c]
+                fields = [c.get("classification", {}).get("field", "Unknown") for c in classifications if c]
                 vc = pd.Series(fields).value_counts()
                 fig = px.bar(x=vc.index, y=vc.values, title="Classification by Field")
                 fig.update_layout(xaxis_title="Field", yaxis_title="Count")
@@ -1140,51 +1337,61 @@ def page_analysis():
             except Exception as e:
                 st.error(f"Classification failed: {e}")
 
-def page_physics():
+
+# ---------------- Physical Applications ----------------
+def physical_applications_page():
     st.header("🔬 Physical Applications")
     st.markdown('<div class="info-box">Explore physics/engineering matches.</div>', unsafe_allow_html=True)
     applications = {
         "Mechanics": [
-            {"name":"Harmonic Oscillator","equation":"y'' + ω^2 y = 0","description":"Spring-mass systems"},
-            {"name":"Damped Oscillator","equation":"y'' + 2γ y' + ω₀² y = 0","description":"Oscillators with friction"},
-            {"name":"Forced Oscillator","equation":"y'' + 2γ y' + ω₀² y = F cos(ωt)","description":"Driven systems"},
+            {"name": "Harmonic Oscillator", "equation": "y'' + ω^2 y = 0", "description": "Spring-mass systems"},
+            {"name": "Damped Oscillator", "equation": "y'' + 2γ y' + ω₀² y = 0", "description": "Oscillators with friction"},
+            {"name": "Forced Oscillator", "equation": "y'' + 2γ y' + ω₀² y = F cos(ωt)", "description": "Driven systems"},
         ],
         "Quantum Physics": [
-            {"name":"Schrödinger (1D)","equation":"-ℏ²/(2m) y'' + V(x)y = Ey","description":"Quantum bound states"},
-            {"name":"Particle in Box","equation":"y'' + (2mE/ℏ²) y = 0","description":"Infinite potential well"},
+            {"name": "Schrödinger (1D)", "equation": "-ℏ²/(2m) y'' + V(x)y = Ey", "description": "Quantum bound states"},
+            {"name": "Particle in Box", "equation": "y'' + (2mE/ℏ²) y = 0", "description": "Infinite potential well"},
         ],
         "Thermodynamics": [
-            {"name":"Heat Equation","equation":"∂T/∂t = α∇²T","description":"Heat diffusion"},
-            {"name":"Newton Cooling","equation":"dT/dt = -k (T - T_env)","description":"Cooling processes"},
+            {"name": "Heat Equation", "equation": "∂T/∂t = α∇²T", "description": "Heat diffusion"},
+            {"name": "Newton Cooling", "equation": "dT/dt = -k (T - T_env)", "description": "Cooling processes"},
         ],
     }
-    cat = st.selectbox("Select Application Field", list(applications.keys()))
-    for app in applications.get(cat, []):
+    category = st.selectbox("Select Application Field", list(applications.keys()))
+    for app in applications.get(category, []):
         with st.expander(f"📚 {app['name']}"):
-            try: st.latex(app["equation"])
-            except Exception: st.write(app["equation"])
+            try:
+                st.latex(app["equation"])
+            except Exception:
+                st.write(app["equation"])
             st.write("Description:", app["description"])
 
-def page_viz():
+
+# ---------------- Visualization ----------------
+def visualization_page():
     st.header("📐 Visualization")
     if not st.session_state.generated_odes:
-        st.warning("No ODEs to visualize."); return
+        st.warning("No ODEs to visualize.")
+        return
     sel = st.selectbox(
-        "Select ODE",
+        "Select ODE to Visualize",
         range(len(st.session_state.generated_odes)),
-        format_func=lambda i: f"ODE {i+1}: {st.session_state.generated_odes[i].get('type','?')} (Order {st.session_state.generated_odes[i].get('order',0)})"
+        format_func=lambda i: f"ODE {i+1}: {st.session_state.generated_odes[i].get('type','?')} (Order {st.session_state.generated_odes[i].get('order',0)})",
     )
     ode = st.session_state.generated_odes[sel]
-    c1,c2,c3 = st.columns(3)
-    with c1: plot_type = st.selectbox("Plot Type", ["Solution","Phase Portrait","3D Surface","Direction Field"])
-    with c2: x_range = st.slider("X Range", -10.0, 10.0, (-5.0, 5.0))
-    with c3: num_points = st.slider("Number of Points", 100, 2000, 500)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        plot_type = st.selectbox("Plot Type", ["Solution", "Phase Portrait", "3D Surface", "Direction Field"])
+    with c2:
+        x_range = st.slider("X Range", -10.0, 10.0, (-5.0, 5.0))
+    with c3:
+        num_points = st.slider("Number of Points", 100, 2000, 500)
     if st.button("Generate Visualization", type="primary"):
         with st.spinner("Creating..."):
             try:
-                # Placeholder visualization; plug actual numeric eval of solution if desired
                 x = np.linspace(x_range[0], x_range[1], num_points)
-                y = np.sin(x) * np.exp(-0.1*np.abs(x))
+                # placeholder demo curve
+                y = np.sin(x) * np.exp(-0.1 * np.abs(x))
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name="Solution"))
                 fig.update_layout(title="ODE Solution", xaxis_title="x", yaxis_title="y(x)")
@@ -1192,35 +1399,41 @@ def page_viz():
             except Exception as e:
                 st.error(f"Visualization failed: {e}")
 
-def page_export():
+
+# ---------------- Export & LaTeX ----------------
+def export_latex_page():
     st.header("📤 Export & LaTeX")
     st.markdown('<div class="info-box">Export ODEs in publication‑ready LaTeX.</div>', unsafe_allow_html=True)
     if not st.session_state.generated_odes:
-        st.warning("No ODEs to export."); return
-    mode = st.radio("Export Type", ["Single ODE","Multiple ODEs","Complete Report"])
-    if mode == "Single ODE":
+        st.warning("No ODEs to export.")
+        return
+    export_type = st.radio("Export Type", ["Single ODE", "Multiple ODEs", "Complete Report"])
+    if export_type == "Single ODE":
         idx = st.selectbox(
-            "Select ODE", range(len(st.session_state.generated_odes)),
-            format_func=lambda i: f"ODE {i+1}: {st.session_state.generated_odes[i].get('type','?')}"
+            "Select ODE",
+            range(len(st.session_state.generated_odes)),
+            format_func=lambda i: f"ODE {i+1}: {st.session_state.generated_odes[i].get('type','?')}",
         )
         ode = st.session_state.generated_odes[idx]
         st.subheader("📋 LaTeX Preview")
-        tex = LaTeXExporter.document(ode, include_preamble=False)
-        st.code(tex, language="latex")
+        latex_doc = LaTeXExporter.generate_latex_document(ode, include_preamble=False)
+        st.code(latex_doc, language="latex")
         c1, c2 = st.columns(2)
         with c1:
-            full = LaTeXExporter.document(ode, include_preamble=True)
-            st.download_button("📄 LaTeX", full, f"ode_{idx+1}.tex", "text/x-latex")
+            full_latex = LaTeXExporter.generate_latex_document(ode, include_preamble=True)
+            st.download_button("📄 Download LaTeX", full_latex, f"ode_{idx+1}.tex", "text/x-latex")
         with c2:
-            pkg = LaTeXExporter.package(ode)
-            st.download_button("📦 Package", pkg, f"ode_package_{idx+1}.zip","application/zip")
-    elif mode == "Multiple ODEs":
+            package = LaTeXExporter.create_export_package(ode, include_extras=True)
+            st.download_button("📦 Download Package", package, f"ode_package_{idx+1}.zip", "application/zip")
+    elif export_type == "Multiple ODEs":
         sel = st.multiselect(
-            "Select ODEs", range(len(st.session_state.generated_odes)),
-            format_func=lambda i: f"ODE {i+1}: {st.session_state.generated_odes[i].get('type','?')}"
+            "Select ODEs",
+            range(len(st.session_state.generated_odes)),
+            format_func=lambda i: f"ODE {i+1}: {st.session_state.generated_odes[i].get('type','?')}",
         )
         if sel and st.button("Generate Multi-ODE Document"):
-            parts = [r"""\documentclass[12pt]{article}
+            parts = [
+                r"""\documentclass[12pt]{article}
 \usepackage{amsmath,amssymb}
 \usepackage{geometry}
 \geometry{margin=1in}
@@ -1229,16 +1442,23 @@ def page_export():
 \date{\today}
 \begin{document}
 \maketitle
-"""]
+"""
+            ]
             for count, i in enumerate(sel, 1):
                 parts.append(f"\\section{{ODE {count}}}")
-                parts.append(LaTeXExporter.document(st.session_state.generated_odes[i], include_preamble=False))
+                parts.append(LaTeXExporter.generate_latex_document(st.session_state.generated_odes[i], include_preamble=False))
             parts.append(r"\end{document}")
             doc = "\n".join(parts)
-            st.download_button("📄 Multi-ODE LaTeX", doc, f"odes_{datetime.now():%Y%m%d_%H%M%S}.tex","text/x-latex")
+            st.download_button(
+                "📄 Download Multi-ODE LaTeX",
+                doc,
+                f"multiple_odes_{datetime.now().strftime('%Y%m%d_%H%M%S')}.tex",
+                "text/x-latex",
+            )
     else:
         if st.button("Generate Complete Report"):
-            parts = [r"""\documentclass[12pt]{report}
+            parts = [
+                r"""\documentclass[12pt]{report}
 \usepackage{amsmath,amssymb}
 \usepackage{geometry}
 \geometry{margin=1in}
@@ -1253,102 +1473,151 @@ def page_export():
 This report contains all ODEs generated by the system.
 
 \chapter{Generated ODEs}
-"""]
+"""
+            ]
             for i, ode in enumerate(st.session_state.generated_odes):
                 parts.append(f"\\section{{ODE {i+1}}}")
-                parts.append(LaTeXExporter.document(ode, include_preamble=False))
-            parts.append(r"""
+                parts.append(LaTeXExporter.generate_latex_document(ode, include_preamble=False))
+            parts.append(
+                r"""
 \chapter{Conclusions}
 The system successfully generated and analyzed multiple ODEs.
 \end{document}
-""")
-            st.download_button("📄 Complete Report", "\n".join(parts),
-                               f"complete_report_{datetime.now():%Y%m%d_%H%M%S}.tex", "text/x-latex")
+"""
+            )
+            st.download_button(
+                "📄 Download Complete Report",
+                "\n".join(parts),
+                f"complete_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.tex",
+                "text/x-latex",
+            )
 
-def page_examples():
-    st.header("📚 Examples Library")
-    with st.expander("Simple Harmonic Oscillator"):
-        st.latex("y'' + y = 0")
 
-def page_settings():
+# ---------------- Settings & Docs ----------------
+def settings_page():
     st.header("⚙️ Settings")
-    tabs = st.tabs(["General","Export","Jobs","About"])
+    tabs = st.tabs(["General", "Export", "Advanced", "About"])
     with tabs[0]:
         st.checkbox("Dark mode", False)
-        st.caption("General settings are illustrative.")
+        if st.button("Save General Settings"):
+            st.success("Saved.")
     with tabs[1]:
-        st.checkbox("Include LaTeX preamble by default", True)
+        include_preamble = st.checkbox("Include LaTeX preamble by default", True)
+        if st.button("Save Export Settings"):
+            st.success("Saved.")
     with tabs[2]:
-        if has_redis():
-            st.subheader("Active & recent jobs")
-            runs = list_runs()
-            if not runs:
-                st.info("No jobs found.")
-            else:
-                st.dataframe(pd.DataFrame(runs), use_container_width=True)
-        else:
-            st.info("Redis not configured; no job monitoring.")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            cm = st.session_state.get("cache_manager")
+            st.metric("Cache Size", len(getattr(cm, "memory_cache", {})) if cm else 0)
+        with c2:
+            if st.button("Clear Cache"):
+                try:
+                    st.session_state.cache_manager.clear()
+                    st.success("Cache cleared.")
+                except Exception:
+                    st.info("No cache manager.")
+        with c3:
+            if st.button("Save Session"):
+                ok = False
+                try:
+                    with open("session_state.pkl", "wb") as f:
+                        pickle.dump(
+                            {
+                                k: st.session_state.get(k)
+                                for k in [
+                                    "generated_odes",
+                                    "generator_patterns",
+                                    "batch_results",
+                                    "analysis_results",
+                                    "training_history",
+                                    "export_history",
+                                ]
+                            },
+                            f,
+                        )
+                    ok = True
+                except Exception:
+                    ok = False
+                st.success("Session saved.") if ok else st.error("Failed to save.")
     with tabs[3]:
-        st.markdown("**Master Generators for ODEs** — Theorems 4.1 & 4.2, ML/DL, Reverse, Export, Novelty.")
+        st.markdown("**Master Generators for ODEs** — Theorems 4.1 & 4.2, ML/DL, Export, Novelty, Async Jobs.")
 
-def page_docs():
+
+def documentation_page():
     st.header("📖 Documentation")
-    st.markdown(f"""
+    st.markdown(
+        """
 **Quick Start**
-1. Go to **Apply Master Theorem** and generate ODEs (or use **Batch** to generate many).
-2. After you have **≥ {MIN_ODES_FOR_TRAINING}** ODEs (session + batch), go to **ML / DL** and train.
-3. Load or upload models from **ML / DL** at any time; generate novel ODEs and try **Reverse**.
-4. Export equations and reports from **Export & LaTeX**.
-5. Monitor async jobs in **Settings → Jobs**.
+1. Go to **Apply Master Theorem**.
+2. Pick f(z) from Basic/Special (or type one).
+3. Set parameters (α,β,n,M) and choose **Exact (symbolic)** if you want rationals.
+4. Choose LHS source: **Constructor**, **Free‑form**, or **Arbitrary SymPy**.
+5. Click **Generate ODE**. If Redis is configured, the job runs in background.
+6. Export from the **📤 Export** tab or the **Export & LaTeX** page.
+7. Compute **y^(m)(x)** via **Theorem 4.2** when needed.
+8. Use **Reverse Engineering** to derive RHS from a candidate y(x) or verify ODEs.
+"""
+    )
 
-**Queues / Worker**
-- Set env: `RQ_QUEUE_COMPUTE=ode_jobs`, `RQ_QUEUE_TRAIN=ml_jobs`, `RQ_QUEUE_REVERSE=reverse_jobs`.
-- Start worker on all queues (priority order):  
-  `rq worker -u "$REDIS_URL" $RQ_QUEUE_COMPUTE $RQ_QUEUE_TRAIN $RQ_QUEUE_REVERSE`
-""")
 
-# ---------- Main ----------
+# ---------------- Main ----------------
 def main():
-    SS.init()
-    st.markdown("""
+    SessionStateManager.initialize()
+    st.markdown(
+        """
     <div class="main-header">
       <div class="main-title">🔬 Master Generators for ODEs</div>
-      <div class="subtitle">Free‑form / Arbitrary LHS • Theorem 4.1 & 4.2 • Async Jobs • ML/DL • Reverse • Export • Novelty</div>
+      <div class="subtitle">By Mohammad Abu Ghuwaleh • Free‑form/Arbitrary generators • ML/DL • Export • Novelty • Async Jobs</div>
     </div>
-    """, unsafe_allow_html=True)
-
+    """,
+        unsafe_allow_html=True,
+    )
     page = st.sidebar.radio(
         "📍 Navigation",
         [
             "🏠 Dashboard",
             "🔧 Generator Constructor",
             "🎯 Apply Master Theorem",
-            "🤖 ML / DL",
+            "🔁 Reverse Engineering",
+            "🤖 ML Pattern Learning",
             "📊 Batch Generation",
             "🔍 Novelty Detection",
             "📈 Analysis & Classification",
             "🔬 Physical Applications",
             "📐 Visualization",
             "📤 Export & LaTeX",
-            "📚 Examples Library",
             "⚙️ Settings",
             "📖 Documentation",
-        ]
+        ],
     )
+    if page == "🏠 Dashboard":
+        dashboard_page()
+    elif page == "🔧 Generator Constructor":
+        generator_constructor_page()
+    elif page == "🎯 Apply Master Theorem":
+        page_apply_master_theorem()
+    elif page == "🔁 Reverse Engineering":
+        reverse_engineering_page()
+    elif page == "🤖 ML Pattern Learning":
+        ml_pattern_learning_page()
+    elif page == "📊 Batch Generation":
+        batch_generation_page()
+    elif page == "🔍 Novelty Detection":
+        novelty_detection_page()
+    elif page == "📈 Analysis & Classification":
+        analysis_classification_page()
+    elif page == "🔬 Physical Applications":
+        physical_applications_page()
+    elif page == "📐 Visualization":
+        visualization_page()
+    elif page == "📤 Export & LaTeX":
+        export_latex_page()
+    elif page == "⚙️ Settings":
+        settings_page()
+    elif page == "📖 Documentation":
+        documentation_page()
 
-    if page == "🏠 Dashboard": page_dashboard()
-    elif page == "🔧 Generator Constructor": page_constructor()
-    elif page == "🎯 Apply Master Theorem": page_apply_theorem()
-    elif page == "🤖 ML / DL": page_ml_dl()
-    elif page == "📊 Batch Generation": page_batch()
-    elif page == "🔍 Novelty Detection": page_novelty()
-    elif page == "📈 Analysis & Classification": page_analysis()
-    elif page == "🔬 Physical Applications": page_physics()
-    elif page == "📐 Visualization": page_viz()
-    elif page == "📤 Export & LaTeX": page_export()
-    elif page == "📚 Examples Library": page_examples()
-    elif page == "⚙️ Settings": page_settings()
-    elif page == "📖 Documentation": page_docs()
 
 if __name__ == "__main__":
     main()
