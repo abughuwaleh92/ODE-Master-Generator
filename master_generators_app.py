@@ -2,16 +2,17 @@
 """
 Master Generators for ODEs — Full App (Corrected & Improved, all services preserved)
 
-New capabilities:
+What's in this build:
+• Fix: replace deprecated st.experimental_rerun with safe fallback (_safe_rerun → uses st.rerun).
 • Durable RQ job progress + run registry: training status no longer “disappears”.
 • Load/Upload finished ML sessions; dashboard shows trained status correctly.
 • Post‑training: generate novel ODEs from model; model‑assisted reverse engineering.
 • Apply Master Theorem: constructor/free‑form/arbitrary LHS, exact params, simplify levels.
 • Theorem 4.2 derivative helper.
-• Batch generation, novelty detection, analysis & classification, visualization, export & LaTeX, examples, settings—unchanged (preserved) with minor robustness fixes.
+• Batch generation, novelty detection, analysis & classification, visualization, export & LaTeX, examples, settings—preserved with small robustness fixes.
 
 Requires:
-- rq_utils.py (enqueue_job supports job_timeout, result_ttl; run registry)
+- rq_utils.py (enqueue_job supports job_timeout, result_ttl; run registry with list_runs/fetch_job/load_run)
 - worker.py (compute_job, train_job, reverse_job)
 - src/ml/trainer.py (upgraded trainer)
 - shared/reverse_engineering.py, shared/phi_lib.py
@@ -56,6 +57,19 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SRC_DIR = os.path.join(APP_DIR, "src")
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
+
+# ---------------- Streamlit rerun compatibility ----------------
+def _safe_rerun():
+    """Compatibility-safe rerun for all Streamlit versions."""
+    try:
+        # Streamlit ≥ 1.26
+        st.rerun()
+    except Exception:
+        # Older Streamlit (deprecated API)
+        try:
+            getattr(st, "experimental_rerun")()
+        except Exception:
+            pass
 
 # ---------------- import src (resilient) ----------------
 HAVE_SRC = True
@@ -120,12 +134,10 @@ except Exception as e:
     HAVE_SRC = False
 
 # ---------------- internal core & RQ utils ----------------
-# The ode_core module must provide these call sites
 from shared.ode_core import (
-    ComputeParams, compute_ode_full, theorem_4_2_y_m_expr,  # apply Master Theorem helpers
+    ComputeParams, compute_ode_full, theorem_4_2_y_m_expr,
     get_function_expr, parse_arbitrary_lhs, to_exact
 )
-
 from rq_utils import has_redis, enqueue_job, fetch_job, list_runs, load_run
 
 # ---------------- Streamlit config ----------------
@@ -648,7 +660,7 @@ def generator_constructor_page():
             with c2:
                 if st.button("❌", key=f"rm_{i}"):
                     st.session_state.generator_terms.pop(i)
-                    st.experimental_rerun()
+                    _safe_rerun()
         if st.button("🔨 Build Generator Specification", type="primary"):
             try:
                 gen_spec = GeneratorSpecification(terms=st.session_state.generator_terms,
@@ -760,7 +772,7 @@ def ml_pattern_learning_page():
                     st.write("Progress:", progress)
                     st.write("Stats:", stats)
                     if st.button("🔄 Refresh", key=f"refresh_{r['job_id']}"):
-                        st.experimental_rerun()
+                        _safe_rerun()
         if completed:
             st.markdown("**Completed**")
             labels = [ _format_job_row(r) for r in completed[:30] ]
@@ -880,7 +892,7 @@ def reverse_engineering_page():
                 st.error(info.get("exc_info","Job failed."))
                 st.session_state.last_reverse_job = None
         if st.button("🔄 Refresh reverse job"):
-            st.experimental_rerun()
+            _safe_rerun()
 
 def batch_generation_page():
     st.header("📊 Batch ODE Generation")
