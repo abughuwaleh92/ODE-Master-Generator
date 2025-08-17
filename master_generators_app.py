@@ -31,7 +31,137 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 import sympy as sp
+# --- Compatibility + Diagnostics for RQ ---
+import os, time
+import redis
+from rq import Queue, Worker
+from rq.job import Job
 
+def _redis_url():
+    # Use whichever env your platform exposes; do NOT change your worker/rq_utils
+    return (
+        os.getenv("REDIS_URL")
+        or os.getenv("REDIS_TLS_URL")
+        or os.getenv("UPSTASH_REDIS_URL")
+        or os.getenv("REDIS_URI")
+        or ""
+    )
+
+def _rq_queue_name_default_safe():
+    """
+    Keep compatibility with old setups:
+      1) If RQ_QUEUE set -> use it.
+      2) Else if QUEUES set (some providers) -> first in list.
+      3) Else fall back to 'ode_jobs' if your worker uses that.
+      4) Else fall back to 'default'.
+    """
+    q = os.getenv("RQ_QUEUE")
+    if q: return q
+    qlist = os.getenv("QUEUES")
+    if qlist:
+        parts = [p.strip() for p in qlist.split(",") if p.strip()]
+        if parts: return parts[0]
+    # Pick your historical default here; if your worker listens to 'default', change the next line to 'default'
+    return "ode_jobs" if os.getenv("FAVORS_ODE_JOBS", "1") == "1" else "default"
+
+def _rq_conn():
+    url = _redis_url()
+    if not url: return None
+    try:
+        return redis.from_url(url, decode_responses=False)
+    except Exception:
+        return None
+
+def rq_live_diagnostics():
+    """
+    Return (queue_name, queue_size, workers_info) to show in UI.
+    This reads *actual* Redis, so it will reveal mismatches instantly.
+    """
+    conn = _rq_conn()
+    if not conn: 
+        return None, None, []
+    try:
+        qname = _rq_queue_name_default_safe()
+        q = Queue(qname, connection=conn)
+        q_count = q.count
+        workers = []
+        for w in Worker.all(connection=conn):
+            try:
+                workers.append({
+                    "name": getattr(w, "name", "?"),
+                    "state": getattr(w, "state", "?"),
+                    "queues": [getattr(qq, "name", str(qq)) for qq in getattr(w, "queues", [])],
+                })
+            except Exception:
+                pass
+        return qname, q_count, workers
+    except Exception:
+        return None, None, []
+
+def safe_enqueue_compute_job(payload: dict):
+    """
+    Use YOUR existing enqueue_job from rq_utils with maximum backward compatibility.
+    - First try new-style signature,
+    - then old-style with queue_name argument,
+    - then minimal (func_path, payload) only.
+    """
+    try:
+        from rq_utils import enqueue_job as _enq
+    except Exception:
+        return None  # rq_utils missing
+
+    func_path = "worker.compute_job"
+    try:
+        # Try new-style (may support job_timeout, result_ttl, queue_name)
+        return _enq(func_path, payload, queue_name=_rq_queue_name_default_safe())
+    except TypeError:
+        # Old helpers might not accept queue_name kw
+        try:
+            return _enq(func_path, payload, _rq_queue_name_default_safe())
+        except TypeError:
+            # Very old: only (func_path, payload)
+            return _enq(func_path, payload)
+    except Exception:
+        # As a last resort, try minimal signature
+        try:
+            return _enq(func_path, payload)
+        except Exception:
+            return None
+
+def safe_fetch_job(job_id: str):
+    """
+    Use YOUR existing fetch_job if present; otherwise fetch via RQ directly.
+    """
+    # 1) Try your rq_utils.fetch_job
+    try:
+        from rq_utils import fetch_job as _fetch
+        return _fetch(job_id)
+    except Exception:
+        pass
+
+    # 2) Fallback: read job directly
+    conn = _rq_conn()
+    if not conn:
+        return {"status": "unknown", "error": "No Redis connection"}
+    try:
+        job = Job.fetch(job_id, connection=conn)
+        status = job.get_status()
+        out = {
+            "id": job.id,
+            "status": status,
+            "enqueued_at": str(job.enqueued_at) if job.enqueued_at else None,
+            "started_at": str(job.started_at) if job.started_at else None,
+            "ended_at": str(job.ended_at) if job.ended_at else None,
+            "exc_info": job.exc_info.decode() if isinstance(job.exc_info, bytes) else job.exc_info,
+        }
+        if status == "finished":
+            try:
+                out["result"] = job.result
+            except Exception:
+                out["result"] = None
+        return out
+    except Exception as e:
+        return {"status": "unknown", "error": str(e)}
 # ---------------- logging ----------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("master_generators_app")
