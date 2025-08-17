@@ -1,75 +1,54 @@
 # worker.py
+"""
+RQ worker functions for the Master Generator app.
+- compute_job(payload): ODE generation (Master Theorem path)
+- train_job(payload): model training with persistent progress
+This file can be imported by RQ OR run directly for local tests.
+"""
+
 import os
 import json
 from datetime import datetime
 import logging
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
 
 import sympy as sp
 from rq import get_current_job
 
-from rq_utils import append_training_log
+# Light logging
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("worker")
+
+# Optional GPU off on small hosts
+if os.getenv("DISABLE_CUDA", "1") == "1":
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
+# --- import shared core (no UI) ---
 from shared.ode_core import ComputeParams, compute_ode_full, expr_to_str
 
-# Optional torch lazy import
-ML_IMPORT_ERROR = None
+# --- optional src imports (safe fallback if absent) ---
 try:
-    import torch
-except Exception as _e:
-    ML_IMPORT_ERROR = _e
-    torch = None
+    from src.functions.basic_functions import BasicFunctions
+    from src.functions.special_functions import SpecialFunctions
+    HAVE_LIBS = True
+except Exception:
+    BasicFunctions = SpecialFunctions = None
+    HAVE_LIBS = False
 
-logger = logging.getLogger("worker")
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-
-CHECKPOINT_DIR = os.getenv("CHECKPOINT_DIR", "checkpoints")
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-
-def _to_json_safe(res: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(res)
-    for k in ("generator", "rhs", "solution", "f_expr_preview"):
-        if k in out:
-            try:
-                out[k] = expr_to_str(out[k])
-            except Exception:
-                out[k] = str(out[k])
-    out["timestamp"] = datetime.utcnow().isoformat()
-    return out
-
-def _update_job_meta(meta: Dict[str, Any]):
-    job = get_current_job()
-    if not job:
-        return
-    job.meta.update(meta or {})
-    try:
-        job.save_meta()
-    except Exception:
-        try:
-            job.save()
-        except Exception:
-            pass
-
-def _log(event: Dict[str, Any]):
-    job = get_current_job()
-    if not job:
-        return
-    append_training_log(job.id, {"ts": datetime.utcnow().isoformat(), **event})
-
-# ---------------- Compute job ----------------
+# ---------------- ODE compute ----------------
 def compute_job(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Background ODE generation.
+    `payload` mirrors ComputeParams fields (see app).
+    """
     job = get_current_job()
-    origin = getattr(job, "origin", None) if job else None
-    _update_job_meta({"status": "computing", "origin": origin})
     try:
-        # Optional function libs
-        basic_lib = special_lib = None
-        try:
-            from src.functions.basic_functions import BasicFunctions
-            from src.functions.special_functions import SpecialFunctions
-            basic_lib = BasicFunctions()
-            special_lib = SpecialFunctions()
-        except Exception:
-            pass
+        if job:
+            job.meta.update({"stage": "started", "desc": "ODE compute"})
+            job.save_meta()
+
+        basic_lib = BasicFunctions() if HAVE_LIBS else None
+        special_lib = SpecialFunctions() if HAVE_LIBS else None
 
         p = ComputeParams(
             func_name=payload.get("func_name", "exp(z)"),
@@ -80,7 +59,7 @@ def compute_job(payload: Dict[str, Any]) -> Dict[str, Any]:
             use_exact=bool(payload.get("use_exact", True)),
             simplify_level=payload.get("simplify_level", "light"),
             lhs_source=payload.get("lhs_source", "constructor"),
-            constructor_lhs=None,
+            constructor_lhs=None,  # worker doesn't have session constructor
             freeform_terms=payload.get("freeform_terms"),
             arbitrary_lhs_text=payload.get("arbitrary_lhs_text"),
             function_library=payload.get("function_library", "Basic"),
@@ -88,112 +67,136 @@ def compute_job(payload: Dict[str, Any]) -> Dict[str, Any]:
             special_lib=special_lib,
         )
 
-        res = compute_ode_full(p)
-        out = _to_json_safe(res)
-        _update_job_meta({"status": "finished", "ok": True})
-        return out
+        result = compute_ode_full(p)
+
+        safe = {
+            **result,
+            "generator": expr_to_str(result["generator"]),
+            "rhs":       expr_to_str(result["rhs"]),
+            "solution":  expr_to_str(result["solution"]),
+            "f_expr_preview": expr_to_str(result.get("f_expr_preview")),
+            "timestamp": datetime.now().isoformat(),
+        }
+
+        if job:
+            job.meta.update({"stage": "finished"})
+            job.save_meta()
+        return safe
+
     except Exception as e:
-        _update_job_meta({"status": "failed", "ok": False, "error": str(e)})
+        if job:
+            job.meta.update({"stage": "failed"})
+            job.save_meta()
         return {"error": str(e)}
 
-# ---------------- Training job ----------------
+# ---------------- Training ----------------
 def train_job(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Background model training with persistent progress saved in job.meta.
+    payload:
+      model_type, epochs, batch_size, samples, validation_split, learning_rate, device, use_generator
+    """
     job = get_current_job()
-    origin = getattr(job, "origin", None) if job else None
-    _update_job_meta({"status": "starting", "kind": "train", "origin": origin})
-    _log({"event": "train_start", "payload": payload, "origin": origin})
-
-    if ML_IMPORT_ERROR:
-        msg = f"PyTorch unavailable in worker: {ML_IMPORT_ERROR}"
-        _update_job_meta({"status": "failed", "error": msg})
-        _log({"event": "error", "message": msg})
-        return {"error": msg}
-
     try:
+        if job:
+            job.meta.update({
+                "stage": "started",
+                "desc": "training",
+                "epoch": 0,
+                "train_loss": None,
+                "val_loss": None,
+            })
+            job.save_meta()
+
+        # Lazy import to keep worker light
         from src.ml.trainer import MLTrainer
-    except Exception as e:
-        _update_job_meta({"status": "failed", "error": f"Import MLTrainer failed: {e}"})
-        _log({"event": "error", "message": f"Import MLTrainer failed: {e}"})
-        return {"error": f"Import MLTrainer failed: {e}"}
 
-    model_type       = payload.get("model_type", "pattern_learner")
-    epochs           = int(payload.get("epochs", 100))
-    batch_size       = int(payload.get("batch_size", 32))
-    samples          = int(payload.get("samples", 1000))
-    validation_split = float(payload.get("validation_split", 0.2))
-    learning_rate    = float(payload.get("learning_rate", 1e-3))
-    enable_amp       = bool(payload.get("enable_mixed_precision", False))
-    device           = payload.get("device")
-    checkpoint_dir   = payload.get("checkpoint_dir", CHECKPOINT_DIR)
-    resume_from      = payload.get("resume_from")
-
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    if not device:
-        device = "cuda" if (torch.cuda.is_available()) else "cpu"
-
-    trainer = MLTrainer(
-        model_type=model_type,
-        learning_rate=learning_rate,
-        device=device,
-        enable_mixed_precision=enable_amp,
-        checkpoint_dir=checkpoint_dir,
-    )
-
-    if resume_from:
-        try:
-            ep = trainer.load_checkpoint(resume_from)
-            _log({"event": "resume", "checkpoint": resume_from, "epoch": ep})
-        except Exception as e:
-            _log({"event": "resume_failed", "error": str(e)})
-
-    def on_progress(ep: int, total: int):
-        hist = getattr(trainer, "history", {})
-        tr = (hist.get("train_loss") or [None])[-1]
-        vl = (hist.get("val_loss") or [None])[-1]
-        _update_job_meta({
-            "status": "training",
-            "epoch": ep, "epochs": total,
-            "progress": float(ep)/float(total),
-            "train_loss": tr, "val_loss": vl,
-            "origin": origin
-        })
-        _log({"event": "epoch", "epoch": ep, "epochs": total, "train_loss": tr, "val_loss": vl})
-
-    try:
-        trainer.train(
-            epochs=epochs, batch_size=batch_size, samples=samples,
-            validation_split=validation_split, use_generator=True,
-            save_best=True, checkpoint_interval=10, progress_callback=on_progress
+        trainer = MLTrainer(
+            model_type=payload.get("model_type", "pattern_learner"),
+            learning_rate=float(payload.get("learning_rate", 1e-3)),
+            device=payload.get("device", "cpu"),
+            enable_mixed_precision=bool(payload.get("mixed_precision", False)),
         )
+
+        epochs = int(payload.get("epochs", 100))
+        batch_size = int(payload.get("batch_size", 32))
+        samples = int(payload.get("samples", 1000))
+        validation_split = float(payload.get("validation_split", 0.2))
+        use_generator = bool(payload.get("use_generator", True))
+
+        # Progress callback updates job.meta every epoch
+        def on_progress(epoch: int, total: int, train_loss: Optional[float]=None, val_loss: Optional[float]=None):
+            if not get_current_job():
+                return
+            j = get_current_job()
+            j.meta.update({
+                "stage": "running",
+                "epoch": epoch,
+                "total_epochs": total,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+            })
+            j.save_meta()
+
+        # Patch trainer to call our callback with losses
+        _orig_log = trainer.logger.info if hasattr(trainer, "logger") else None
+
+        def progress_proxy(e, t):
+            # find latest losses if available
+            tl = trainer.history["train_loss"][-1] if trainer.history["train_loss"] else None
+            vl = trainer.history["val_loss"][-1] if trainer.history["val_loss"] else None
+            on_progress(e, t, tl, vl)
+
+        trainer.train(
+            epochs=epochs,
+            batch_size=batch_size,
+            samples=samples,
+            validation_split=validation_split,
+            use_generator=use_generator,
+            progress_callback=progress_proxy,
+            save_best=True,
+        )
+
+        # Best checkpoint path (as trainer saved it)
+        ckpt_dir = getattr(trainer, "checkpoint_dir", "checkpoints")
+        best_name = f"{trainer.model_type}_best.pth"
+        model_path = os.path.join(ckpt_dir, best_name)
+
+        result = {
+            "ok": True,
+            "trained": True,
+            "epochs": trainer.history.get("epochs", epochs),
+            "best_val_loss": trainer.history.get("best_val_loss"),
+            "model_path": model_path,
+            "history": trainer.history,
+            "timestamp": datetime.now().isoformat(),
+        }
+
+        if job:
+            job.meta.update({"stage": "finished"})
+            job.save_meta()
+
+        return result
+
     except Exception as e:
-        _update_job_meta({"status": "failed", "error": str(e)})
-        _log({"event": "error", "message": str(e)})
-        return {"error": str(e)}
+        if job:
+            job.meta.update({"stage": "failed", "error": str(e)})
+            job.save_meta()
+        return {"ok": False, "error": str(e)}
 
-    best = os.path.join(checkpoint_dir, f"{model_type}_best.pth")
-    try:
-        if not os.path.exists(best):
-            trainer.save_model(best)
-    except Exception:
-        pass
+# ---- optional: run a worker directly (local dev) ----
+if __name__ == "__main__":
+    # Example: python worker.py (starts an RQ worker)
+    import redis
+    from rq import Worker, Queue, Connection
 
-    hist_path = os.path.join(checkpoint_dir, f"history_{job.id if job else 'local'}.json")
-    try:
-        with open(hist_path, "w", encoding="utf-8") as f:
-            json.dump(getattr(trainer, "history", {}), f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-    result = {
-        "ok": True, "status": "finished",
-        "job_id": job.id if job else None,
-        "model_type": model_type,
-        "checkpoint_dir": checkpoint_dir,
-        "best_model_path": best if os.path.exists(best) else None,
-        "history_path": hist_path if os.path.exists(hist_path) else None,
-        "history": getattr(trainer, "history", {}),
-        "device": device, "origin": origin
-    }
-    _update_job_meta({"status": "finished", "ok": True, "best_model_path": result["best_model_path"], "origin": origin})
-    _log({"event": "train_done", "artifacts": {"best": result["best_model_path"], "history": result["history_path"]}})
-    return result
+    REDIS_URL = os.getenv("REDIS_URL")
+    RQ_QUEUES = [q.strip() for q in os.getenv("RQ_QUEUES", os.getenv("RQ_QUEUE", "ode_jobs")).split(",") if q.strip()]
+    if not REDIS_URL:
+        raise SystemExit("Set REDIS_URL first")
+    conn = redis.from_url(REDIS_URL, decode_responses=True)
+    with Connection(conn):
+        qs = [Queue(name) for name in RQ_QUEUES]
+        log.info(f"Starting worker on queues: {', '.join([q.name for q in qs])}")
+        w = Worker(qs)
+        w.work(with_scheduler=True)
