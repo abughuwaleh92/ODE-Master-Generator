@@ -1,145 +1,125 @@
 # rq_utils.py
-"""
-RQ helpers — robust, queue-consistent, with persistent progress.
-Default queue is 'ode_jobs' (override with env RQ_QUEUE).
-"""
-
 import os
-import time
-import json
-from typing import Any, Dict, Optional
+import logging
+from typing import Optional, Dict, Any
 
 import redis
-from rq import Queue, Connection
+from rq import Queue, Worker
 from rq.job import Job
-from rq.registry import (StartedJobRegistry, FinishedJobRegistry,
-                         FailedJobRegistry, ScheduledJobRegistry, DeferredJobRegistry)
 
-# ---- configuration ----
-REDIS_URL = (
-    os.getenv("REDIS_URL")
-    or os.getenv("UPSTASH_REDIS_URL")
-    or os.getenv("REDIS_TLS_URL")
-    or ""
-)
-RQ_QUEUE = os.getenv("RQ_QUEUE", "ode_jobs").strip() or "ode_jobs"
+logger = logging.getLogger(__name__)
 
-# optional: longer defaults for heavy training
-DEFAULT_RESULT_TTL = int(os.getenv("RQ_RESULT_TTL", "86400"))    # 24h
-DEFAULT_FAILURE_TTL = int(os.getenv("RQ_FAILURE_TTL", "604800")) # 7d
-DEFAULT_JOB_TIMEOUT = int(os.getenv("RQ_JOB_TIMEOUT", "1800"))   # 30m default
+REDIS_URL = os.environ.get("REDIS_URL", "")
+RQ_QUEUE = os.environ.get("RQ_QUEUE", "ode_jobs")
 
-# ---- connection ----
-def _conn() -> redis.Redis:
+
+def _get_redis() -> Optional[redis.Redis]:
+    """Return a live Redis connection or None."""
     if not REDIS_URL:
-        raise RuntimeError("REDIS_URL is not set")
-    # keep connections reliable on Railway
-    return redis.from_url(
-        REDIS_URL,
-        decode_responses=True,
-        health_check_interval=30,
-        socket_connect_timeout=5,
-        socket_timeout=30,
-        retry_on_timeout=True,
-    )
+        return None
+    try:
+        r = redis.from_url(REDIS_URL)
+        # Light health check; don't be too aggressive in PaaS.
+        r.ping()
+        return r
+    except Exception as e:
+        logger.warning(f"Redis connection issue: {e}")
+        return None
+
 
 def has_redis() -> bool:
-    try:
-        r = _conn()
-        r.ping()
-        return True
-    except Exception:
-        return False
+    """True if REDIS_URL is configured and usable."""
+    return _get_redis() is not None
 
-# ---- enqueue/fetch ----
+
 def enqueue_job(
-    fn_path: str,
+    func_path: str,
     payload: Dict[str, Any],
-    *,
     queue: Optional[str] = None,
-    description: Optional[str] = None,
-    job_timeout: Optional[int] = None,
-    result_ttl: Optional[int] = None,
-    failure_ttl: Optional[int] = None,
-    meta: Optional[Dict[str, Any]] = None,
-) -> str:
+    **rq_kwargs: Any,
+) -> Optional[str]:
     """
-    Enqueue a Python callable by dotted path.
-    Returns job_id.
+    Enqueue a job by function import path (e.g., 'worker.compute_job').
+    - Ensures it is enqueued to the intended queue (default: env RQ_QUEUE or 'ode_jobs').
+    - Forwards any RQ enqueue kwargs (job_timeout, result_ttl, failure_ttl, description, depends_on, at_front, meta, etc.).
     """
-    qname = (queue or RQ_QUEUE).strip()
-    with Connection(_conn()):
-        q = Queue(qname, default_timeout=job_timeout or DEFAULT_JOB_TIMEOUT)
-        job = q.enqueue(
-            fn_path,
-            payload,
-            description=description or fn_path,
-            job_timeout=job_timeout or DEFAULT_JOB_TIMEOUT,
-            result_ttl=result_ttl if result_ttl is not None else DEFAULT_RESULT_TTL,
-            failure_ttl=failure_ttl if failure_ttl is not None else DEFAULT_FAILURE_TTL,
-            meta=meta or {},
-        )
-        return job.id
+    r = _get_redis()
+    if r is None:
+        return None
+
+    qname = queue or RQ_QUEUE
+    q = Queue(qname, connection=r)
+
+    # Ensure we always have a sensible initial meta
+    meta = rq_kwargs.pop("meta", {}) or {}
+    meta.setdefault("stage", "enqueued")
+
+    job = q.enqueue(
+        func_path,
+        kwargs={"payload": payload},
+        meta=meta,
+        **rq_kwargs,
+    )
+    return job.get_id()
+
 
 def fetch_job(job_id: str) -> Optional[Dict[str, Any]]:
-    """Return a compact, JSON‑safe status dict for a job_id (None if unknown)."""
-    if not job_id:
+    """Return a snapshot of job status/fields or None if not found."""
+    r = _get_redis()
+    if r is None:
         return None
-    with Connection(_conn()):
-        try:
-            job = Job.fetch(job_id, connection=_conn())
-        except Exception:
-            return None
-
-        # compact snapshot + meta
-        info = {
-            "id": job.id,
-            "status": job.get_status(refresh=True),
-            "created_at": str(job.created_at) if job.created_at else None,
-            "started_at": str(job.started_at) if job.started_at else None,
-            "ended_at": str(job.ended_at) if job.ended_at else None,
-            "description": job.description,
-            "origin": job.origin,
-            "result": job.result if job.is_finished else None,
-            "meta": job.meta or {},
-            "exc_info": job.exc_info,
-        }
-        # add stage if present in meta
-        stage = (job.meta or {}).get("stage")
-        if stage:
-            info["stage"] = stage
-        return info
-
-# ---- observability (used by app's Jobs & Workers panel) ----
-def rq_inspect() -> Dict[str, Any]:
-    """Summarize queues and workers; safe to call from Streamlit."""
-    summary: Dict[str, Any] = {"queues": [], "workers": []}
     try:
-        with Connection(_conn()):
-            from rq import Worker
-            from rq.command import send_shutdown_command
+        job = Job.fetch(job_id, connection=r)
+    except Exception:
+        return None
 
-            # queues
-            for qname in sorted({RQ_QUEUE, "default"}):
-                q = Queue(qname)
-                summary["queues"].append({
-                    "name": qname,
-                    "count": q.count,
-                    "deferred": DeferredJobRegistry(qname).count,
-                    "scheduled": ScheduledJobRegistry(qname).count,
-                    "started": StartedJobRegistry(qname).count,
-                    "finished": FinishedJobRegistry(qname).count,
-                    "failed": FailedJobRegistry(qname).count,
-                })
+    snap = {
+        "id": job.id,
+        "status": job.get_status(),
+        "origin": job.origin,
+        "description": getattr(job, "description", "") or "",
+        "created_at": getattr(job, "created_at", None),
+        "enqueued_at": getattr(job, "enqueued_at", None),
+        "started_at": getattr(job, "started_at", None),
+        "ended_at": getattr(job, "ended_at", None),
+        "result": job.result,
+        "meta": dict(job.meta or {}),
+        "exc_info": job.exc_info,
+    }
+    return snap
 
-            # workers
-            for w in Worker.all():
-                summary["workers"].append({
-                    "name": w.name,
-                    "state": w.state,
-                    "queues": [qq.name for qq in w.queues],
-                    "birth_date": str(w.birth_date) if w.birth_date else None,
-                })
+
+def rq_inspect() -> Dict[str, Any]:
+    """
+    Lightweight queues/workers snapshot for the UI panel.
+    """
+    r = _get_redis()
+    if r is None:
+        return {"error": "No Redis connection (set REDIS_URL)."}
+
+    try:
+        # Queues
+        queues = []
+        for q in Queue.all(connection=r):
+            try:
+                count = q.count
+            except Exception:
+                count = None
+            queues.append({"name": q.name, "count": count})
+
+        # Workers
+        workers = []
+        for w in Worker.all(connection=r):
+            try:
+                qnames = [qq.name for qq in w.queues]
+            except Exception:
+                qnames = []
+            try:
+                state = w.get_state()
+            except Exception:
+                state = "unknown"
+            workers.append({"name": w.name, "state": state, "queues": ",".join(qnames)})
+
+        return {"queues": queues, "workers": workers}
     except Exception as e:
-        summary["error"] = str(e)
-    return summary
+        return {"error": str(e)}
