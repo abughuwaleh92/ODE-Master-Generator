@@ -1,112 +1,96 @@
 # rq_utils.py
-"""
-RQ helper utilities for RQ 2.x.
-Provides: has_redis, get_redis, get_queue, enqueue_job, fetch_job, rq_inspect.
-"""
-
 import os
-from typing import Any, Dict, Optional
+import json
+from typing import Optional, Dict, Any, List
 
-from redis import Redis
+import redis
 from rq import Queue
 from rq.job import Job
 
-def _redis_url() -> Optional[str]:
-    return os.getenv("REDIS_URL") or os.getenv("RQ_REDIS_URL")
-
-def get_redis() -> Optional[Redis]:
-    url = _redis_url()
-    if not url:
-        return None
-    try:
-        r = Redis.from_url(url)
-        r.ping()
-        return r
-    except Exception:
-        return None
+REDIS_URL = (
+    os.getenv("REDIS_URL")
+    or os.getenv("UPSTASH_REDIS_URL")
+    or os.getenv("REDISCLOUD_URL")
+    or ""
+)
 
 def has_redis() -> bool:
-    return get_redis() is not None
+    return bool(REDIS_URL and (REDIS_URL.startswith("redis://") or REDIS_URL.startswith("rediss://") or REDIS_URL.startswith("unix://")))
 
-def get_queue(name: Optional[str] = None) -> Optional[Queue]:
-    conn = get_redis()
-    if not conn:
+def _redis() -> Optional[redis.Redis]:
+    if not has_redis():
         return None
-    qname = name or os.getenv("RQ_QUEUE") or "ode_jobs"
-    return Queue(qname, connection=conn, default_timeout=1800)
+    return redis.from_url(REDIS_URL, decode_responses=True)
 
-def enqueue_job(
-    func_path: str,
-    payload: Dict[str, Any],
-    queue: Optional[str] = None,
-    job_timeout: int = 1800,
-    result_ttl: int = 86400,
-    description: str = "",
-) -> Optional[str]:
-    q = get_queue(queue)
-    if not q:
+def _queue(name: str = "default") -> Queue:
+    r = _redis()
+    return Queue(name, connection=r, default_timeout=int(os.getenv("RQ_DEFAULT_JOB_TIMEOUT", "86400")))
+
+def enqueue_job(func_path: str, payload: dict, **rq_kwargs) -> Optional[str]:
+    """
+    Enqueue with flexible kwargs (fixes 'unexpected keyword' error).
+    e.g. enqueue_job("worker.train_job", payload, job_timeout=86400, result_ttl=604800)
+    """
+    if not has_redis():
         return None
+    q = _queue("default")
     try:
-        job = q.enqueue(
-            func_path,
-            args=(payload,),
-            job_timeout=job_timeout,
-            result_ttl=result_ttl,
-            failure_ttl=max(result_ttl, 7 * 24 * 3600),
-            description=description or "RQ job",
-            retry=None,
-        )
-        return job.get_id()
-    except Exception:
-        return None
+        job = q.enqueue(func_path, payload, **rq_kwargs)
+    except TypeError:
+        # Fall back to minimal call if local RQ lacks some kwarg
+        job = q.enqueue(func_path, payload)
+    return job.id
 
 def fetch_job(job_id: str) -> Optional[Dict[str, Any]]:
-    conn = get_redis()
-    if not conn:
-        return None
+    if not has_redis(): return None
+    r = _redis()
     try:
-        job = Job.fetch(job_id, connection=conn)
-        info = {
-            "id": job.get_id(),
-            "status": job.get_status(),
-            "origin": job.origin,
-            "description": job.description,
-            "enqueued_at": str(job.enqueued_at) if job.enqueued_at else None,
-            "started_at": str(job.started_at) if job.started_at else None,
-            "ended_at": str(job.ended_at) if job.ended_at else None,
-            "meta": dict(job.meta or {}),
-        }
-        if job.is_finished:
-            info["result"] = job.result
-        if job.is_failed:
-            info["exc_string"] = job.exc_info
-        return info
+        job = Job.fetch(job_id, connection=r)
     except Exception:
         return None
+    meta = job.meta or {}
+    return {
+        "id": job.id,
+        "status": job.get_status(refresh=True),
+        "meta": meta,
+        "created_at": str(job.created_at) if job.created_at else None,
+        "enqueued_at": str(job.enqueued_at) if job.enqueued_at else None,
+        "started_at": str(job.started_at) if job.started_at else None,
+        "ended_at": str(job.ended_at) if job.ended_at else None,
+        "result": job.result if job.is_finished else None,
+    }
 
-def rq_inspect(current_queue: Optional[str] = None) -> Dict[str, Any]:
-    from rq.worker import Worker
-    res = {"ok": False, "queues": [], "workers": [], "using_queue": None}
-    conn = get_redis()
-    if not conn:
-        return res
-    try:
-        qname = current_queue or os.getenv("RQ_QUEUE") or "ode_jobs"
-        res["using_queue"] = qname
+# ---------- persistent progress in Redis ----------
+def _key(job_id: str, which: str) -> str:
+    return f"mg:train:{job_id}:{which}"
 
-        q_main = Queue(qname, connection=conn)
-        res["queues"].append({"name": q_main.name, "count": q_main.count})
-        if qname != "default":
-            q_def = Queue("default", connection=conn)
-            res["queues"].append({"name": q_def.name, "count": q_def.count})
+def push_log(job_id: str, line: str):
+    r = _redis()
+    if not r: return
+    r.rpush(_key(job_id, "log"), line)
 
-        for w in Worker.all(connection=conn):
-            res["workers"].append({
-                "name": w.name,
-                "state": w.get_state(),
-                "queues": [qq.name for qq in w.queues],
-            })
-        res["ok"] = True
-        return res
-    except Exception:
-        return res
+def get_logs(job_id: str, start: int = 0, end: int = -1) -> List[str]:
+    r = _redis()
+    if not r: return []
+    return r.lrange(_key(job_id, "log"), start, end)
+
+def set_progress(job_id: str, progress: Dict[str, Any]):
+    r = _redis()
+    if not r: return
+    r.hset(_key(job_id, "prog"), mapping={k: json.dumps(v) for k, v in progress.items()})
+
+def get_progress(job_id: str) -> Dict[str, Any]:
+    r = _redis()
+    if not r: return {}
+    raw = r.hgetall(_key(job_id, "prog"))
+    return {k: json.loads(v) for k, v in raw.items()}
+
+def set_artifacts(job_id: str, paths: Dict[str, str]):
+    r = _redis()
+    if not r: return
+    r.hset(_key(job_id, "artifacts"), mapping=paths)
+
+def get_artifacts(job_id: str) -> Dict[str, str]:
+    r = _redis()
+    if not r: return {}
+    return r.hgetall(_key(job_id, "artifacts"))
