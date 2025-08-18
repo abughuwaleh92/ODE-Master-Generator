@@ -1,68 +1,48 @@
 # worker.py
 """
 RQ worker entry points.
-- compute_job(payload): builds ODE via shared.ode_core and returns JSON-safe result.
-- train_job(payload): trains ML model with persistent progress saved in job.meta.
-Designed for RQ >= 2, Redis URL from env: REDIS_URL (or RQ_REDIS_URL).
+- compute_job(payload): ODE compute with JSON-safe result.
+- train_job(payload): trains ML model; epoch progress persisted in job.meta.
 """
 
 import os
-import json
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
-# RQ >= 2
+# Ensure a safe secret key for any pydantic Settings used by src utils.
+os.environ.setdefault("SECRET_KEY", os.getenv("APP_SECRET", "mg-dev-secret"))
+
 from rq.job import get_current_job
-
-# ---- Optional heavy deps guarded ----
 import sympy as sp
 
-# core compute helpers (must exist in your repo)
-from shared.ode_core import (
-    ComputeParams,
-    compute_ode_full,
-    expr_to_str,   # stringifier safe for SymPy; falls back to str() if needed
-)
+from shared.ode_core import ComputeParams, compute_ode_full, expr_to_str
 
-# -------------------- Helpers --------------------
-
-def _to_safe(obj: Any) -> Any:
-    """SymPy/NumPy -> JSON safe."""
+def _to_safe(x: Any) -> Any:
     try:
-        return expr_to_str(obj)
+        return expr_to_str(x)
     except Exception:
         try:
-            if isinstance(obj, (list, tuple)):
-                return [_to_safe(x) for x in obj]
-            if isinstance(obj, dict):
-                return {k: _to_safe(v) for k, v in obj.items()}
-            return str(obj)
+            if isinstance(x, (list, tuple)): return [_to_safe(v) for v in x]
+            if isinstance(x, dict): return {k: _to_safe(v) for k, v in x.items()}
+            return str(x)
         except Exception:
-            return str(obj)
+            return str(x)
 
-def _update_meta(stage: str, **kwargs):
+def _update_meta(stage: str, **kv):
     job = get_current_job()
-    if not job:
-        return
+    if not job: return
     job.meta = job.meta or {}
     job.meta["stage"] = stage
     job.meta["heartbeat"] = datetime.utcnow().isoformat()
-    for k, v in kwargs.items():
-        job.meta[k] = v
+    for k, v in kv.items(): job.meta[k] = v
     job.save_meta()
 
-# -------------------- ODE compute --------------------
+# ---------------- ODE compute ----------------
 
 def compute_job(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Create ODE from Theorem page request.
-    Payload fields mirror ComputeParams plus library hints.
-    """
     _update_meta("received", desc="ODE compute")
     try:
-        # Try to instantiate libraries here, but compute_ode_full can work with basic names
-        basic_lib = None
-        special_lib = None
+        basic_lib = special_lib = None
         try:
             from src.functions.basic_functions import BasicFunctions
             from src.functions.special_functions import SpecialFunctions
@@ -80,7 +60,7 @@ def compute_job(payload: Dict[str, Any]) -> Dict[str, Any]:
             use_exact=bool(payload.get("use_exact", True)),
             simplify_level=payload.get("simplify_level", "light"),
             lhs_source=payload.get("lhs_source", "constructor"),
-            constructor_lhs=None,  # constructor expression is session-bound; worker uses freeform/arbitrary text if given
+            constructor_lhs=None,
             freeform_terms=payload.get("freeform_terms"),
             arbitrary_lhs_text=payload.get("arbitrary_lhs_text"),
             function_library=payload.get("function_library", "Basic"),
@@ -90,10 +70,8 @@ def compute_job(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         _update_meta("computing")
         res = compute_ode_full(p)
-
         safe = {k: _to_safe(v) for k, v in res.items()}
         safe["timestamp"] = datetime.utcnow().isoformat()
-
         _update_meta("finished")
         return safe
 
@@ -101,16 +79,11 @@ def compute_job(payload: Dict[str, Any]) -> Dict[str, Any]:
         _update_meta("failed", error=str(e))
         return {"error": str(e), "stage": "failed"}
 
-# -------------------- Training job --------------------
+# ---------------- ML training ----------------
 
 def train_job(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Train ML/DL model with persistent progress.
-    payload = {model_type, epochs, batch_size, samples, validation_split, use_generator, learning_rate, device, mixed_precision}
-    """
     _update_meta("received", desc="ML training", epoch=0, total_epochs=payload.get("epochs", 100))
 
-    # Import lazily to keep worker import cost low
     from src.ml.trainer import MLTrainer
 
     model_type = payload.get("model_type", "pattern_learner")
@@ -122,12 +95,9 @@ def train_job(payload: Dict[str, Any]) -> Dict[str, Any]:
     lr = float(payload.get("learning_rate", 1e-3))
     device = payload.get("device") or ("cuda" if os.getenv("USE_CUDA", "1") == "1" else "cpu")
     mp = bool(payload.get("mixed_precision", False))
-
-    # Make sure checkpoint dir exists on worker FS
     ckpt_dir = payload.get("checkpoint_dir", "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    # Build trainer
     trainer = MLTrainer(
         model_type=model_type,
         learning_rate=lr,
@@ -136,22 +106,18 @@ def train_job(payload: Dict[str, Any]) -> Dict[str, Any]:
         enable_mixed_precision=mp,
     )
 
-    # callback: persist epoch + losses in job.meta
     def on_progress(ep: int, total: int):
         hist = getattr(trainer, "history", {})
         tr = hist.get("train_loss", [])
         vl = hist.get("val_loss", [])
-        train_loss = float(tr[-1]) if tr else None
-        val_loss = float(vl[-1]) if vl else None
         _update_meta(
             "training",
             epoch=int(ep),
             total_epochs=int(total),
-            train_loss=train_loss,
-            val_loss=val_loss,
+            train_loss=float(tr[-1]) if tr else None,
+            val_loss=float(vl[-1]) if vl else None,
         )
 
-    # Train
     _update_meta("training", epoch=0, total_epochs=epochs)
     trainer.train(
         epochs=epochs,
@@ -163,16 +129,14 @@ def train_job(payload: Dict[str, Any]) -> Dict[str, Any]:
         progress_callback=on_progress,
     )
 
-    # Locate best checkpoint
-    best_path = os.path.join(ckpt_dir, f"{model_type}_best.pth")
+    best = os.path.join(ckpt_dir, f"{model_type}_best.pth")
     info = {
         "model_type": model_type,
         "device": device,
         "epochs": epochs,
-        "checkpoint": best_path if os.path.exists(best_path) else None,
+        "checkpoint": best if os.path.exists(best) else None,
         "history": getattr(trainer, "history", {}),
         "saved_at": datetime.utcnow().isoformat(),
     }
-
     _update_meta("finished", trained=True, checkpoint=info["checkpoint"])
     return info
