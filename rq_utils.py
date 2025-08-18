@@ -1,125 +1,150 @@
 # rq_utils.py
-import os
-import logging
-from typing import Optional, Dict, Any
+"""
+RQ helper utilities (RQ 2.x compatible).
+- No 'Connection' import (removed in RQ 2).
+- Uses redis-py client for connections.
+- Provides: has_redis, get_redis, get_queue, enqueue_job, fetch_job, rq_inspect.
+"""
 
-import redis
-from rq import Queue, Worker
+import os
+from typing import Any, Dict, Optional, Tuple
+
+from redis import Redis
+from rq import Queue
 from rq.job import Job
 
-logger = logging.getLogger(__name__)
+# ----------------------------- Redis / Queue -----------------------------
 
-REDIS_URL = os.environ.get("REDIS_URL", "")
-RQ_QUEUE = os.environ.get("RQ_QUEUE", "ode_jobs")
+def _redis_url() -> Optional[str]:
+    # Prefer REDIS_URL; allow RQ_REDIS_URL fallback
+    return os.getenv("REDIS_URL") or os.getenv("RQ_REDIS_URL")
 
-
-def _get_redis() -> Optional[redis.Redis]:
-    """Return a live Redis connection or None."""
-    if not REDIS_URL:
+def get_redis() -> Optional[Redis]:
+    url = _redis_url()
+    if not url:
         return None
     try:
-        r = redis.from_url(REDIS_URL)
-        # Light health check; don't be too aggressive in PaaS.
+        r = Redis.from_url(url)
+        # verify quickly
         r.ping()
         return r
-    except Exception as e:
-        logger.warning(f"Redis connection issue: {e}")
+    except Exception:
         return None
 
-
 def has_redis() -> bool:
-    """True if REDIS_URL is configured and usable."""
-    return _get_redis() is not None
+    return get_redis() is not None
 
+def get_queue(name: Optional[str] = None) -> Optional[Queue]:
+    """Return Queue instance bound to configured Redis."""
+    conn = get_redis()
+    if not conn:
+        return None
+    qname = name or os.getenv("RQ_QUEUE") or "ode_jobs"
+    # give each job a sane default timeout unless overridden when enqueuing
+    return Queue(qname, connection=conn, default_timeout=1800)
+
+# ------------------------------ Enqueue ---------------------------------
 
 def enqueue_job(
     func_path: str,
     payload: Dict[str, Any],
     queue: Optional[str] = None,
-    **rq_kwargs: Any,
+    job_timeout: int = 1800,
+    result_ttl: int = 86400,
+    description: str = "",
 ) -> Optional[str]:
     """
-    Enqueue a job by function import path (e.g., 'worker.compute_job').
-    - Ensures it is enqueued to the intended queue (default: env RQ_QUEUE or 'ode_jobs').
-    - Forwards any RQ enqueue kwargs (job_timeout, result_ttl, failure_ttl, description, depends_on, at_front, meta, etc.).
+    Enqueue a job by function import path string (e.g., 'worker.compute_job').
+    Returns job id or None.
     """
-    r = _get_redis()
-    if r is None:
-        return None
-
-    qname = queue or RQ_QUEUE
-    q = Queue(qname, connection=r)
-
-    # Ensure we always have a sensible initial meta
-    meta = rq_kwargs.pop("meta", {}) or {}
-    meta.setdefault("stage", "enqueued")
-
-    job = q.enqueue(
-        func_path,
-        kwargs={"payload": payload},
-        meta=meta,
-        **rq_kwargs,
-    )
-    return job.get_id()
-
-
-def fetch_job(job_id: str) -> Optional[Dict[str, Any]]:
-    """Return a snapshot of job status/fields or None if not found."""
-    r = _get_redis()
-    if r is None:
+    q = get_queue(queue)
+    if not q:
         return None
     try:
-        job = Job.fetch(job_id, connection=r)
+        # Use import string so the worker doesn't need the object pickled from web
+        job = q.enqueue(
+            func_path,
+            args=(payload,),
+            job_timeout=job_timeout,
+            result_ttl=result_ttl,
+            failure_ttl=max(result_ttl, 7 * 24 * 3600),
+            description=description or "RQ job",
+            retry=None,
+        )
+        return job.get_id()
     except Exception:
         return None
 
-    snap = {
-        "id": job.id,
-        "status": job.get_status(),
-        "origin": job.origin,
-        "description": getattr(job, "description", "") or "",
-        "created_at": getattr(job, "created_at", None),
-        "enqueued_at": getattr(job, "enqueued_at", None),
-        "started_at": getattr(job, "started_at", None),
-        "ended_at": getattr(job, "ended_at", None),
-        "result": job.result,
-        "meta": dict(job.meta or {}),
-        "exc_info": job.exc_info,
-    }
-    return snap
+# ------------------------------ Fetch -----------------------------------
 
+def fetch_job(job_id: str) -> Optional[Dict[str, Any]]:
+    """Return a JSON-safe snapshot of an RQ job."""
+    conn = get_redis()
+    if not conn:
+        return None
+    try:
+        job = Job.fetch(job_id, connection=conn)
+        info = {
+            "id": job.get_id(),
+            "enqueued_at": str(job.enqueued_at) if job.enqueued_at else None,
+            "started_at": str(job.started_at) if job.started_at else None,
+            "ended_at": str(job.ended_at) if job.ended_at else None,
+            "status": job.get_status(),
+            "origin": job.origin,
+            "description": job.description,
+            "meta": dict(job.meta or {}),
+        }
+        # Only attach result safely after finished
+        if job.is_finished:
+            info["result"] = job.result
+        if job.is_failed:
+            info["exc_string"] = job.exc_info
+        return info
+    except Exception:
+        return None
 
-def rq_inspect() -> Dict[str, Any]:
+# ------------------------------ Inspect ---------------------------------
+
+def rq_inspect(current_queue: Optional[str] = None) -> Dict[str, Any]:
     """
-    Lightweight queues/workers snapshot for the UI panel.
+    Lightweight view of queues & workers (no deprecated Connection).
     """
-    r = _get_redis()
-    if r is None:
-        return {"error": "No Redis connection (set REDIS_URL)."}
+    from rq import Queue
+    from rq.worker import Worker
+
+    res = {"ok": False, "queues": [], "workers": [], "using_queue": None}
+    conn = get_redis()
+    if not conn:
+        return res
 
     try:
-        # Queues
-        queues = []
-        for q in Queue.all(connection=r):
-            try:
-                count = q.count
-            except Exception:
-                count = None
-            queues.append({"name": q.name, "count": count})
+        qname = current_queue or os.getenv("RQ_QUEUE") or "ode_jobs"
+        res["using_queue"] = qname
 
-        # Workers
-        workers = []
-        for w in Worker.all(connection=r):
-            try:
-                qnames = [qq.name for qq in w.queues]
-            except Exception:
-                qnames = []
-            try:
-                state = w.get_state()
-            except Exception:
-                state = "unknown"
-            workers.append({"name": w.name, "state": state, "queues": ",".join(qnames)})
+        # queues
+        q_all = [Queue(qname, connection=conn)]
+        # also show 'default' if different
+        if qname != "default":
+            q_all.append(Queue("default", connection=conn))
 
-        return {"queues": queues, "workers": workers}
-    except Exception as e:
-        return {"error": str(e)}
+        for q in q_all:
+            try:
+                res["queues"].append({"name": q.name, "count": q.count})
+            except Exception:
+                res["queues"].append({"name": q.name, "count": None})
+
+        # workers (simple snapshot)
+        for w in Worker.all(connection=conn):
+            try:
+                res["workers"].append({
+                    "name": w.name,
+                    "state": w.get_state(),
+                    "queues": [qq.name for qq in w.queues]
+                })
+            except Exception:
+                pass
+
+        res["ok"] = True
+        return res
+    except Exception:
+        return res
