@@ -7,7 +7,12 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import sympy as sp
-
+# at top near imports
+from rq_utils import has_redis, enqueue_job, fetch_job, redis_status
+import sympy as sp
+import streamlit as st
+import json
+from datetime import datetime
 # Optional plotting
 _PLOTLY_OK = True
 try:
