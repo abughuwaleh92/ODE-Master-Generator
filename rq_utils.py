@@ -6,20 +6,53 @@ from rq import Queue
 from rq.job import Job
 from redis import Redis
 
-# RQ connection used for jobs (binary safe for pickling)
+def _redis_url_from_env() -> Optional[str]:
+    # Try several well-known env names
+    for key in ("REDIS_URL", "REDIS_TLS_URL", "UPSTASH_REDIS_URL"):
+        val = os.getenv(key)
+        if val:
+            return val
+
+    # Optional: read from a secrets file if you can't put it directly in env
+    path = os.getenv("REDIS_URL_FILE")
+    if path and os.path.exists(path):
+        try:
+            return open(path, "r", encoding="utf-8").read().strip()
+        except Exception:
+            pass
+
+    # Optional: Streamlit secrets (only in the web app process)
+    try:
+        import streamlit as st
+        for key in ("REDIS_URL", "REDIS_TLS_URL", "UPSTASH_REDIS_URL"):
+            if key in st.secrets:
+                return st.secrets[key]
+    except Exception:
+        pass
+
+    return None
+
+def _redis_kwargs(url: str) -> dict:
+    # Allow insecure TLS (for some managed hosts / Upstash if cert path breaks)
+    kwargs = {"decode_responses": False}
+    if url.startswith("rediss://") and os.getenv("REDIS_INSECURE_TLS", "false").lower() == "true":
+        kwargs["ssl_cert_reqs"] = None  # disable cert verification (use only if you must)
+    return kwargs
+
 def _redis_rq() -> Optional[Redis]:
-    url = (
-        os.getenv("REDIS_URL")
-        or os.getenv("REDIS_TLS_URL")
-        or os.getenv("UPSTASH_REDIS_URL")
-    )
+    url = _redis_url_from_env()
     if not url:
         return None
-    # decode_responses=False is important for pickling payloads
-    return Redis.from_url(url, decode_responses=False)
+    return Redis.from_url(url, **_redis_kwargs(url))
 
 def has_redis() -> bool:
-    return _redis_rq() is not None
+    r = _redis_rq()
+    if not r:
+        return False
+    try:
+        return r.ping()
+    except Exception:
+        return False
 
 def _queue(name: Optional[str] = None) -> Queue:
     conn = _redis_rq()
@@ -29,18 +62,12 @@ def _queue(name: Optional[str] = None) -> Queue:
     return Queue(name=qname, connection=conn)
 
 def enqueue_job(func_path: str, payload: Dict[str, Any], **job_opts) -> Optional[str]:
-    """
-    Enqueue a job. Accepts common options if supported by the installed RQ:
-    - job_timeout, result_ttl, ttl, description, meta
-    """
     q = _queue(job_opts.pop("queue", None))
-    # filter known enqueue options
     allowed = {"job_timeout", "result_ttl", "ttl", "description", "meta", "depends_on"}
     opts = {k: v for k, v in job_opts.items() if k in allowed}
-    # sensible defaults
-    opts.setdefault("job_timeout", int(os.getenv("RQ_JOB_TIMEOUT", "86400")))     # 24h
-    opts.setdefault("result_ttl", int(os.getenv("RQ_RESULT_TTL", "604800")))     # 7 days
-    opts.setdefault("ttl", int(os.getenv("RQ_TTL", "86400")))                    # 1 day in queue
+    opts.setdefault("job_timeout", int(os.getenv("RQ_JOB_TIMEOUT", "86400")))
+    opts.setdefault("result_ttl", int(os.getenv("RQ_RESULT_TTL", "604800")))
+    opts.setdefault("ttl", int(os.getenv("RQ_TTL", "86400")))
     job = q.enqueue(func_path, payload, **opts)
     return job.id if job else None
 
@@ -63,14 +90,36 @@ def fetch_job(job_id: str) -> Optional[Dict[str, Any]]:
         "exc_info": job.exc_info,
         "result": job.result if job.is_finished else None,
     }
-    # attach plain-text logs if we used worker.py's logger
+    # Optional: attach plain-text logs created by worker.py
     try:
-        rtext = Redis.from_url(
-            os.getenv("REDIS_URL") or os.getenv("REDIS_TLS_URL") or os.getenv("UPSTASH_REDIS_URL"),
-            decode_responses=True,
-        )
+        url = _redis_url_from_env()
+        rtext = Redis.from_url(url, decode_responses=True, **_redis_kwargs(url))
         logs = rtext.lrange(f"job:{job.id}:logs", 0, -1)
         info["logs"] = logs or []
     except Exception:
         info["logs"] = []
     return info
+
+# Small helper exposed for the UI diagnostics
+def redis_status() -> Dict[str, Any]:
+    url = _redis_url_from_env()
+    if not url:
+        return {"ok": False, "reason": "No REDIS_URL/TLS/UPSTASH env or secret found."}
+    try:
+        r = Redis.from_url(url, **_redis_kwargs(url))
+        pong = r.ping()
+        return {
+            "ok": bool(pong),
+            "url_preview": _mask_url(url),
+            "queue": os.getenv("RQ_QUEUE", "ode_jobs"),
+        }
+    except Exception as e:
+        return {"ok": False, "reason": str(e), "url_preview": _mask_url(url)}
+
+def _mask_url(url: str) -> str:
+    # Hide password in logs/UI
+    try:
+        import re
+        return re.sub(r"(?<=://.*:)[^@]+(?=@)", "***", url)
+    except Exception:
+        return url
