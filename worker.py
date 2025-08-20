@@ -1,324 +1,608 @@
 # worker.py
+"""
+Enhanced RQ Worker for Master Generators ODE System
+Handles compute and training jobs with comprehensive error handling,
+progress tracking, and artifact management.
+"""
+
 import os
+import sys
 import json
-import glob
+import pickle
 import zipfile
-import inspect
+import traceback
+import gc
 from datetime import datetime
+from typing import Dict, Any, Optional, Callable
+from pathlib import Path
 
 import sympy as sp
+import numpy as np
 from rq import get_current_job
+from rq.job import Job
 
-# ---- Core compute (ODE generation) ----
+# Add project root to path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Import RQ utilities
+from rq_utils import append_log, update_progress, update_artifacts
+
+# Core computation
 from shared.ode_core import ComputeParams, compute_ode_full, expr_to_str
 
-# ---- Optional Trainer (present in your repo) ----
+# Optional imports with graceful fallback
 try:
-    from src.ml.trainer import MLTrainer  # your trainer class
-except Exception:
-    MLTrainer = None
+    from src.functions.basic_functions import BasicFunctions
+    from src.functions.special_functions import SpecialFunctions
+    FUNCTIONS_AVAILABLE = True
+except ImportError:
+    BasicFunctions = SpecialFunctions = None
+    FUNCTIONS_AVAILABLE = False
 
-# ---- Optional: some repos define a TrainConfig; we handle both cases ----
 try:
-    from src.ml.trainer import TrainConfig
-except Exception:
-    TrainConfig = None
+    from src.ml.trainer import MLTrainer, TrainConfig
+    ML_AVAILABLE = True
+except ImportError:
+    MLTrainer = TrainConfig = None
+    ML_AVAILABLE = False
 
-# ---- Redis for logs (separate connection from RQ’s internal one) ----
-try:
-    import redis
-except Exception:
-    redis = None
+# Configure paths
+ARTIFACTS_DIR = Path("artifacts")
+CHECKPOINTS_DIR = Path("checkpoints")
+MODELS_DIR = Path("models")
 
+# Create directories
+for dir_path in [ARTIFACTS_DIR, CHECKPOINTS_DIR, MODELS_DIR]:
+    dir_path.mkdir(parents=True, exist_ok=True)
 
-def _redis():
-    url = os.getenv("REDIS_URL") or os.getenv("REDIS_TLS_URL") or os.getenv("UPSTASH_REDIS_URL")
-    if not url or not redis:
-        return None
-    # decode_responses=True is fine here because we only push/read plain text log lines
-    return redis.from_url(url, decode_responses=True)
+class WorkerLogger:
+    """Centralized logging for worker jobs"""
+    
+    def __init__(self, job: Optional[Job] = None):
+        self.job = job or get_current_job()
+    
+    def log(self, message: str, level: str = "INFO"):
+        """Log a message"""
+        formatted = f"[{level}] {message}"
+        print(formatted)  # Console output
+        
+        if self.job:
+            append_log(self.job.id, formatted)
+    
+    def info(self, message: str):
+        self.log(message, "INFO")
+    
+    def warning(self, message: str):
+        self.log(message, "WARNING")
+    
+    def error(self, message: str):
+        self.log(message, "ERROR")
+    
+    def debug(self, message: str):
+        self.log(message, "DEBUG")
 
-
-def _log(job, msg: str):
-    """Append a log line to Redis (job-specific list), keep last ~5000 lines."""
-    try:
-        conn = _redis()
-        if not conn or not job:
+class ProgressTracker:
+    """Tracks and updates job progress"""
+    
+    def __init__(self, job: Optional[Job] = None):
+        self.job = job or get_current_job()
+        self.logger = WorkerLogger(job)
+    
+    def update(self, **kwargs):
+        """Update progress with arbitrary key-value pairs"""
+        if not self.job:
             return
-        key = f"job:{job.id}:logs"
-        conn.rpush(key, f"[{datetime.utcnow().isoformat()}Z] {msg}")
-        conn.ltrim(key, -5000, -1)
-    except Exception:
-        pass
-
-
-def _set_progress(job, **fields):
-    """Persist progress in job.meta['progress'] so UI remains visible across epochs."""
-    if not job:
-        return
-    try:
-        job.meta.setdefault("progress", {})
-        job.meta["progress"].update(fields)
-        job.save_meta()
-    except Exception:
-        pass
-
-
-def _set_artifacts(job, **fields):
-    if not job:
-        return
-    try:
-        job.meta.setdefault("artifacts", {})
-        job.meta["artifacts"].update(fields)
-        job.save_meta()
-    except Exception:
-        pass
-
-
-# ----------------- Compute (Generate ODE) -----------------
-def compute_job(payload: dict):
-    """
-    Called via RQ: "worker.compute_job"
-    Does not rely on UI session-only objects (constructor_lhs is None on worker).
-    Converts SymPy to JSON-safe strings before returning.
-    """
-    job = get_current_job()
-    try:
-        _log(job, f"compute_job: start payload={payload}")
-
-        # Try to load function libraries (optional)
-        basic_lib = None
-        special_lib = None
-        try:
-            from src.functions.basic_functions import BasicFunctions
-            from src.functions.special_functions import SpecialFunctions
-            basic_lib = BasicFunctions()
-            special_lib = SpecialFunctions()
-            _log(job, "Loaded BasicFunctions & SpecialFunctions.")
-        except Exception as e:
-            _log(job, f"Library load skipped: {e}")
-
-        p = ComputeParams(
-            func_name        = payload.get("func_name", "exp(z)"),
-            alpha            = payload.get("alpha", 1),
-            beta             = payload.get("beta", 1),
-            n                = int(payload.get("n", 1)),
-            M                = payload.get("M", 0),
-            use_exact        = bool(payload.get("use_exact", True)),
-            simplify_level   = payload.get("simplify_level", "light"),
-            lhs_source       = payload.get("lhs_source", "constructor"),
-            constructor_lhs  = None,  # worker cannot access UI constructor session
-            freeform_terms   = payload.get("freeform_terms"),
-            arbitrary_lhs_text = payload.get("arbitrary_lhs_text"),
-            function_library = payload.get("function_library", "Basic"),
-            basic_lib        = basic_lib,
-            special_lib      = special_lib,
-        )
-
-        res = compute_ode_full(p)
-
-        safe = {
-            **res,
-            "generator":      expr_to_str(res.get("generator")),
-            "rhs":            expr_to_str(res.get("rhs")),
-            "solution":       expr_to_str(res.get("solution")),
-            "f_expr_preview": expr_to_str(res.get("f_expr_preview")),
-            "timestamp":      datetime.utcnow().isoformat() + "Z",
+        
+        progress_data = {
+            'timestamp': datetime.utcnow().isoformat(),
+            **kwargs
         }
+        
+        update_progress(self.job.id, progress_data)
+        
+        # Log significant updates
+        if 'stage' in kwargs:
+            self.logger.info(f"Progress: {kwargs['stage']}")
+        if 'percent' in kwargs:
+            self.logger.info(f"Progress: {kwargs['percent']}%")
 
-        _set_progress(job, stage="finished")
-        _log(job, "compute_job: finished.")
-        return safe
+# ============================================================================
+# COMPUTE JOB - ODE Generation
+# ============================================================================
 
-    except Exception as e:
-        _set_progress(job, stage="failed", error=str(e))
-        _log(job, f"compute_job: failed: {e}")
-        raise
-
-
-# ----------------- Helpers for trainer compatibility -----------------
-def _supports(fn, param_name: str) -> bool:
-    """Return True if callable `fn` supports a keyword arg `param_name`."""
-    try:
-        sig = inspect.signature(fn)
-        return param_name in sig.parameters
-    except Exception:
-        return False
-
-
-def _filter_kwargs(fn, kwargs: dict) -> dict:
-    """Keep only kwargs supported by callable `fn`."""
-    try:
-        sig = inspect.signature(fn)
-        return {k: v for k, v in kwargs.items() if k in sig.parameters}
-    except Exception:
-        # Fallback: pass nothing if we can't safely inspect
-        return {}
-
-
-def _build_trainer(payload: dict):
-    """
-    Instantiate MLTrainer safely across versions:
-      - If TrainConfig exists and MLTrainer accepts it, use it.
-      - Else pass (model_type, hidden_dim, enable_mixed_precision, etc.) filtered by __init__ signature.
-    """
-    if MLTrainer is None:
-        raise RuntimeError("MLTrainer not available in worker environment.")
-
-    model_type = payload.get("model_type", "pattern_learner")
-    hidden_dim = int(payload.get("hidden_dim", 128))
-    enable_amp = bool(payload.get("enable_mixed_precision", False))
-
-    # Prefer TrainConfig if available AND MLTrainer.__init__ supports it.
-    if TrainConfig is not None:
-        try:
-            cfg = TrainConfig(
-                model_type=model_type,
-                hidden_dim=hidden_dim,
-                normalize=bool(payload.get("normalize", False)),
-                beta_vae=float(payload.get("beta_vae", 1.0)) if "beta_vae" in payload else 1.0,
-                kl_anneal=str(payload.get("kl_anneal", "linear")) if "kl_anneal" in payload else "linear",
-                kl_max_beta=float(payload.get("kl_max_beta", 1.0)) if "kl_max_beta" in payload else 1.0,
-                kl_warmup_epochs=int(payload.get("kl_warmup_epochs", 10)) if "kl_warmup_epochs" in payload else 10,
-                early_stop_patience=int(payload.get("early_stop_patience", 12)) if "early_stop_patience" in payload else 12,
-                loss_weights=payload.get("loss_weights", None),
-                enable_mixed_precision=enable_amp,
-            )
-            # If __init__ supports a single config object:
-            if _supports(MLTrainer.__init__, "cfg"):
-                return MLTrainer(cfg)
-            # Else pass expanded fields through signature filter:
-            init_kwargs = {
-                "model_type": model_type,
-                "hidden_dim": hidden_dim,
-                "enable_mixed_precision": enable_amp,
-                # add common kwargs your older MLTrainer may accept:
-                "learning_rate": payload.get("learning_rate", 0.001),
-                "checkpoint_dir": payload.get("checkpoint_dir", "checkpoints"),
-            }
-            init_kwargs = _filter_kwargs(MLTrainer.__init__, init_kwargs)
-            return MLTrainer(**init_kwargs)
-        except Exception:
-            # Fall back to signature-filtered init below
-            pass
-
-    # No TrainConfig path → call MLTrainer with filtered kwargs
-    init_kwargs = {
-        "model_type": model_type,
-        "hidden_dim": hidden_dim,
-        "enable_mixed_precision": enable_amp,
-        "learning_rate": payload.get("learning_rate", 0.001),
-        "checkpoint_dir": payload.get("checkpoint_dir", "checkpoints"),
-        "device": payload.get("device", None),
-        "input_dim": payload.get("input_dim", 12),
-        "output_dim": payload.get("output_dim", 12),
+def validate_compute_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate and sanitize compute job payload"""
+    
+    # Required fields with defaults
+    validated = {
+        'func_name': str(payload.get('func_name', 'exp(z)')),
+        'alpha': float(payload.get('alpha', 1.0)),
+        'beta': float(payload.get('beta', 1.0)),
+        'n': int(payload.get('n', 1)),
+        'M': float(payload.get('M', 0.0)),
+        'use_exact': bool(payload.get('use_exact', True)),
+        'simplify_level': str(payload.get('simplify_level', 'light')),
+        'lhs_source': str(payload.get('lhs_source', 'constructor')),
+        'function_library': str(payload.get('function_library', 'Basic')),
     }
-    init_kwargs = _filter_kwargs(MLTrainer.__init__, init_kwargs)
-    return MLTrainer(**init_kwargs)
+    
+    # Validate ranges
+    if not 0.01 <= validated['beta'] <= 1000:
+        raise ValueError(f"Beta must be between 0.01 and 1000, got {validated['beta']}")
+    
+    if not 1 <= validated['n'] <= 20:
+        raise ValueError(f"n must be between 1 and 20, got {validated['n']}")
+    
+    if validated['simplify_level'] not in ['none', 'light', 'aggressive']:
+        validated['simplify_level'] = 'light'
+    
+    if validated['lhs_source'] not in ['constructor', 'freeform', 'arbitrary']:
+        validated['lhs_source'] = 'constructor'
+    
+    # Optional fields
+    if 'freeform_terms' in payload:
+        validated['freeform_terms'] = payload['freeform_terms']
+    
+    if 'arbitrary_lhs_text' in payload:
+        # Validate arbitrary LHS for safety
+        lhs_text = str(payload['arbitrary_lhs_text'])
+        if len(lhs_text) > 5000:
+            raise ValueError("Arbitrary LHS text too long (max 5000 chars)")
+        validated['arbitrary_lhs_text'] = lhs_text
+    
+    if 'constructor_lhs' in payload:
+        validated['constructor_lhs'] = payload['constructor_lhs']
+    
+    return validated
 
-
-# ----------------- Train (Persistent RQ) -----------------
-def train_job(payload: dict):
+def compute_job(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Background training with persistent progress/logging/artifacts.
-    Works with *any* version of your MLTrainer by filtering args.
+    Main compute job for ODE generation via Master Theorem
+    
+    Args:
+        payload: Job parameters
+        
+    Returns:
+        Dictionary with computed ODE, solution, and metadata
     """
     job = get_current_job()
-
+    logger = WorkerLogger(job)
+    progress = ProgressTracker(job)
+    
+    start_time = datetime.utcnow()
+    
     try:
-        _log(job, f"train_job: start payload={payload}")
-        os.makedirs("checkpoints", exist_ok=True)
-        os.makedirs("artifacts", exist_ok=True)
-
-        trainer = _build_trainer(payload)
-
-        # Collect train kwargs then filter them against trainer.train signature
-        train_kwargs = {
-            "epochs":            int(payload.get("epochs", 100)),
-            "batch_size":        int(payload.get("batch_size", 32)),
-            "samples":           int(payload.get("samples", 1000)),
-            "validation_split":  float(payload.get("validation_split", 0.2)),
-            "use_generator":     bool(payload.get("use_generator", True)),
-            # These may or may not exist depending on trainer version:
-            "save_best":         True,
-            "checkpoint_interval": 5,
-        }
-
-        # Progress callback (only pass if supported)
-        def progress_callback(epoch, total_epochs):
-            _set_progress(job, epoch=int(epoch), total=int(total_epochs))
-            _log(job, f"epoch {epoch}/{total_epochs}")
-
-        if _supports(trainer.train, "progress_callback"):
-            train_kwargs["progress_callback"] = progress_callback
-
-        # Filter kwargs to what this trainer actually supports
-        safe_train_kwargs = _filter_kwargs(trainer.train, train_kwargs)
-
-        # Resume support (if your trainer has a load_checkpoint method)
-        resume_from = payload.get("resume_from", None)
-        if resume_from and hasattr(trainer, "load_checkpoint") and os.path.exists(resume_from):
+        # Initialize
+        logger.info(f"Starting compute job with payload keys: {list(payload.keys())}")
+        progress.update(stage="initializing", percent=0)
+        
+        # Validate payload
+        logger.info("Validating parameters...")
+        validated_payload = validate_compute_payload(payload)
+        
+        # Load function libraries if available
+        basic_lib = special_lib = None
+        if FUNCTIONS_AVAILABLE:
             try:
-                trainer.load_checkpoint(resume_from)
-                _log(job, f"Resumed from checkpoint: {resume_from}")
+                logger.info("Loading function libraries...")
+                basic_lib = BasicFunctions()
+                special_lib = SpecialFunctions()
+                logger.info("Function libraries loaded successfully")
             except Exception as e:
-                _log(job, f"Resume failed: {e}")
-
-        # ---- Train ----
-        _set_progress(job, stage="running", epoch=0, total=safe_train_kwargs.get("epochs", 0))
-        trainer.train(**safe_train_kwargs)
-
-        # ---- Locate a best model (robust) ----
-        best_model = None
-        # Prefer an explicit attribute if your trainer exposes it
-        if hasattr(trainer, "best_model_path"):
-            best_model = getattr(trainer, "best_model_path")
-
-        if not best_model or not os.path.exists(best_model):
-            # Common convention in your repo:
-            mt = getattr(trainer, "model_type", None) or payload.get("model_type", "pattern_learner")
-            candidate = os.path.join("checkpoints", f"{mt}_best.pth")
-            if os.path.exists(candidate):
-                best_model = candidate
-
-        if not best_model:
-            # Last resort: newest "*best*.pth"
-            cands = sorted(glob.glob("checkpoints/*best*.pth"))
-            if cands:
-                best_model = cands[-1]
-
-        # ---- Save a session ZIP for portability ----
-        session_zip = os.path.join("artifacts", f"session_{job.id}.zip")
-        try:
-            with zipfile.ZipFile(session_zip, "w", zipfile.ZIP_DEFLATED) as zf:
-                if best_model and os.path.exists(best_model):
-                    zf.write(best_model, arcname=os.path.basename(best_model))
-                # history.json
-                hist = getattr(trainer, "history", None)
-                if hist is not None:
-                    zf.writestr("history.json", json.dumps(hist, indent=2))
-                # config-like info for reproducibility
-                cfg_dict = {
-                    "model_type": payload.get("model_type", "pattern_learner"),
-                    "hidden_dim": int(payload.get("hidden_dim", 128)),
-                    "normalize":  bool(payload.get("normalize", False)),
-                }
-                zf.writestr("config.json", json.dumps(cfg_dict, indent=2))
-        except Exception as e:
-            _log(job, f"session zip error: {e}")
-            session_zip = None
-
-        _set_artifacts(job,
-            best_model=best_model if best_model and os.path.exists(best_model) else None,
-            session_zip=session_zip if session_zip and os.path.exists(session_zip) else None
+                logger.warning(f"Failed to load function libraries: {e}")
+        else:
+            logger.warning("Function libraries not available in worker environment")
+        
+        # Handle constructor LHS if provided
+        constructor_lhs = None
+        if 'constructor_lhs' in validated_payload:
+            try:
+                constructor_lhs = sp.sympify(validated_payload['constructor_lhs'])
+                logger.info(f"Parsed constructor LHS: {constructor_lhs}")
+            except Exception as e:
+                logger.warning(f"Failed to parse constructor_lhs: {e}")
+        
+        # Create compute parameters
+        progress.update(stage="preparing", percent=20)
+        
+        params = ComputeParams(
+            func_name=validated_payload['func_name'],
+            alpha=validated_payload['alpha'],
+            beta=validated_payload['beta'],
+            n=validated_payload['n'],
+            M=validated_payload['M'],
+            use_exact=validated_payload['use_exact'],
+            simplify_level=validated_payload['simplify_level'],
+            lhs_source=validated_payload['lhs_source'],
+            constructor_lhs=constructor_lhs,
+            freeform_terms=validated_payload.get('freeform_terms'),
+            arbitrary_lhs_text=validated_payload.get('arbitrary_lhs_text'),
+            function_library=validated_payload['function_library'],
+            basic_lib=basic_lib,
+            special_lib=special_lib,
         )
-
-        _set_progress(job, stage="finished")
-        _log(job, f"train_job: finished. best={best_model} zip={session_zip}")
-        # Return artifacts so RQ result panel shows them even before UI polls meta
-        return {"best_model": best_model, "session_zip": session_zip}
-
+        
+        logger.info(f"Parameters: α={params.alpha}, β={params.beta}, n={params.n}, M={params.M}")
+        logger.info(f"Function: {params.func_name} from {params.function_library} library")
+        
+        # Compute ODE
+        progress.update(stage="computing", percent=40)
+        logger.info("Starting ODE computation...")
+        
+        result = compute_ode_full(params)
+        
+        logger.info("ODE computation completed successfully")
+        progress.update(stage="processing", percent=80)
+        
+        # Convert SymPy expressions to strings for JSON serialization
+        safe_result = {
+            'generator': expr_to_str(result.get('generator')),
+            'rhs': expr_to_str(result.get('rhs')),
+            'solution': expr_to_str(result.get('solution')),
+            'f_expr_preview': expr_to_str(result.get('f_expr_preview')),
+            'type': result.get('type', 'unknown'),
+            'order': result.get('order', 0),
+            'initial_conditions': result.get('initial_conditions', {}),
+            'parameters': {
+                'alpha': params.alpha,
+                'beta': params.beta,
+                'n': params.n,
+                'M': params.M,
+            },
+            'metadata': {
+                'function_name': params.func_name,
+                'function_library': params.function_library,
+                'lhs_source': params.lhs_source,
+                'simplify_level': params.simplify_level,
+                'use_exact': params.use_exact,
+            },
+            'computation_time': (datetime.utcnow() - start_time).total_seconds(),
+            'timestamp': datetime.utcnow().isoformat(),
+        }
+        
+        # Save result summary as artifact
+        artifact_path = ARTIFACTS_DIR / f"compute_{job.id}.json"
+        with open(artifact_path, 'w') as f:
+            json.dump(safe_result, f, indent=2)
+        
+        update_artifacts(job.id, {
+            'result_file': str(artifact_path),
+            'computation_time': safe_result['computation_time'],
+        })
+        
+        progress.update(stage="completed", percent=100)
+        logger.info(f"Job completed in {safe_result['computation_time']:.2f} seconds")
+        
+        return safe_result
+        
     except Exception as e:
-        _set_progress(job, stage="failed", error=str(e))
-        _log(job, f"train_job: failed: {e}")
-        raise
+        error_msg = f"Compute job failed: {str(e)}"
+        logger.error(error_msg)
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        
+        progress.update(
+            stage="failed",
+            percent=0,
+            error=str(e),
+            traceback=traceback.format_exc()
+        )
+        
+        raise RuntimeError(error_msg) from e
+
+# ============================================================================
+# TRAINING JOB - ML Model Training
+# ============================================================================
+
+def validate_train_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate and sanitize training job payload"""
+    
+    validated = {
+        'model_type': str(payload.get('model_type', 'pattern_learner')),
+        'hidden_dim': int(payload.get('hidden_dim', 128)),
+        'normalize': bool(payload.get('normalize', False)),
+        'epochs': int(payload.get('epochs', 100)),
+        'batch_size': int(payload.get('batch_size', 32)),
+        'samples': int(payload.get('samples', 1000)),
+        'validation_split': float(payload.get('validation_split', 0.2)),
+        'use_generator': bool(payload.get('use_generator', True)),
+        'enable_mixed_precision': bool(payload.get('enable_mixed_precision', False)),
+    }
+    
+    # Validate ranges
+    if validated['model_type'] not in ['pattern_learner', 'vae', 'transformer']:
+        validated['model_type'] = 'pattern_learner'
+    
+    if not 16 <= validated['hidden_dim'] <= 2048:
+        validated['hidden_dim'] = 128
+    
+    if not 1 <= validated['epochs'] <= 10000:
+        validated['epochs'] = 100
+    
+    if not 1 <= validated['batch_size'] <= 512:
+        validated['batch_size'] = 32
+    
+    if not 10 <= validated['samples'] <= 100000:
+        validated['samples'] = 1000
+    
+    if not 0.0 <= validated['validation_split'] <= 0.5:
+        validated['validation_split'] = 0.2
+    
+    # Optional advanced parameters
+    if 'beta_vae' in payload:
+        validated['beta_vae'] = float(payload['beta_vae'])
+    
+    if 'kl_anneal' in payload:
+        validated['kl_anneal'] = str(payload['kl_anneal'])
+    
+    if 'early_stop_patience' in payload:
+        validated['early_stop_patience'] = int(payload['early_stop_patience'])
+    
+    if 'checkpoint_interval' in payload:
+        validated['checkpoint_interval'] = int(payload['checkpoint_interval'])
+    
+    if 'resume_from' in payload:
+        validated['resume_from'] = str(payload['resume_from'])
+    
+    return validated
+
+def train_job(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Background training job for ML models
+    
+    Args:
+        payload: Training configuration
+        
+    Returns:
+        Dictionary with training results and artifact paths
+    """
+    if not ML_AVAILABLE:
+        raise RuntimeError("ML training modules not available in worker environment")
+    
+    job = get_current_job()
+    logger = WorkerLogger(job)
+    progress = ProgressTracker(job)
+    
+    start_time = datetime.utcnow()
+    trainer = None
+    
+    try:
+        # Initialize
+        logger.info(f"Starting training job with payload keys: {list(payload.keys())}")
+        progress.update(stage="initializing", percent=0)
+        
+        # Validate payload
+        logger.info("Validating training parameters...")
+        validated = validate_train_payload(payload)
+        
+        # Create training configuration
+        logger.info(f"Creating trainer with model_type={validated['model_type']}")
+        
+        config = TrainConfig(
+            model_type=validated['model_type'],
+            hidden_dim=validated['hidden_dim'],
+            normalize=validated['normalize'],
+            beta_vae=validated.get('beta_vae', 1.0),
+            kl_anneal=validated.get('kl_anneal', 'linear'),
+            early_stop_patience=validated.get('early_stop_patience', 12),
+            enable_mixed_precision=validated['enable_mixed_precision'],
+        )
+        
+        trainer = MLTrainer(config)
+        logger.info("Trainer initialized successfully")
+        
+        # Resume from checkpoint if specified
+        if 'resume_from' in validated and os.path.exists(validated['resume_from']):
+            try:
+                epoch = trainer.load_checkpoint(validated['resume_from'])
+                logger.info(f"Resumed from checkpoint at epoch {epoch}")
+                progress.update(stage="resumed", resumed_epoch=epoch)
+            except Exception as e:
+                logger.warning(f"Failed to resume from checkpoint: {e}")
+        
+        # Setup progress hooks
+        def progress_hook(info: Dict[str, Any]):
+            """Hook called by trainer to update progress"""
+            progress.update(
+                stage="training",
+                epoch=info.get('epoch', 0),
+                total_epochs=validated['epochs'],
+                percent=int((info.get('epoch', 0) / validated['epochs']) * 100),
+                train_loss=info.get('train_loss'),
+                val_loss=info.get('val_loss'),
+            )
+            
+            # Log epoch info
+            if 'epoch' in info and info['epoch'] % 10 == 0:
+                logger.info(
+                    f"Epoch {info['epoch']}/{validated['epochs']}: "
+                    f"train_loss={info.get('train_loss', 'N/A'):.4f}, "
+                    f"val_loss={info.get('val_loss', 'N/A'):.4f}"
+                )
+        
+        def log_hook(message: str):
+            """Hook for trainer to send log messages"""
+            logger.info(f"[Trainer] {message}")
+        
+        # Set hooks
+        trainer.progress_hook = progress_hook
+        trainer.log_hook = log_hook
+        
+        # Start training
+        logger.info(f"Starting training: {validated['epochs']} epochs, "
+                   f"{validated['samples']} samples, "
+                   f"batch_size={validated['batch_size']}")
+        
+        progress.update(stage="training", percent=5)
+        
+        trainer.train(
+            epochs=validated['epochs'],
+            batch_size=validated['batch_size'],
+            samples=validated['samples'],
+            validation_split=validated['validation_split'],
+            use_generator=validated['use_generator'],
+            checkpoint_interval=validated.get('checkpoint_interval', 10),
+        )
+        
+        logger.info("Training completed successfully")
+        progress.update(stage="saving", percent=95)
+        
+        # Save final model
+        model_path = MODELS_DIR / f"{config.model_type}_{job.id}.pth"
+        trainer.save_checkpoint(str(model_path), validated['epochs'])
+        logger.info(f"Model saved to {model_path}")
+        
+        # Find best model
+        best_model_path = CHECKPOINTS_DIR / f"{config.model_type}_best.pth"
+        if not best_model_path.exists():
+            # Try to find any best model
+            import glob
+            candidates = glob.glob(str(CHECKPOINTS_DIR / "*best*.pth"))
+            if candidates:
+                best_model_path = Path(candidates[-1])
+        
+        # Create session archive
+        logger.info("Creating session archive...")
+        session_zip_path = ARTIFACTS_DIR / f"session_{job.id}.zip"
+        
+        with zipfile.ZipFile(session_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            # Add model files
+            if model_path.exists():
+                zf.write(model_path, arcname=model_path.name)
+            if best_model_path.exists():
+                zf.write(best_model_path, arcname=f"best_{best_model_path.name}")
+            
+            # Add training history
+            history_data = {
+                'history': trainer.history,
+                'config': config.__dict__,
+                'validated_params': validated,
+                'training_time': (datetime.utcnow() - start_time).total_seconds(),
+            }
+            zf.writestr('history.json', json.dumps(history_data, indent=2))
+            
+            # Add metadata
+            metadata = {
+                'job_id': job.id,
+                'created_at': datetime.utcnow().isoformat(),
+                'model_type': config.model_type,
+                'epochs': validated['epochs'],
+                'samples': validated['samples'],
+            }
+            zf.writestr('metadata.json', json.dumps(metadata, indent=2))
+        
+        logger.info(f"Session archive created: {session_zip_path}")
+        
+        # Update artifacts
+        artifacts = {
+            'model_path': str(model_path),
+            'best_model_path': str(best_model_path) if best_model_path.exists() else None,
+            'session_zip': str(session_zip_path),
+            'training_time': (datetime.utcnow() - start_time).total_seconds(),
+            'final_train_loss': trainer.history['train_loss'][-1] if trainer.history['train_loss'] else None,
+            'final_val_loss': trainer.history['val_loss'][-1] if trainer.history['val_loss'] else None,
+            'best_val_loss': trainer.history.get('best_val_loss'),
+        }
+        
+        update_artifacts(job.id, artifacts)
+        
+        progress.update(stage="completed", percent=100)
+        logger.info(f"Training job completed in {artifacts['training_time']:.2f} seconds")
+        
+        # Clean up memory
+        del trainer
+        gc.collect()
+        
+        return artifacts
+        
+    except Exception as e:
+        error_msg = f"Training job failed: {str(e)}"
+        logger.error(error_msg)
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        
+        progress.update(
+            stage="failed",
+            percent=0,
+            error=str(e),
+            traceback=traceback.format_exc()
+        )
+        
+        # Clean up
+        if trainer:
+            del trainer
+        gc.collect()
+        
+        raise RuntimeError(error_msg) from e
+
+# ============================================================================
+# UTILITY JOBS
+# ============================================================================
+
+def ping_job(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Simple ping job for testing"""
+    job = get_current_job()
+    logger = WorkerLogger(job)
+    
+    logger.info(f"Ping received with payload: {payload}")
+    
+    return {
+        'status': 'ok',
+        'echo': payload,
+        'job_id': job.id if job else None,
+        'timestamp': datetime.utcnow().isoformat(),
+        'worker_hostname': os.uname().nodename if hasattr(os, 'uname') else 'unknown',
+    }
+
+def cleanup_job(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Clean up old artifacts and models"""
+    job = get_current_job()
+    logger = WorkerLogger(job)
+    
+    older_than_days = payload.get('older_than_days', 7)
+    logger.info(f"Starting cleanup for files older than {older_than_days} days")
+    
+    cutoff_time = datetime.utcnow().timestamp() - (older_than_days * 86400)
+    removed_files = []
+    
+    # Clean up directories
+    for directory in [ARTIFACTS_DIR, CHECKPOINTS_DIR, MODELS_DIR]:
+        if not directory.exists():
+            continue
+            
+        for file_path in directory.glob('*'):
+            if file_path.is_file() and file_path.stat().st_mtime < cutoff_time:
+                try:
+                    file_path.unlink()
+                    removed_files.append(str(file_path))
+                    logger.info(f"Removed: {file_path}")
+                except Exception as e:
+                    logger.error(f"Failed to remove {file_path}: {e}")
+    
+    logger.info(f"Cleanup completed: removed {len(removed_files)} files")
+    
+    return {
+        'removed_count': len(removed_files),
+        'removed_files': removed_files[:100],  # Limit to first 100
+        'timestamp': datetime.utcnow().isoformat(),
+    }
+
+# ============================================================================
+# WORKER HEALTH CHECK
+# ============================================================================
+
+def health_check() -> Dict[str, Any]:
+    """Check worker health and available modules"""
+    return {
+        'status': 'healthy',
+        'timestamp': datetime.utcnow().isoformat(),
+        'modules': {
+            'functions_available': FUNCTIONS_AVAILABLE,
+            'ml_available': ML_AVAILABLE,
+            'sympy_version': sp.__version__,
+            'numpy_version': np.__version__,
+        },
+        'directories': {
+            'artifacts': str(ARTIFACTS_DIR.absolute()),
+            'checkpoints': str(CHECKPOINTS_DIR.absolute()),
+            'models': str(MODELS_DIR.absolute()),
+        }
+    }
